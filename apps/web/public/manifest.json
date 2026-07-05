@@ -1,6 +1,6 @@
 {
-  "name": "Plane",
-  "short_name": "Plane",
+  "name": "Dumont Hangar",
+  "short_name": "Dumont Hangar",
   "icons": [
     {
       "src": "/icons/icon-192x192.png",
@@ -19,7 +19,7 @@
       "type": "image/png"
     }
   ],
-  "theme_color": "#FFFFFF",
+  "theme_color": "#C026D3",
   "background_color": "#FFFFFF",
   "start_url": "/",
   "display": "standalone",
