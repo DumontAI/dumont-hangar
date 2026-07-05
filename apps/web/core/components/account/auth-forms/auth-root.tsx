@@ -97,6 +97,9 @@ export const AuthRoot = observer(function AuthRoot(props: TAuthRoot) {
 
         setErrorInfo(errorhandler);
       }
+      // strip error_code/error_message/email query params from the address bar (and history)
+      // now that they've been read into state; plain replaceState avoids a router re-render.
+      window.history.replaceState(null, "", window.location.pathname);
     }
   }, [error_code, authMode]);
 
