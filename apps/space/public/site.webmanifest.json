@@ -8,12 +8,12 @@
   "theme_color": "#C026D3",
   "icons": [
     {
-      "src": "/favicon/android-chrome-192x192.png",
+      "src": "/favicon/android-chrome-192x192.png?v=dumont",
       "sizes": "192x192",
       "type": "image/png"
     },
     {
-      "src": "/favicon/android-chrome-512x512.png",
+      "src": "/favicon/android-chrome-512x512.png?v=dumont",
       "sizes": "512x512",
       "type": "image/png"
     }
