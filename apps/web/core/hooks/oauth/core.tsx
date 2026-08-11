@@ -10,6 +10,8 @@ import { useTheme } from "next-themes";
 import { API_BASE_URL } from "@plane/constants";
 import type { TOAuthConfigs, TOAuthOption } from "@plane/types";
 // assets
+// Dumont addition
+import dumontLogo from "@/app/assets/images/dumont-hangar-logo.png?url";
 import giteaLogo from "@/app/assets/logos/gitea-logo.svg?url";
 import GithubLightLogo from "@/app/assets/logos/github-black.png?url";
 import GithubDarkLogo from "@/app/assets/logos/github-dark.svg?url";
@@ -33,9 +35,20 @@ export const useCoreOAuthConfig = (oauthActionText: string): TOAuthConfigs => {
       (config?.is_google_enabled ||
         config?.is_github_enabled ||
         config?.is_gitlab_enabled ||
-        config?.is_gitea_enabled)) ||
+        config?.is_gitea_enabled ||
+        config?.is_dumont_enabled)) ||
     false;
   const oAuthOptions: TOAuthOption[] = [
+    // Dumont addition: listed first, it is the primary way in.
+    {
+      id: "dumont",
+      text: `${oauthActionText} with Dumont Auth`,
+      icon: <img src={dumontLogo} height={18} width={18} alt="Dumont Auth" />,
+      onClick: () => {
+        window.location.assign(`${API_BASE_URL}/auth/dumont/${next_path ? `?next_path=${next_path}` : ``}`);
+      },
+      enabled: config?.is_dumont_enabled,
+    },
     {
       id: "google",
       text: `${oauthActionText} with Google`,

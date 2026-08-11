@@ -18,6 +18,9 @@ from .views import (
     GitHubOauthInitiateEndpoint,
     GoogleCallbackEndpoint,
     GoogleOauthInitiateEndpoint,
+    # Dumont addition
+    DumontCallbackEndpoint,
+    DumontOauthInitiateEndpoint,
     MagicGenerateEndpoint,
     MagicSignInEndpoint,
     MagicSignUpEndpoint,
@@ -76,6 +79,9 @@ urlpatterns = [
         MagicSignUpSpaceEndpoint.as_view(),
         name="space-magic-sign-up",
     ),
+    ## Dumont Auth Oauth (Dumont addition, app only - space sign-in stays on the upstream providers)
+    path("dumont/", DumontOauthInitiateEndpoint.as_view(), name="dumont-initiate"),
+    path("dumont/callback/", DumontCallbackEndpoint.as_view(), name="dumont-callback"),
     ## Google Oauth
     path("google/", GoogleOauthInitiateEndpoint.as_view(), name="google-initiate"),
     path("google/callback/", GoogleCallbackEndpoint.as_view(), name="google-callback"),
