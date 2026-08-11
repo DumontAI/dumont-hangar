@@ -99,14 +99,14 @@ class DumontOAuthProvider(OauthAdapter):
     def set_user_data(self):
         user_info_response = self.get_user_response()
         email = user_info_response.get("email")
-        # Reject an address the issuer explicitly marks unverified: it would let anyone claim a
-        # Hangar account by registering someone else's address at the IdP. Dumont Auth omits
-        # email_verified in some responses (same quirk that forced the Frappe oauth.py patch), and
-        # a missing claim is not a failed check, so only an explicit false is fatal.
-        if not email or user_info_response.get("email_verified") is False:
+        # Fail closed exactly like upstream's providers (GHSA-7j95-vh8g-f365): an unverified
+        # address would let anyone claim a Hangar account by registering someone else's address
+        # at the IdP. Dumont Auth's userinfo does return email_verified, verified against the
+        # live endpoint, so an absent claim means something changed and is not safe to trust.
+        if not email or user_info_response.get("email_verified") is not True:
             raise AuthenticationException(
-                error_code=AUTHENTICATION_ERROR_CODES["DUMONT_OAUTH_PROVIDER_ERROR"],
-                error_message="DUMONT_OAUTH_PROVIDER_ERROR",
+                error_code=AUTHENTICATION_ERROR_CODES["OAUTH_PROVIDER_UNVERIFIED_EMAIL"],
+                error_message="OAUTH_PROVIDER_UNVERIFIED_EMAIL",
             )
         super().set_user_data(
             {

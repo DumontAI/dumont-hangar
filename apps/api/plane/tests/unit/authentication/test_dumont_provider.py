@@ -45,11 +45,11 @@ class TestDumontUserData:
         assert provider.user_data["user"]["first_name"] == "Carlos"
         assert provider.user_data["user"]["is_password_autoset"] is True
 
-    def test_absent_email_verified_is_accepted(self):
-        """Dumont Auth omits the claim in some responses; absent must not mean unverified."""
+    def test_absent_email_verified_is_rejected(self):
+        """Fail closed like upstream (GHSA-7j95-vh8g-f365): absent is not verified."""
         provider = _provider({"sub": "1", "email": "carlos@shipeezi.com"})
-        provider.set_user_data()
-        assert provider.user_data["email"] == "carlos@shipeezi.com"
+        with pytest.raises(AuthenticationException):
+            provider.set_user_data()
 
     def test_explicit_unverified_email_is_rejected(self):
         provider = _provider({"sub": "1", "email": "attacker@example.com", "email_verified": False})
