@@ -29,6 +29,8 @@ class LLMProvider:
     name: str = ""
     models: List[str] = []
     default_model: str = ""
+    # Dumont addition: None means the OpenAI SDK default (api.openai.com)
+    base_url: str | None = None
 
     @classmethod
     def get_config(cls) -> Dict[str, str | List[str]]:
@@ -66,10 +68,20 @@ class GeminiProvider(LLMProvider):
     default_model = "gemini-pro"
 
 
+# Dumont addition: DeepSeek speaks the OpenAI API, so it only needs a base_url.
+class DeepSeekProvider(LLMProvider):
+    name = "DeepSeek"
+    models = ["deepseek-chat", "deepseek-reasoner"]
+    default_model = "deepseek-chat"
+    base_url = "https://api.deepseek.com"
+
+
 SUPPORTED_PROVIDERS = {
     "openai": OpenAIProvider,
     "anthropic": AnthropicProvider,
     "gemini": GeminiProvider,
+    # Dumont addition
+    "deepseek": DeepSeekProvider,
 }
 
 
@@ -128,7 +140,10 @@ def get_llm_response(task, prompt, api_key: str, model: str, provider: str) -> T
         if provider.lower() == "gemini":
             model = f"gemini/{model}"
 
-        client = OpenAI(api_key=api_key)
+        # Dumont addition: route OpenAI-compatible providers at their own host
+        provider_cls = SUPPORTED_PROVIDERS.get(provider.lower())
+        base_url = getattr(provider_cls, "base_url", None) if provider_cls else None
+        client = OpenAI(api_key=api_key, base_url=base_url) if base_url else OpenAI(api_key=api_key)
         chat_completion = client.chat.completions.create(
             model=model, messages=[{"role": "user", "content": final_text}]
         )
