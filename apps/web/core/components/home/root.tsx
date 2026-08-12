@@ -17,6 +17,7 @@ import { TourRoot } from "@/components/onboarding/tour/root";
 // local imports
 import { DashboardWidgets } from "./home-dashboard-widgets";
 import { UserGreetingsView } from "./user-greetings";
+import { HomeWorkOverview } from "./work-overview";
 import { HomePeekOverviewsRoot } from "../issues/peek-overview/peek-overviews";
 
 export const WorkspaceHomeView = observer(function WorkspaceHomeView() {
@@ -55,8 +56,9 @@ export const WorkspaceHomeView = observer(function WorkspaceHomeView() {
       <>
         <HomePeekOverviewsRoot />
         <ContentWrapper className="mx-auto scrollbar-hide gap-6 bg-surface-1 px-page-x">
-          <div className="mx-auto w-full max-w-[800px]">
+          <div className="mx-auto w-full max-w-[1000px]">
             {currentUser && <UserGreetingsView user={currentUser} />}
+            <HomeWorkOverview />
             <DashboardWidgets />
           </div>
         </ContentWrapper>
