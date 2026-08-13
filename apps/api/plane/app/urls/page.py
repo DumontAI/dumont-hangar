@@ -11,9 +11,15 @@ from plane.app.views import (
     PagesDescriptionViewSet,
     PageVersionEndpoint,
     PageDuplicateEndpoint,
+    WorkspacePagesEndpoint,
 )
 
 urlpatterns = [
+    path(
+        "workspaces/<str:slug>/pages/",
+        WorkspacePagesEndpoint.as_view(),
+        name="workspace-pages",
+    ),
     path(
         "workspaces/<str:slug>/projects/<uuid:project_id>/pages-summary/",
         PageViewSet.as_view({"get": "summary"}),

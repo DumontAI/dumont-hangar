@@ -172,6 +172,7 @@ from .page.base import (
     PageFavoriteViewSet,
     PagesDescriptionViewSet,
     PageDuplicateEndpoint,
+    WorkspacePagesEndpoint,
 )
 from .page.version import PageVersionEndpoint
 

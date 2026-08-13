@@ -637,3 +637,30 @@ class PageDuplicateEndpoint(BaseAPIView):
         )
         serializer = PageDetailSerializer(page)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+class WorkspacePagesEndpoint(BaseAPIView):
+    """List root pages across every project the user is an active member of."""
+
+    @allow_permission(allowed_roles=[ROLE.ADMIN, ROLE.MEMBER, ROLE.GUEST], level="WORKSPACE")
+    def get(self, request, slug):
+        pages = (
+            Page.objects.filter(workspace__slug=slug)
+            .filter(
+                projects__project_projectmember__member=request.user,
+                projects__project_projectmember__is_active=True,
+                projects__archived_at__isnull=True,
+            )
+            .filter(parent__isnull=True, archived_at__isnull=True)
+            .filter(Q(owned_by=request.user) | Q(access=0))
+            .select_related("workspace", "owned_by")
+            .annotate(
+                project_ids=Coalesce(
+                    ArrayAgg("projects__id", distinct=True, filter=~Q(projects__id__isnull=True)),
+                    Value([], output_field=ArrayField(UUIDField())),
+                )
+            )
+            .distinct()
+            .order_by("-updated_at")
+        )
+        return Response(PageSerializer(pages, many=True).data, status=status.HTTP_200_OK)

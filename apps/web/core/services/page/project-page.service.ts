@@ -29,6 +29,14 @@ export class ProjectPageService extends APIService {
       });
   }
 
+  async fetchAllInWorkspace(workspaceSlug: string): Promise<TPage[]> {
+    return this.get(`/api/workspaces/${workspaceSlug}/pages/`)
+      .then((response) => response?.data)
+      .catch((error) => {
+        throw error?.response?.data;
+      });
+  }
+
   async fetchById(workspaceSlug: string, projectId: string, pageId: string, trackVisit: boolean): Promise<TPage> {
     return this.get(`/api/workspaces/${workspaceSlug}/projects/${projectId}/pages/${pageId}/`, {
       params: {
