@@ -78,7 +78,7 @@ class PageViewSet(BaseViewSet):
     permission_classes = [ProjectPagePermission]
     search_fields = ["name"]
 
-    def get_queryset(self):
+    def get_queryset(self, include_sub_pages=False):
         subquery = UserFavorite.objects.filter(
             user=self.request.user,
             entity_type="page",
@@ -94,7 +94,7 @@ class PageViewSet(BaseViewSet):
                 projects__project_projectmember__is_active=True,
                 projects__archived_at__isnull=True,
             )
-            .filter(parent__isnull=True)
+            .filter(**({} if include_sub_pages else {"parent__isnull": True}))
             .filter(Q(owned_by=self.request.user) | Q(access=0))
             .prefetch_related("projects")
             .select_related("workspace")
@@ -200,7 +200,8 @@ class PageViewSet(BaseViewSet):
             )
 
     def retrieve(self, request, slug, project_id, page_id=None):
-        page = self.get_queryset().filter(pk=page_id).first()
+        # sub-pages are hidden from the list but must still open directly
+        page = self.get_queryset(include_sub_pages=True).filter(pk=page_id).first()
         project = Project.objects.get(pk=project_id)
         track_visit = request.query_params.get("track_visit", "true").lower() == "true"
 
