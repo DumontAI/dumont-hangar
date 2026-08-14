@@ -5,8 +5,10 @@
  */
 
 import React from "react";
+import { observer } from "mobx-react";
 import { useTranslation } from "@plane/i18n";
 import { ChartXAxisProperty, ChartYAxisMetric } from "@plane/types";
+import { useAnalytics } from "@/hooks/store/use-analytics";
 import AnalyticsSectionWrapper from "../analytics-section-wrapper";
 import AnalyticsWrapper from "../analytics-wrapper";
 import TotalInsights from "../total-insights";
@@ -24,8 +26,12 @@ const BREAKDOWNS = [
   { key: "types_of_work", x_axis: ChartXAxisProperty.LABELS },
 ] as const;
 
-function Summary() {
+const Summary = observer(function Summary() {
   const { t } = useTranslation();
+  const { selectedProjects } = useAnalytics();
+  // every project brings its own states, so across projects only the groups are readable
+  const statusAxis =
+    selectedProjects?.length === 1 ? ChartXAxisProperty.STATES : ChartXAxisProperty.STATE_GROUPS;
 
   return (
     <AnalyticsWrapper i18nTitle="workspace_analytics.summary.label">
@@ -33,12 +39,15 @@ function Summary() {
         <TotalInsights analyticsType="summary" />
         {BREAKDOWNS.map((breakdown) => (
           <AnalyticsSectionWrapper key={breakdown.key} title={t(`workspace_analytics.summary.${breakdown.key}`)}>
-            <PriorityChart x_axis={breakdown.x_axis} y_axis={ChartYAxisMetric.WORK_ITEM_COUNT} />
+            <PriorityChart
+              x_axis={breakdown.key === "status_overview" ? statusAxis : breakdown.x_axis}
+              y_axis={ChartYAxisMetric.WORK_ITEM_COUNT}
+            />
           </AnalyticsSectionWrapper>
         ))}
       </div>
     </AnalyticsWrapper>
   );
-}
+});
 
 export { Summary };
