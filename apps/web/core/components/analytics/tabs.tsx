@@ -6,9 +6,11 @@
 
 import type { AnalyticsTab } from "@plane/types";
 import { Overview } from "@/components/analytics/overview";
+import { Summary } from "@/components/analytics/summary";
 import { WorkItems } from "@/components/analytics/work-items";
 
 export const getAnalyticsTabs = (t: (key: string, params?: Record<string, any>) => string): AnalyticsTab[] => [
+  { key: "summary", label: t("workspace_analytics.summary.label"), content: Summary, isDisabled: false },
   { key: "overview", label: t("common.overview"), content: Overview, isDisabled: false },
   { key: "work-items", label: t("sidebar.work_items"), content: WorkItems, isDisabled: false },
 ];

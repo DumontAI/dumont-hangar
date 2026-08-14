@@ -20,6 +20,12 @@ export interface IInsightField {
 }
 
 export const ANALYTICS_INSIGHTS_FIELDS: Record<TAnalyticsTabsBase, IInsightField[]> = {
+  summary: [
+    { key: "created_recently", i18nKey: "workspace_analytics.summary.created" },
+    { key: "completed_recently", i18nKey: "workspace_analytics.summary.completed" },
+    { key: "updated_recently", i18nKey: "workspace_analytics.summary.updated" },
+    { key: "due_soon", i18nKey: "workspace_analytics.summary.due_soon" },
+  ],
   overview: [
     {
       key: "total_users",

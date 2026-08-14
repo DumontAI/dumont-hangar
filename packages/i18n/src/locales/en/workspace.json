@@ -148,7 +148,18 @@
     "workitem_resolved_vs_pending": "Work items resolved vs pending",
     "projects_by_status": "Projects by status",
     "active_users": "Active users",
-    "intake_trends": "Intake Trends"
+    "intake_trends": "Intake Trends",
+    "summary": {
+      "label": "Summary",
+      "created": "Created in the last 7 days",
+      "completed": "Completed in the last 7 days",
+      "updated": "Updated in the last 7 days",
+      "due_soon": "Due in the next 7 days",
+      "status_overview": "Status overview",
+      "priority_breakdown": "Priority breakdown",
+      "team_workload": "Team workload",
+      "types_of_work": "Types of work"
+    }
   },
   "workspace_projects": {
     "label": "{count, plural, one {Project} other {Projects}}",

@@ -4,6 +4,7 @@
 
 from rest_framework.response import Response
 from rest_framework import status
+from datetime import timedelta
 from typing import Dict, List, Any
 from django.db.models import QuerySet, Q, Count
 from django.http import HttpRequest
@@ -101,6 +102,23 @@ class AdvanceAnalyticsEndpoint(AdvanceAnalyticsBaseView):
             "completed_work_items": self.get_filtered_counts(base_queryset.filter(state__group="completed")),
         }
 
+    def get_summary_stats(self) -> Dict[str, Dict[str, int]]:
+        """The last-7-days numbers a Jira project summary opens with."""
+        base_queryset = Issue.issue_objects.filter(**self.filters["base_filters"])
+        since = timezone.now() - timedelta(days=7)
+        today = timezone.now().date()
+
+        return {
+            "created_recently": {"count": base_queryset.filter(created_at__gte=since).count()},
+            "completed_recently": {"count": base_queryset.filter(completed_at__gte=since).count()},
+            "updated_recently": {"count": base_queryset.filter(updated_at__gte=since).count()},
+            "due_soon": {
+                "count": base_queryset.filter(target_date__gte=today, target_date__lte=today + timedelta(days=7))
+                .exclude(state__group__in=["completed", "cancelled"])
+                .count()
+            },
+        }
+
     @allow_permission([ROLE.ADMIN, ROLE.MEMBER], level="WORKSPACE")
     def get(self, request: HttpRequest, slug: str) -> Response:
         self.initialize_workspace(slug, type="analytics")
@@ -109,6 +127,11 @@ class AdvanceAnalyticsEndpoint(AdvanceAnalyticsBaseView):
         if tab == "overview":
             return Response(
                 self.get_overview_data(),
+                status=status.HTTP_200_OK,
+            )
+        elif tab == "summary":
+            return Response(
+                self.get_summary_stats(),
                 status=status.HTTP_200_OK,
             )
         elif tab == "work-items":
