@@ -1,6 +1,13 @@
-<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"> 
-<html>
-    <p>This is a test email sent to verify if email configuration is working as expected in your Dumont Hangar instance.</p>
+{% extends "emails/base_dumont.html" %}
 
-<p>Regards,</br> Team Dumont </p>
-</html>
+{% block title %}Dumont Hangar test email{% endblock %}
+
+{% block heading %}
+<h1 style="margin:0 0 16px;font-size:20px;line-height:1.35;color:#1B2433;">Email is working</h1>
+{% endblock %}
+
+{% block content %}
+<p style="margin:0;font-size:15px;line-height:1.65;color:#374151;">
+  This is a test message from Dumont Hangar. If it arrived, the SMTP settings are right.
+</p>
+{% endblock %}
