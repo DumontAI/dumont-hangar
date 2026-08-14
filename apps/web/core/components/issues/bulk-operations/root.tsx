@@ -123,17 +123,27 @@ export const IssueBulkOperationsRoot = observer(function IssueBulkOperationsRoot
 
         {projectId ? (
           <div className={cn("flex flex-wrap items-center gap-2", isUpdating && "pointer-events-none opacity-60")}>
-            <StateDropdown
-              value={undefined}
-              projectId={projectId}
-              onChange={(stateId) => applyToSelection({ state_id: stateId }, "state")}
-              buttonVariant="border-with-text"
-            />
-            <PriorityDropdown
-              value={undefined}
-              onChange={(priority: TIssuePriorities) => applyToSelection({ priority }, "priority")}
-              buttonVariant="border-with-text"
-            />
+            {/* the icons alone would read as current values, so each control is labelled */}
+            <span className="text-13 text-tertiary">Set</span>
+            <span className="flex items-center gap-1">
+              <span className="text-13">State</span>
+              <StateDropdown
+                value={undefined}
+                showDefaultState={false}
+                projectId={projectId}
+                onChange={(stateId) => applyToSelection({ state_id: stateId }, "state")}
+                buttonVariant="border-without-text"
+              />
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="text-13">Priority</span>
+              <PriorityDropdown
+                value={undefined}
+                onChange={(priority: TIssuePriorities) => applyToSelection({ priority }, "priority")}
+                buttonVariant="border-without-text"
+                hideText
+              />
+            </span>
             <MemberDropdown
               projectId={projectId}
               value={[]}
