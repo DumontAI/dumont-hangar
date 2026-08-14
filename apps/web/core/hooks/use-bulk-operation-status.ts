@@ -4,4 +4,9 @@
  * See the LICENSE file for details.
  */
 
-export const useBulkOperationStatus = () => false;
+/**
+ * Multi-select on work item layouts. Upstream ships the selection code but keeps
+ * this switch off in the community build; the actions behind it live in
+ * components/issues/bulk-operations.
+ */
+export const useBulkOperationStatus = () => true;
