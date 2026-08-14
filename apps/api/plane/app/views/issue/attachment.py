@@ -182,10 +182,19 @@ class IssueAttachmentV2Endpoint(BaseAPIView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
+            # inline so the UI can preview images, PDFs and video in a modal;
+            # ?download=1 (and anything a browser can execute) still forces a download
             storage = S3Storage(request=request)
+            asset_mime_type = (asset.attributes.get("type") or "").split(";")[0].strip().lower()
+            wants_download = request.GET.get("download") in ("1", "true", "True")
+            disposition = (
+                "attachment"
+                if wants_download or asset_mime_type in settings.SCRIPT_CAPABLE_MIME_TYPES
+                else "inline"
+            )
             presigned_url = storage.generate_presigned_url(
                 object_name=asset.asset.name,
-                disposition="attachment",
+                disposition=disposition,
                 filename=asset.attributes.get("name"),
             )
             return HttpResponseRedirect(presigned_url)

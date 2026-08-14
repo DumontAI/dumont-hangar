@@ -683,12 +683,15 @@ class ProjectAssetEndpoint(BaseAPIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        # Get the presigned URL
+        # Serve inline so images, PDFs and video can be previewed in place. Anything a
+        # browser can execute stays an attachment (same-origin XSS), and the separate
+        # /download/ endpoint always forces a download.
         storage = S3Storage(request=request)
-        # Generate a presigned URL to share an S3 object
+        asset_mime_type = (asset.attributes.get("type") or "").split(";")[0].strip().lower()
+        disposition = "attachment" if asset_mime_type in settings.SCRIPT_CAPABLE_MIME_TYPES else "inline"
         signed_url = storage.generate_presigned_url(
             object_name=asset.asset.name,
-            disposition="attachment",
+            disposition=disposition,
             filename=asset.attributes.get("name"),
         )
         # Redirect to the signed URL

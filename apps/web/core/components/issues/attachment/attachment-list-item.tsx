@@ -4,9 +4,11 @@
  * See the LICENSE file for details.
  */
 
+import { useState } from "react";
 import { observer } from "mobx-react";
 
 import { useTranslation } from "@plane/i18n";
+import { Download } from "lucide-react";
 import { TrashIcon } from "@plane/propel/icons";
 import { Tooltip } from "@plane/propel/tooltip";
 import type { TIssueServiceType } from "@plane/types";
@@ -18,6 +20,7 @@ import { convertBytesToSize, getFileExtension, getFileName, getFileURL, renderFo
 //
 import { ButtonAvatars } from "@/components/dropdowns/member/avatar";
 import { getFileIcon } from "@/components/icons";
+import { IssueAttachmentPreviewModal } from "@/components/issues/attachment/attachment-preview-modal";
 // helpers
 // hooks
 import { useIssueDetail } from "@/hooks/store/use-issue-detail";
@@ -45,7 +48,10 @@ export const IssueAttachmentsListItem = observer(function IssueAttachmentsListIt
   const fileName = getFileName(attachment?.attributes.name ?? "");
   const fileExtension = getFileExtension(attachment?.attributes.name ?? "");
   const fileIcon = getFileIcon(fileExtension, 18);
-  const fileURL = getFileURL(attachment?.asset_url ?? "");
+  const fileURL = getFileURL(attachment?.asset_url ?? "") ?? "";
+  const downloadURL = fileURL ? `${fileURL}${fileURL.includes("?") ? "&" : "?"}download=1` : "";
+  // states
+  const [isPreviewOpen, setIsPreviewOpen] = useState(false);
   // hooks
   const { isMobile } = usePlatformOS();
 
@@ -53,11 +59,20 @@ export const IssueAttachmentsListItem = observer(function IssueAttachmentsListIt
 
   return (
     <>
+      <IssueAttachmentPreviewModal
+        isOpen={isPreviewOpen}
+        onClose={() => setIsPreviewOpen(false)}
+        name={`${fileName}.${fileExtension}`}
+        size={attachment.attributes.size}
+        type={attachment.attributes.type}
+        src={fileURL}
+        downloadSrc={downloadURL}
+      />
       <button
         onClick={(e) => {
           e.preventDefault();
           e.stopPropagation();
-          window.open(fileURL, "_blank");
+          setIsPreviewOpen(true);
         }}
       >
         <div className="group flex h-11 items-center justify-between gap-3 pr-2 pl-9 hover:bg-surface-2">
@@ -86,8 +101,19 @@ export const IssueAttachmentsListItem = observer(function IssueAttachmentsListIt
               </>
             )}
 
-            <CustomMenu ellipsis closeOnSelect placement="bottom-end" disabled={disabled}>
+            <CustomMenu ellipsis closeOnSelect placement="bottom-end">
               <CustomMenu.MenuItem
+                onClick={() => {
+                  window.open(downloadURL, "_blank");
+                }}
+              >
+                <div className="flex items-center gap-2">
+                  <Download className="h-3.5 w-3.5" strokeWidth={2} />
+                  <span>Download</span>
+                </div>
+              </CustomMenu.MenuItem>
+              <CustomMenu.MenuItem
+                disabled={disabled}
                 onClick={() => {
                   toggleDeleteAttachmentModal(attachmentId);
                 }}
