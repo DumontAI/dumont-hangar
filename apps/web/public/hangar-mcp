@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+"""hangar-mcp - connect an AI assistant to Hangar over MCP.
+
+Install (from your own Hangar, so the URL is always right):
+
+    curl -fsSL https://hangar.getdumont.ai/hangar-mcp -o ~/.local/bin/hangar-mcp
+    chmod +x ~/.local/bin/hangar-mcp
+
+Then point any MCP client at it:
+
+    command: hangar-mcp
+    env:     HANGAR_API_KEY=<your token>          (Settings -> API tokens)
+             HANGAR_URL=https://hangar.getdumont.ai   (optional, this is the default)
+             HANGAR_WORKSPACE=dumont                  (optional, this is the default)
+
+It runs the work item MCP server underneath and replaces itself with it, so
+stdio passes straight through and nothing in your config mentions the package.
+"""
+
+import os
+import shutil
+import sys
+
+DEFAULT_URL = "https://hangar.getdumont.ai"
+DEFAULT_WORKSPACE = "dumont"
+
+api_key = os.environ.get("HANGAR_API_KEY") or os.environ.get("HANGAR_TOKEN")
+if not api_key:
+    sys.exit(
+        "hangar-mcp: no token. Create one in Hangar under your avatar -> Settings -> API tokens, "
+        "then set HANGAR_API_KEY in your MCP config."
+    )
+
+runner = shutil.which("uvx")
+if not runner:
+    sys.exit(
+        "hangar-mcp: uvx is missing. Install uv first:\n"
+        "  brew install uv\n"
+        "  or: curl -LsSf https://astral.sh/uv/install.sh | sh"
+    )
+
+environment = {
+    **os.environ,
+    "PLANE_API_KEY": api_key,
+    "PLANE_BASE_URL": os.environ.get("HANGAR_URL", DEFAULT_URL).rstrip("/"),
+    "PLANE_WORKSPACE_SLUG": os.environ.get("HANGAR_WORKSPACE", DEFAULT_WORKSPACE),
+}
+
+# no version pin: bug fixes ride along. Pin here if an upstream release ever breaks us.
+os.execve(runner, [runner, "plane-mcp-server", "stdio", *sys.argv[1:]], environment)
