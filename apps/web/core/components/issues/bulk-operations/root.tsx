@@ -7,7 +7,7 @@
 import { useState } from "react";
 import { observer } from "mobx-react";
 import { useParams } from "next/navigation";
-import { X } from "lucide-react";
+import { Archive, Trash2, X } from "lucide-react";
 // plane imports
 import { Button } from "@plane/propel/button";
 import { TOAST_TYPE, setToast } from "@plane/propel/toast";
@@ -18,6 +18,7 @@ import { CycleDropdown } from "@/components/dropdowns/cycle";
 import { MemberDropdown } from "@/components/dropdowns/member/dropdown";
 import { PriorityDropdown } from "@/components/dropdowns/priority";
 import { StateDropdown } from "@/components/dropdowns/state/dropdown";
+import { IssuePropertyLabels } from "@/components/issues/issue-layouts/properties/labels";
 // hooks
 import { useIssueDetail } from "@/hooks/store/use-issue-detail";
 import { useMultipleSelectStore } from "@/hooks/store/use-multiple-select-store";
@@ -51,6 +52,8 @@ export const IssueBulkOperationsRoot = observer(function IssueBulkOperationsRoot
     updateIssue,
     addIssueToCycle,
     removeIssueFromCycle,
+    archiveIssue,
+    removeIssue,
     issue: { getIssueById },
   } = useIssueDetail();
 
@@ -114,6 +117,51 @@ export const IssueBulkOperationsRoot = observer(function IssueBulkOperationsRoot
     }
   };
 
+  // labels add rather than replace: picking "bug" should not wipe the labels already there
+  const addLabels = async (labelIds: string[]) => {
+    if (!workspaceSlug || labelIds.length === 0) return;
+    setIsUpdating(true);
+    try {
+      await Promise.all(
+        selectedIssues.map((issue) =>
+          updateIssue(workspaceSlug.toString(), issue.project_id as string, issue.id, {
+            label_ids: Array.from(new Set([...(issue.label_ids ?? []), ...labelIds])),
+          })
+        )
+      );
+      setToast({ type: TOAST_TYPE.SUCCESS, title: "Updated", message: `${selectedIssues.length} work items: labels` });
+    } catch {
+      setToast({ type: TOAST_TYPE.ERROR, title: "Could not label every work item", message: "Try again." });
+    } finally {
+      setIsUpdating(false);
+    }
+  };
+
+  const runOnEach = async (
+    action: (workspaceSlug: string, projectId: string, issueId: string) => Promise<unknown>,
+    verb: string
+  ) => {
+    if (!workspaceSlug) return;
+    const count = selectedIssues.length;
+    if (!window.confirm(`${verb} ${count} work item${count > 1 ? "s" : ""}?`)) return;
+    setIsUpdating(true);
+    try {
+      await Promise.all(
+        selectedIssues.map((issue) => action(workspaceSlug.toString(), issue.project_id as string, issue.id))
+      );
+      setToast({ type: TOAST_TYPE.SUCCESS, title: `${verb}d`, message: `${count} work item${count > 1 ? "s" : ""}` });
+      clearSelection();
+    } catch {
+      setToast({
+        type: TOAST_TYPE.ERROR,
+        title: `Could not ${verb.toLowerCase()} every work item`,
+        message: "Only completed or cancelled items can be archived.",
+      });
+    } finally {
+      setIsUpdating(false);
+    }
+  };
+
   return (
     <div className={cn("sticky bottom-0 left-0 z-[2] grid h-20 place-items-center px-3.5", className)}>
       <div className="border-subtle bg-surface-1 flex h-14 w-full items-center gap-3 rounded-md border px-3.5 py-4 shadow-lg">
@@ -159,6 +207,29 @@ export const IssueBulkOperationsRoot = observer(function IssueBulkOperationsRoot
               buttonVariant="border-with-text"
               placeholder="Cycle"
             />
+            <IssuePropertyLabels
+              projectId={projectId}
+              value={[]}
+              onChange={addLabels}
+              placeholderText="Labels"
+              hideDropdownArrow={false}
+            />
+            <button
+              type="button"
+              className="text-13 flex items-center gap-1 rounded-sm border border-subtle px-2 py-1 hover:bg-layer-transparent-hover"
+              onClick={() => runOnEach(archiveIssue, "Archive")}
+            >
+              <Archive className="size-3.5" />
+              Archive
+            </button>
+            <button
+              type="button"
+              className="text-13 text-danger-primary flex items-center gap-1 rounded-sm border border-subtle px-2 py-1 hover:bg-layer-transparent-hover"
+              onClick={() => runOnEach(removeIssue, "Delete")}
+            >
+              <Trash2 className="size-3.5" />
+              Delete
+            </button>
           </div>
         ) : (
           <span className="text-13 text-tertiary">

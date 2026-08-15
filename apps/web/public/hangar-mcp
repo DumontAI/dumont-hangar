@@ -9,20 +9,24 @@ Install (from your own Hangar, so the URL is always right):
 Then point any MCP client at it:
 
     command: hangar-mcp
-    env:     HANGAR_API_KEY=<your token>          (Settings -> API tokens)
+    env:     HANGAR_API_KEY=<your token>              (Settings -> API tokens)
              HANGAR_URL=https://hangar.getdumont.ai   (optional, this is the default)
              HANGAR_WORKSPACE=dumont                  (optional, this is the default)
 
-It runs the work item MCP server underneath and replaces itself with it, so
-stdio passes straight through and nothing in your config mentions the package.
+It runs the work item MCP server underneath and relays stdio both ways, rewriting
+the one field where the server names itself so clients show "Hangar".
 """
 
+import json
 import os
 import shutil
+import subprocess
 import sys
+import threading
 
 DEFAULT_URL = "https://hangar.getdumont.ai"
 DEFAULT_WORKSPACE = "dumont"
+SERVER_NAME = "Hangar"
 
 api_key = os.environ.get("HANGAR_API_KEY") or os.environ.get("HANGAR_TOKEN")
 if not api_key:
@@ -47,4 +51,39 @@ environment = {
 }
 
 # no version pin: bug fixes ride along. Pin here if an upstream release ever breaks us.
-os.execve(runner, [runner, "plane-mcp-server", "stdio", *sys.argv[1:]], environment)
+server = subprocess.Popen(
+    [runner, "plane-mcp-server", "stdio", *sys.argv[1:]],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    env=environment,
+    bufsize=0,
+)
+
+
+def rename(line: bytes) -> bytes:
+    """Only the initialize response carries serverInfo; everything else passes through."""
+    if b'"serverInfo"' not in line:
+        return line
+    try:
+        message = json.loads(line)
+        info = message.get("result", {}).get("serverInfo")
+        if isinstance(info, dict):
+            info["name"] = SERVER_NAME
+            return (json.dumps(message) + "\n").encode()
+    except (ValueError, AttributeError):
+        pass
+    return line
+
+
+def pump(source, sink, transform=None):
+    for line in iter(source.readline, b""):
+        sink.write(transform(line) if transform else line)
+        sink.flush()
+    sink.close()
+
+
+threading.Thread(
+    target=pump, args=(sys.stdin.buffer, server.stdin), daemon=True
+).start()
+pump(server.stdout, sys.stdout.buffer, rename)
+sys.exit(server.wait())
