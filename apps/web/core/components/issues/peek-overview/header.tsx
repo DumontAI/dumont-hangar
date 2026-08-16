@@ -7,7 +7,7 @@
 import { useRef } from "react";
 import { observer } from "mobx-react";
 import Link from "next/link";
-import { MoveDiagonal, MoveRight } from "lucide-react";
+import { ArrowLeft, MoveDiagonal, MoveRight } from "lucide-react";
 // plane imports
 import { useTranslation } from "@plane/i18n";
 import { CenterPanelIcon, CopyLinkIcon, FullScreenPanelIcon, SidePanelIcon } from "@plane/propel/icons";
@@ -159,11 +159,23 @@ export const IssuePeekOverviewHeader = observer(function IssuePeekOverviewHeader
       }`}
     >
       <div className="flex items-center gap-4">
-        <Tooltip tooltipContent={t("common.close_peek_view")} isMobile={isMobile}>
-          <button onClick={removeRoutePeekId}>
-            <MoveRight className="h-4 w-4 text-tertiary hover:text-secondary" />
+        {/* opened from the inbox there is nowhere to go "back" to except the list,
+            and a bare arrow does not say so */}
+        {embedIssue ? (
+          <button
+            onClick={removeRoutePeekId}
+            className="text-13 flex items-center gap-1 text-tertiary hover:text-secondary"
+          >
+            <ArrowLeft className="h-4 w-4" />
+            Back
           </button>
-        </Tooltip>
+        ) : (
+          <Tooltip tooltipContent={t("common.close_peek_view")} isMobile={isMobile}>
+            <button onClick={removeRoutePeekId}>
+              <MoveRight className="h-4 w-4 text-tertiary hover:text-secondary" />
+            </button>
+          </Tooltip>
+        )}
 
         <Tooltip tooltipContent={t("issue.open_in_full_screen")} isMobile={isMobile}>
           <Link href={workItemLink} onClick={() => removeRoutePeekId()}>
