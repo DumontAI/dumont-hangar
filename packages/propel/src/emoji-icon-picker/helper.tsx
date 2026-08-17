@@ -9,6 +9,7 @@ import type { TPlacement, TSide, TAlign } from "../utils/placement";
 export const EmojiIconPickerTypes = {
   EMOJI: "emoji",
   ICON: "icon",
+  IMAGE: "image",
 } as const;
 
 export type TChangeHandlerProps =
@@ -22,9 +23,18 @@ export type TChangeHandlerProps =
         name: string;
         color: string;
       };
+    }
+  | {
+      type: typeof EmojiIconPickerTypes.IMAGE;
+      value: {
+        url: string;
+      };
     };
 
-export type TEmojiIconPickerTypes = typeof EmojiIconPickerTypes.EMOJI | typeof EmojiIconPickerTypes.ICON;
+export type TEmojiIconPickerTypes =
+  | typeof EmojiIconPickerTypes.EMOJI
+  | typeof EmojiIconPickerTypes.ICON
+  | typeof EmojiIconPickerTypes.IMAGE;
 
 export type TCustomEmojiPicker = {
   isOpen: boolean;
@@ -42,6 +52,9 @@ export type TCustomEmojiPicker = {
   searchDisabled?: boolean;
   searchPlaceholder?: string;
   iconType?: "material" | "lucide";
+  /** provide this to offer an Upload tab; it stores the file and returns its URL */
+  uploadImage?: (file: File) => Promise<string>;
+  currentImageUrl?: string;
   theme?: "light" | "dark";
   side?: TSide;
   align?: TAlign;

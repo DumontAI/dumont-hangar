@@ -36,7 +36,21 @@ export function Logo({ logo, size = 16, type = "material" }: Props) {
   // Early returns for loading/empty states
   if (!logo || !logo.in_use) return loadingSkeleton;
 
-  const { in_use, emoji, icon } = logo;
+  const { in_use, emoji, icon, image } = logo;
+
+  // Uploaded image
+  if (in_use === "image") {
+    if (!image?.url) return loadingSkeleton;
+    return (
+      <img
+        src={image.url}
+        alt=""
+        style={{ height: size, width: size }}
+        className="rounded-sm object-cover"
+      />
+    );
+  }
+
   const value = in_use === "emoji" ? emoji?.value : icon?.name;
 
   if (!value) return loadingSkeleton;

@@ -18,7 +18,7 @@ import { Tooltip } from "@plane/propel/tooltip";
 import { EFileAssetType } from "@plane/types";
 import type { IProject, IWorkspace } from "@plane/types";
 import { CustomSelect, Input, TextArea } from "@plane/ui";
-import { renderFormattedDate } from "@plane/utils";
+import { getFileURL, renderFormattedDate } from "@plane/utils";
 import { CoverImage } from "@/components/common/cover-image";
 import { ImagePickerPopover } from "@/components/core/image-picker-popover";
 import { TimezoneSelect } from "@/components/global";
@@ -28,6 +28,7 @@ import { handleCoverImageChange } from "@/helpers/cover-image.helper";
 import { useProject } from "@/hooks/store/use-project";
 import { usePlatformOS } from "@/hooks/use-platform-os";
 // services
+import { FileService } from "@/services/file.service";
 import { ProjectService } from "@/services/project";
 // local imports
 import { ProjectNetworkIcon } from "./project-network-icon";
@@ -39,9 +40,21 @@ export interface IProjectDetailsForm {
   isAdmin: boolean;
 }
 const projectService = new ProjectService();
+const fileService = new FileService();
 
 export function ProjectDetailsForm(props: IProjectDetailsForm) {
   const { project, workspaceSlug, projectId, isAdmin } = props;
+
+  // logo uploads ride the project asset flow that cover images already use
+  const uploadLogo = async (file: File) => {
+    const response = await fileService.uploadProjectAsset(
+      workspaceSlug,
+      projectId,
+      { entity_identifier: projectId, entity_type: EFileAssetType.PROJECT_COVER },
+      file
+    );
+    return getFileURL(response.asset_url) ?? response.asset_url;
+  };
   const { t } = useTranslation();
   // states
   const [isOpen, setIsOpen] = useState(false);
@@ -226,7 +239,7 @@ export function ProjectDetailsForm(props: IProjectDetailsForm) {
                       logoValue = {
                         value: val.value,
                       };
-                    else if (val?.type === "icon") logoValue = val.value;
+                    else if (val?.type === "icon" || val?.type === "image") logoValue = val.value;
 
                     onChange({
                       in_use: val?.type,
@@ -234,6 +247,8 @@ export function ProjectDetailsForm(props: IProjectDetailsForm) {
                     });
                     setIsOpen(false);
                   }}
+                  uploadImage={isAdmin ? uploadLogo : undefined}
+                  currentImageUrl={value?.in_use === "image" ? value?.image?.url : undefined}
                   defaultIconColor={value?.in_use && value.in_use === "icon" ? value?.icon?.color : undefined}
                   defaultOpen={
                     value.in_use && value.in_use === "emoji" ? EmojiIconPickerTypes.EMOJI : EmojiIconPickerTypes.ICON
