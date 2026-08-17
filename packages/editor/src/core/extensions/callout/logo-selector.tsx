@@ -57,6 +57,8 @@ export function CalloutBlockLogoSelector(props: Props) {
               url: DEFAULT_CALLOUT_BLOCK_ATTRIBUTES["data-emoji-url"],
             },
           };
+          // a callout takes an emoji or an icon, never an uploaded image
+          if (val.type === "image") return;
           if (val.type === "emoji") {
             // val.value is now a string in decimal format (e.g. "128512")
             const emojiValue = val.value;
