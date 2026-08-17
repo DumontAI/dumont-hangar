@@ -626,8 +626,12 @@ class ProjectAssetEndpoint(BaseAPIView):
             workspace=workspace,
             created_by=request.user,
             entity_type=entity_type,
-            project_id=project_id,
-            **self.get_entity_id_field(entity_type, entity_identifier),
+            # PROJECT_COVER hands back project_id too, so let the entity field win
+            # rather than pass the same keyword twice and blow up with a 500
+            **{
+                "project_id": project_id,
+                **self.get_entity_id_field(entity_type, entity_identifier),
+            },
         )
 
         # Get the presigned URL

@@ -9,6 +9,9 @@ import { ImageUp, Loader2 } from "lucide-react";
 import { cn } from "../../utils/classname";
 
 const MAX_SIZE = 2 * 1024 * 1024;
+// what the asset endpoint actually accepts. SVG is excluded on purpose: it can carry
+// script, so it is served as a download rather than rendered inline
+const ACCEPTED = ["image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"];
 
 type Props = {
   currentUrl?: string;
@@ -25,8 +28,8 @@ export function ImageUploadRoot({ currentUrl, onChange, upload }: Props) {
 
   const handleFile = async (file?: File) => {
     if (!file) return;
-    if (!file.type.startsWith("image/")) {
-      setError("That is not an image.");
+    if (!ACCEPTED.includes(file.type)) {
+      setError("Use a PNG, JPG, WebP or GIF.");
       return;
     }
     if (file.size > MAX_SIZE) {
@@ -37,8 +40,11 @@ export function ImageUploadRoot({ currentUrl, onChange, upload }: Props) {
     setIsUploading(true);
     try {
       onChange(await upload(file));
-    } catch {
-      setError("Upload failed. Try again.");
+    } catch (e) {
+      // show what the server said; a bare "try again" tells nobody anything
+      const detail =
+        (e as { error?: string; message?: string })?.error ?? (e as { message?: string })?.message ?? "";
+      setError(detail || "Upload failed. Try again.");
     } finally {
       setIsUploading(false);
     }
@@ -61,13 +67,13 @@ export function ImageUploadRoot({ currentUrl, onChange, upload }: Props) {
       >
         {isUploading ? <Loader2 className="size-5 animate-spin" /> : <ImageUp className="size-5" />}
         {isUploading ? "Uploading…" : "Choose an image"}
-        <span className="text-11 text-placeholder">PNG, JPG or SVG up to 2 MB</span>
+        <span className="text-11 text-placeholder">PNG, JPG, WebP or GIF up to 2 MB</span>
       </button>
       {error && <p className="text-11 text-danger-primary">{error}</p>}
       <input
         ref={inputRef}
         type="file"
-        accept="image/*"
+        accept={ACCEPTED.join(",")}
         hidden
         onChange={(e) => {
           void handleFile(e.target.files?.[0]);
