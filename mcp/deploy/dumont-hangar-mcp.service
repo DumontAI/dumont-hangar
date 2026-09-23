@@ -1,0 +1,26 @@
+[Unit]
+Description=Dumont Hangar read-only MCP server
+Documentation=https://github.com/DumontAI/dumont-hangar/tree/dumont/mcp
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deploy
+Group=deploy
+WorkingDirectory=/opt/dumont-hangar-mcp/current/mcp
+EnvironmentFile=/etc/dumont-hangar-mcp.env
+ExecStart=/usr/bin/node /opt/dumont-hangar-mcp/current/mcp/dist/http.js
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/opt/dumont-hangar-mcp
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
