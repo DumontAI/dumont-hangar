@@ -2,8 +2,6 @@ import type { KeyObject } from "node:crypto";
 
 export type JsonRecord = Record<string, unknown>;
 
-export type McpAuthMode = "static" | "oidc";
-
 export type OidcIntrospectionAuth =
   | {
       readonly method: "client_secret_basic";
@@ -28,8 +26,6 @@ export interface HangarConfig {
   readonly projectCacheSeconds: number;
   readonly httpPort: number;
   readonly httpHost: string;
-  readonly authMode: McpAuthMode;
-  readonly mcpAuthToken: string;
   readonly allowedOrigins: readonly string[];
   readonly allowedHosts: readonly string[];
   readonly oidcIssuer: URL | null;

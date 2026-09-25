@@ -2,9 +2,10 @@ import { createServer, type Server } from "node:http";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import { afterEach, describe, expect, it } from "vitest";
 import { createAuthorizer, protectedResourceMetadata } from "../src/auth.js";
+import { HangarClient } from "../src/client.js";
 import { createHangarHttpServer } from "../src/http.js";
 import { createHangarServer } from "../src/tools.js";
-import { testConfig } from "./fixtures.js";
+import { hangarFetch, PROJECT_HGR, testConfig } from "./fixtures.js";
 
 const openServers: Server[] = [];
 
@@ -52,8 +53,6 @@ async function setupOidc() {
   const issuer = new URL("https://issuer.example.test");
   const roleScope = "urn:zitadel:iam:org:project:role:hangar_reader";
   const config = testConfig({
-    authMode: "oidc",
-    mcpAuthToken: "",
     allowedHosts: [],
     oidcIssuer: issuer,
     oidcJwksUrl: new URL(`http://127.0.0.1:${jwksPort}/jwks`),
@@ -140,7 +139,9 @@ describe("OIDC authorization", () => {
 
   it("returns 401 metadata challenge and 403 for a valid token without the role", async () => {
     const { config, token } = await setupOidc();
-    const server = createHangarHttpServer(config, () => createHangarServer(config));
+    const calls: URL[] = [];
+    const hangar = new HangarClient(config, hangarFetch(calls));
+    const server = createHangarHttpServer(config, () => createHangarServer(config, hangar));
     const port = await listen(server);
     const baseUrl = `http://127.0.0.1:${port}`;
 
@@ -171,10 +172,11 @@ describe("OIDC authorization", () => {
     expect(forbidden.status).toBe(403);
     expect(forbidden.headers.get("www-authenticate")).toContain("insufficient_scope");
 
+    const accessToken = await token();
     const authorized = await fetch(`${baseUrl}/mcp`, {
       method: "POST",
       headers: {
-        authorization: `Bearer ${await token()}`,
+        authorization: `Bearer ${accessToken}`,
         accept: "application/json, text/event-stream",
         "content-type": "application/json",
       },
@@ -186,5 +188,27 @@ describe("OIDC authorization", () => {
       }),
     });
     expect(authorized.status).toBe(200);
+
+    const call = async (id: number, method: string, params: Record<string, unknown>) => {
+      const response = await fetch(`${baseUrl}/mcp`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${accessToken}`,
+          accept: "application/json, text/event-stream",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id, method, params }),
+      });
+      expect(response.status).toBe(200);
+      return (await response.json()) as Record<string, unknown>;
+    };
+    const listed = await call(3, "tools/list", {});
+    expect((listed.result as { tools: unknown[] }).tools).toHaveLength(9);
+    const result = await call(4, "tools/call", {
+      name: "hangar_list_projects",
+      arguments: { limit: 10, response_format: "json" },
+    });
+    expect(result.result).toMatchObject({ structuredContent: { results: [{ id: PROJECT_HGR }] } });
+    expect(calls[0]?.pathname).toBe("/api/v1/workspaces/dumont/projects/");
   });
 });

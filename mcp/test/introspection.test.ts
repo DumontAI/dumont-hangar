@@ -9,8 +9,6 @@ const ROLE_SCOPE = "urn:zitadel:iam:org:project:role:hangar_reader";
 
 function introspectionConfig() {
   return testConfig({
-    authMode: "oidc",
-    mcpAuthToken: "",
     oidcIssuer: new URL(ISSUER),
     oidcJwksUrl: new URL(`${ISSUER}/oauth/v2/keys`),
     oidcAudience: AUDIENCE,

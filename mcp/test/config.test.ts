@@ -8,12 +8,16 @@ function env(overrides: Record<string, string | undefined> = {}): NodeJS.Process
     HANGAR_API_KEY: VALID_KEY,
     HANGAR_WORKSPACE_SLUG: "dumont",
     HANGAR_ALLOWED_PROJECTS: "HGR",
+    MCP_OIDC_ISSUER: "https://auth.getdumont.ai",
+    MCP_OIDC_JWKS_URL: "https://auth.getdumont.ai/oauth/v2/keys",
+    MCP_RESOURCE_URL: "https://hangar.getdumont.ai/mcp",
+    MCP_OIDC_AUDIENCE: "390213468206137347",
     ...overrides,
   };
 }
 
 describe("Hangar configuration", () => {
-  it("loads a minimal valid configuration with safe defaults", () => {
+  it("loads a valid OIDC-only configuration with safe defaults", () => {
     const config = loadHangarConfig(env());
     expect(config.baseUrl.toString()).toBe("https://hangar.getdumont.ai/");
     expect(config.workspaceSlug).toBe("dumont");
@@ -61,13 +65,18 @@ describe("Hangar configuration", () => {
       MCP_OIDC_AUDIENCE: "390213468206137347",
     };
     const config = loadHangarConfig(env(oidc));
-    expect(config.authMode).toBe("oidc");
     expect(() => assertHttpAuthConfigured(config)).not.toThrow();
     expect(() => loadHangarConfig(env({ ...oidc, MCP_OIDC_REQUIRED_SCOPE: "two scopes" }))).toThrow(HangarConfigError);
     for (const missing of ["MCP_OIDC_ISSUER", "MCP_OIDC_JWKS_URL", "MCP_RESOURCE_URL", "MCP_OIDC_AUDIENCE"]) {
       expect(() => loadHangarConfig(env({ ...oidc, [missing]: undefined }))).toThrow(HangarConfigError);
     }
-    expect(() => assertHttpAuthConfigured(loadHangarConfig(env()))).toThrow(HangarConfigError);
+    expect(() => assertHttpAuthConfigured(loadHangarConfig(env()))).not.toThrow();
+  });
+
+  it("rejects the retired static MCP credential even with valid OIDC settings", () => {
+    expect(() => loadHangarConfig(env({ MCP_AUTH_MODE: "static", MCP_AUTH_TOKEN: "old-token" }))).toThrow(/retired/);
+    expect(() => loadHangarConfig(env({ MCP_AUTH_TOKEN: "old-token" }))).toThrow(/retired/);
+    expect(() => loadHangarConfig(env({ MCP_AUTH_MODE: "oidc" }))).not.toThrow();
   });
 
   it("requires introspection credentials to pair with a same-origin URL", () => {

@@ -1,4 +1,3 @@
-import { timingSafeEqual } from "node:crypto";
 import { createRemoteJWKSet, jwtVerify, type JWTPayload } from "jose";
 import type { IncomingMessage } from "node:http";
 import { createIntrospector, isZitadelOpaqueToken, type IntrospectionDependencies } from "./introspection.js";
@@ -25,12 +24,6 @@ export type AuthorizationFailure =
 export interface AuthorizationResult {
   readonly failure: AuthorizationFailure | null;
   readonly subject: string | null;
-}
-
-function equalSecret(actual: string, expected: string): boolean {
-  const left = Buffer.from(actual);
-  const right = Buffer.from(expected);
-  return left.length === right.length && timingSafeEqual(left, right);
 }
 
 function requestHost(req: IncomingMessage): string {
@@ -266,7 +259,7 @@ export function metadataUrl(config: HangarConfig): URL | null {
 }
 
 export function protectedResourceMetadata(config: HangarConfig): Record<string, unknown> | null {
-  if (config.authMode !== "oidc" || !config.resourceUrl || !config.oidcIssuer) return null;
+  if (!config.resourceUrl || !config.oidcIssuer) return null;
   return {
     resource: canonicalUrl(config.resourceUrl),
     authorization_servers: [canonicalUrl(config.oidcIssuer)],
@@ -289,7 +282,7 @@ function quote(value: string): string {
 }
 
 export function authorizationChallenge(config: HangarConfig, failure: AuthorizationFailure): string | null {
-  if (config.authMode !== "oidc" || failure === "temporarily_unavailable") return null;
+  if (failure === "temporarily_unavailable") return null;
   const metadata = metadataUrl(config);
   if (!metadata) return null;
   const scope = quote(config.oidcRequiredScope);
@@ -304,7 +297,7 @@ export function createAuthorizer(
   config: HangarConfig,
   dependencies: AuthorizerDependencies = {}
 ): (req: IncomingMessage) => Promise<AuthorizationResult> {
-  const verifyOidc = config.authMode === "oidc" ? createOidcVerifier(config, dependencies) : null;
+  const verifyOidc = createOidcVerifier(config, dependencies);
   return async (req) => {
     if (!requestOriginAllowed(req, config)) {
       return { failure: "request_origin_not_allowed", subject: null };
@@ -316,11 +309,6 @@ export function createAuthorizer(
     const token = bearerToken(req);
     if (!token) return { failure: "missing_credentials", subject: null };
 
-    if (config.authMode === "static") {
-      return equalSecret(token, config.mcpAuthToken)
-        ? { failure: null, subject: null }
-        : { failure: "invalid_credentials", subject: null };
-    }
-    return verifyOidc ? verifyOidc(token) : { failure: "invalid_credentials", subject: null };
+    return verifyOidc(token);
   };
 }
