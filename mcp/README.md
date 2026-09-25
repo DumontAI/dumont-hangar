@@ -74,6 +74,10 @@ dumont-code example:
 - Caddy on `hangar.getdumont.ai` routes `/mcp` and the protected-resource
   metadata paths to `127.0.0.1:3014`; everything else stays with the Hangar
   stack.
+- Caddy must return `410 Gone` for `/hangar-mcp` before the Hangar catch-all:
+  `handle /hangar-mcp { respond "The API-key Hangar MCP was retired. Use https://hangar.getdumont.ai/mcp with Dumont login." 410 }`.
+  This prevents the old web image from distributing the API-key launcher while
+  a refreshed image is pending.
 - Deploy a tested `mcp/` build as a new release directory, switch `current`,
   restart only `dumont-hangar-mcp.service`, then verify the OIDC challenge and
   an authenticated read. Keep the previous release for rollback.
