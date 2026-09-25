@@ -4,8 +4,7 @@
   "private": true,
   "description": "Read-only MCP server for the Dumont Hangar (Plane) instance",
   "bin": {
-    "hangar-mcp-http": "dist/http.js",
-    "hangar-mcp-server": "dist/stdio.js"
+    "hangar-mcp-http": "dist/http.js"
   },
   "type": "module",
   "scripts": {
@@ -13,7 +12,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "type-check": "npm run typecheck",
     "test": "vitest run",
-    "start": "node dist/stdio.js",
+    "start": "node dist/http.js",
     "start:http": "node dist/http.js"
   },
   "dependencies": {

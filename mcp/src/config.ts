@@ -1,5 +1,5 @@
 import { createPrivateKey } from "node:crypto";
-import type { HangarConfig, McpAuthMode, OidcIntrospectionAuth } from "./types.js";
+import type { HangarConfig, OidcIntrospectionAuth } from "./types.js";
 
 const DEFAULT_BASE_URL = "https://hangar.getdumont.ai";
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
@@ -105,14 +105,6 @@ function parseHosts(env: NodeJS.ProcessEnv): string[] {
   return [...new Set(parseCsv(env, "MCP_ALLOWED_HOSTS").map((host) => host.toLowerCase()))];
 }
 
-function parseAuthMode(env: NodeJS.ProcessEnv): McpAuthMode {
-  const mode = env.MCP_AUTH_MODE?.trim().toLowerCase() || "static";
-  if (mode !== "static" && mode !== "oidc") {
-    throw new HangarConfigError("MCP_AUTH_MODE must be static or oidc");
-  }
-  return mode;
-}
-
 function validateHttpsUrl(raw: string, name: string): URL {
   let url: URL;
   try {
@@ -210,7 +202,6 @@ function parseIntrospectionPrivateKey(raw: string, clientId: string): OidcIntros
 
 function parseIntrospection(
   env: NodeJS.ProcessEnv,
-  authMode: McpAuthMode,
   oidcIssuer: URL | null
 ): Pick<HangarConfig, "oidcIntrospectionUrl" | "oidcIntrospectionAuth"> {
   const url = parseOptionalHttpsUrl(env, "MCP_OIDC_INTROSPECTION_URL");
@@ -220,9 +211,6 @@ function parseIntrospection(
       throw new HangarConfigError(`MCP_OIDC_INTROSPECTION_URL is required when ${stray} is set`);
     }
     return { oidcIntrospectionUrl: null, oidcIntrospectionAuth: null };
-  }
-  if (authMode !== "oidc") {
-    throw new HangarConfigError("MCP_OIDC_INTROSPECTION_URL requires MCP_AUTH_MODE=oidc");
   }
   // Client tokens are posted to this URL, so it must belong to the configured issuer.
   if (!oidcIssuer || url.origin !== oidcIssuer.origin) {
@@ -267,7 +255,12 @@ export function loadHangarConfig(env: NodeJS.ProcessEnv = process.env): HangarCo
     throw new HangarConfigError("MCP_ALLOWED_HOSTS is required for non-loopback HTTP binding");
   }
 
-  const authMode = parseAuthMode(env);
+  if (env.MCP_AUTH_MODE?.trim().toLowerCase() === "static" || env.MCP_AUTH_TOKEN?.trim()) {
+    throw new HangarConfigError("Static MCP authentication is retired; use ZITADEL OIDC");
+  }
+  if (env.MCP_AUTH_MODE && env.MCP_AUTH_MODE.trim().toLowerCase() !== "oidc") {
+    throw new HangarConfigError("MCP_AUTH_MODE must be oidc");
+  }
   const oidcIssuer = parseOptionalHttpsUrl(env, "MCP_OIDC_ISSUER");
   const oidcJwksUrl = parseOptionalHttpsUrl(env, "MCP_OIDC_JWKS_URL");
   const resourceUrl = parseOptionalHttpsUrl(env, "MCP_RESOURCE_URL");
@@ -279,14 +272,12 @@ export function loadHangarConfig(env: NodeJS.ProcessEnv = process.env): HangarCo
   const oidcRequiredScope = parseOidcScope(env, `urn:zitadel:iam:org:project:role:${oidcRequiredRole}`);
   const oidcAllowedOrgId = parseOptionalToken(env, "MCP_OIDC_ALLOWED_ORG_ID");
   const oidcAllowedSubjects = parseCsv(env, "MCP_OIDC_ALLOWED_SUBJECTS");
-  const introspection = parseIntrospection(env, authMode, oidcIssuer);
+  const introspection = parseIntrospection(env, oidcIssuer);
 
-  if (authMode === "oidc") {
-    if (!oidcIssuer) throw new HangarConfigError("MCP_OIDC_ISSUER is required when MCP_AUTH_MODE=oidc");
-    if (!oidcJwksUrl) throw new HangarConfigError("MCP_OIDC_JWKS_URL is required when MCP_AUTH_MODE=oidc");
-    if (!resourceUrl) throw new HangarConfigError("MCP_RESOURCE_URL is required when MCP_AUTH_MODE=oidc");
-    parseOidcAudience(env);
-  }
+  if (!oidcIssuer) throw new HangarConfigError("MCP_OIDC_ISSUER is required");
+  if (!oidcJwksUrl) throw new HangarConfigError("MCP_OIDC_JWKS_URL is required");
+  if (!resourceUrl) throw new HangarConfigError("MCP_RESOURCE_URL is required");
+  parseOidcAudience(env);
 
   return {
     baseUrl: validateBaseUrl(env.HANGAR_BASE_URL?.trim() || DEFAULT_BASE_URL),
@@ -299,8 +290,6 @@ export function loadHangarConfig(env: NodeJS.ProcessEnv = process.env): HangarCo
     projectCacheSeconds: boundedInt(env, "HANGAR_PROJECT_CACHE_SECONDS", 60, 0, 600),
     httpPort: boundedInt(env, "MCP_HTTP_PORT", 3000, 1, 65535),
     httpHost,
-    authMode,
-    mcpAuthToken: env.MCP_AUTH_TOKEN?.trim() ?? "",
     allowedOrigins: parseOrigins(env),
     allowedHosts,
     oidcIssuer,
@@ -320,13 +309,7 @@ export function loadHangarConfig(env: NodeJS.ProcessEnv = process.env): HangarCo
 }
 
 export function assertHttpAuthConfigured(config: HangarConfig): void {
-  if (config.authMode === "static" && !config.mcpAuthToken) {
-    throw new HangarConfigError("MCP_AUTH_TOKEN is required for Streamable HTTP");
-  }
-  if (
-    config.authMode === "oidc" &&
-    (!config.oidcIssuer || !config.oidcJwksUrl || !config.oidcAudience || !config.resourceUrl)
-  ) {
+  if (!config.oidcIssuer || !config.oidcJwksUrl || !config.oidcAudience || !config.resourceUrl) {
     throw new HangarConfigError("OIDC configuration is incomplete for Streamable HTTP");
   }
 }

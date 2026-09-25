@@ -5,11 +5,8 @@ projects, work items, comments, states, labels and members to MCP clients
 without ever forwarding the caller's credential to Hangar: upstream reads use a
 server-side Hangar API token.
 
-Two transports:
-
-- **Streamable HTTP** (`dist/http.js`) for the team, behind OIDC.
-- **stdio** (`dist/stdio.js`) for local use with `HANGAR_API_KEY` in the
-  environment.
+Only **Streamable HTTP** (`dist/http.js`) is supported, behind ZITADEL OIDC.
+The earlier API-key/stdio launcher and static MCP bearer mode are retired.
 
 ## Tools (read-only)
 
@@ -33,17 +30,17 @@ leave the server.
 
 See [.env.example](.env.example). The important ones:
 
-| Variable                   | Meaning                                                    |
-| -------------------------- | ---------------------------------------------------------- |
-| `HANGAR_BASE_URL`          | Hangar origin, default `https://hangar.getdumont.ai`       |
-| `HANGAR_API_KEY`           | Hangar API token (`plane_api_` + 32 hex). Server-side only |
-| `HANGAR_WORKSPACE_SLUG`    | Workspace slug                                             |
-| `HANGAR_ALLOWED_PROJECTS`  | CSV of identifiers (`HGR`) or project UUIDs                |
-| `MCP_AUTH_MODE`            | `oidc` (team) or `static` (local smoke)                    |
-| `MCP_RESOURCE_URL`         | Public MCP URL, `https://hangar.getdumont.ai/mcp`          |
-| `MCP_OIDC_AUDIENCE`        | ZITADEL project audience (the `ZITADEL DCR` project)       |
-| `MCP_OIDC_REQUIRED_ROLE`   | `hangar_reader`                                            |
-| `MCP_OIDC_INTROSPECTION_*` | Optional RFC 7662 introspection for opaque tokens          |
+| Variable                   | Meaning                                              |
+| -------------------------- | ---------------------------------------------------- |
+| `HANGAR_BASE_URL`          | Hangar origin, default `https://hangar.getdumont.ai` |
+| `HANGAR_API_KEY`           | Dedicated Hangar bot token. Server-side only         |
+| `HANGAR_WORKSPACE_SLUG`    | Workspace slug                                       |
+| `HANGAR_ALLOWED_PROJECTS`  | CSV of identifiers (`HGR`) or project UUIDs          |
+| `MCP_AUTH_MODE`            | `oidc` only                                          |
+| `MCP_RESOURCE_URL`         | Public MCP URL, `https://hangar.getdumont.ai/mcp`    |
+| `MCP_OIDC_AUDIENCE`        | ZITADEL project audience (the `ZITADEL DCR` project) |
+| `MCP_OIDC_REQUIRED_ROLE`   | `hangar_reader`                                      |
+| `MCP_OIDC_INTROSPECTION_*` | Optional RFC 7662 introspection for opaque tokens    |
 
 ## Team access with login
 
@@ -77,5 +74,10 @@ dumont-code example:
 - Caddy on `hangar.getdumont.ai` routes `/mcp` and the protected-resource
   metadata paths to `127.0.0.1:3014`; everything else stays with the Hangar
   stack.
-- Deploy with `scripts/deploy-hel1.sh <archive> <release-id>`; it installs the
-  release, restarts, and rolls back if the smoke fails.
+- Deploy a tested `mcp/` build as a new release directory, switch `current`,
+  restart only `dumont-hangar-mcp.service`, then verify the OIDC challenge and
+  an authenticated read. Keep the previous release for rollback.
+
+The historical downloadable `/hangar-mcp` launcher is disabled. Older local
+copies cannot be disabled by a server release: remove their MCP registrations
+and revoke their personal Hangar tokens only after confirming no other API use.

@@ -30,8 +30,6 @@ export function testConfig(overrides: Partial<HangarConfig> = {}): HangarConfig 
     projectCacheSeconds: 60,
     httpPort: 0,
     httpHost: "127.0.0.1",
-    authMode: "static",
-    mcpAuthToken: "mcp-test-token",
     allowedOrigins: [],
     allowedHosts: [],
     oidcIssuer: null,
