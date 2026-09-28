@@ -13,9 +13,13 @@ from drf_spectacular.views import (
     SpectacularSwaggerView,
 )
 
+from plane.dumont.access.health import AccessSyncStatusEndpoint  # Dumont addition
+
 handler404 = "plane.app.views.error_404.custom_404_view"
 
 urlpatterns = [
+    # Dumont addition: public health of the ZITADEL membership sync (plain view, no DRF throttle)
+    path("api/dumont/access-sync/status/", AccessSyncStatusEndpoint.as_view(), name="dumont-access-sync-status"),
     path("api/", include("plane.app.urls")),
     path("api/public/", include("plane.space.urls")),
     path("api/instances/", include("plane.license.urls")),

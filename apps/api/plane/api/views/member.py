@@ -20,6 +20,7 @@ from plane.api.serializers import (
     ProjectMemberLiteAPISerializer,
 )
 from plane.db.models import User, Workspace, WorkspaceMember, Project, ProjectMember
+from plane.dumont.access.guard import lock_project_membership  # Dumont addition: ZITADEL-managed memberships
 from plane.utils.permissions import ProjectMemberPermission, WorkSpaceAdminPermission, ProjectAdminPermission
 from plane.utils.openapi import (
     WORKSPACE_SLUG_PARAMETER,
@@ -157,6 +158,7 @@ class ProjectMemberListCreateAPIEndpoint(BaseAPIView):
         responses={201: OpenApiResponse(description="Project member created", response=ProjectMemberSerializer)},
         request=OpenApiRequest(request=ProjectMemberSerializer),
     )
+    @lock_project_membership()
     def post(self, request, slug, project_id):
         serializer = ProjectMemberSerializer(data=request.data, context={"slug": slug})
         serializer.is_valid(raise_exception=True)
@@ -208,6 +210,7 @@ class ProjectMemberDetailAPIEndpoint(ProjectMemberListCreateAPIEndpoint):
         responses={200: OpenApiResponse(description="Project member updated", response=ProjectMemberSerializer)},
         request=OpenApiRequest(request=ProjectMemberSerializer),
     )
+    @lock_project_membership()
     def patch(self, request, slug, project_id, pk):
         project_member = ProjectMember.objects.get(project_id=project_id, workspace__slug=slug, pk=pk)
         serializer = ProjectMemberSerializer(project_member, data=request.data, partial=True, context={"slug": slug})
@@ -223,6 +226,7 @@ class ProjectMemberDetailAPIEndpoint(ProjectMemberListCreateAPIEndpoint):
         parameters=[WORKSPACE_SLUG_PARAMETER, PROJECT_ID_PARAMETER],
         responses={204: OpenApiResponse(description="Project member deleted")},
     )
+    @lock_project_membership()
     def delete(self, request, slug, project_id, pk):
         project_member = ProjectMember.objects.get(project_id=project_id, workspace__slug=slug, pk=pk)
         project_member.is_active = False

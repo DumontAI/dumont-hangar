@@ -24,6 +24,8 @@ from rest_framework.generics import GenericAPIView
 # Module imports
 from plane.api.middleware.api_authentication import APIKeyAuthentication
 from plane.api.rate_limit import ApiKeyRateThrottle
+from plane.dumont.auth.authentication import ZitadelBearerAuthentication  # Dumont addition
+from plane.dumont.auth.throttle import DumontBearerRateThrottle  # Dumont addition
 from plane.utils.exception_logger import log_exception
 from plane.utils.paginator import BasePaginator
 from plane.utils.core.mixins import ReadReplicaControlMixin
@@ -47,7 +49,7 @@ class TimezoneMixin:
 
 
 class BaseAPIView(TimezoneMixin, GenericAPIView, ReadReplicaControlMixin, BasePaginator):
-    authentication_classes = [APIKeyAuthentication]
+    authentication_classes = [ZitadelBearerAuthentication, APIKeyAuthentication]  # Dumont: bearer first
 
     permission_classes = [IsAuthenticated]
 
@@ -59,7 +61,7 @@ class BaseAPIView(TimezoneMixin, GenericAPIView, ReadReplicaControlMixin, BasePa
         return queryset
 
     def get_throttles(self):
-        return [ApiKeyRateThrottle()]
+        return [ApiKeyRateThrottle(), DumontBearerRateThrottle()]  # Dumont: per-sub bearer throttle
 
     def handle_exception(self, exc):
         """
@@ -154,11 +156,14 @@ class BaseAPIView(TimezoneMixin, GenericAPIView, ReadReplicaControlMixin, BasePa
 class BaseViewSet(TimezoneMixin, ReadReplicaControlMixin, ModelViewSet, BasePaginator):
     model = None
 
-    authentication_classes = [APIKeyAuthentication]
+    authentication_classes = [ZitadelBearerAuthentication, APIKeyAuthentication]  # Dumont: bearer first
     permission_classes = [
         IsAuthenticated,
     ]
     use_read_replica = False
+
+    def get_throttles(self):
+        return [*super().get_throttles(), DumontBearerRateThrottle()]  # Dumont: per-sub bearer throttle
 
     def get_queryset(self):
         try:

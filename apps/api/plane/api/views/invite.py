@@ -16,6 +16,7 @@ from drf_spectacular.utils import (
 # Module imports
 from plane.api.views.base import BaseViewSet
 from plane.db.models import WorkspaceMemberInvite, Workspace
+from plane.dumont.access.guard import lock_workspace_membership  # Dumont addition: ZITADEL-managed memberships
 from plane.api.serializers import WorkspaceInviteSerializer
 from plane.utils.permissions import WorkspaceOwnerPermission
 from plane.utils.openapi.parameters import WORKSPACE_SLUG_PARAMETER
@@ -86,6 +87,7 @@ class WorkspaceInvitationsViewset(BaseViewSet):
             WORKSPACE_SLUG_PARAMETER,
         ],
     )
+    @lock_workspace_membership()
     def create(self, request, slug):
         workspace = Workspace.objects.get(slug=slug)
         serializer = WorkspaceInviteSerializer(data=request.data, context={"slug": slug})
@@ -109,6 +111,7 @@ class WorkspaceInvitationsViewset(BaseViewSet):
             ),
         ],
     )
+    @lock_workspace_membership()
     def partial_update(self, request, slug, pk):
         workspace_member_invite = self.get_object()
         if request.data.get("email"):

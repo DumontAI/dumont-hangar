@@ -47,6 +47,8 @@ AUTHENTICATION_ERROR_CODES = {
     "GITEA_NOT_CONFIGURED": 5112,
     # Dumont addition
     "DUMONT_NOT_CONFIGURED": 5113,
+    # Dumont addition: the Dumont Auth user belongs to another ZITADEL organization
+    "DUMONT_ORG_NOT_ALLOWED": 5116,
     "GOOGLE_OAUTH_PROVIDER_ERROR": 5115,
     "GITHUB_OAUTH_PROVIDER_ERROR": 5120,
     "GITLAB_OAUTH_PROVIDER_ERROR": 5121,

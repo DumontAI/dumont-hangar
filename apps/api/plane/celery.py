@@ -47,6 +47,11 @@ app.conf.beat_schedule = {
         "task": "plane.bgtasks.email_notification_task.stack_email_notification",
         "schedule": crontab(minute="*/5"),  # Every 5 minutes
     },
+    # Dumont addition: ZITADEL -> Hangar memberships (no-op unless DUMONT_ACCESS_SYNC is dry-run/enforce)
+    "dumont-access-sync-every-five-minutes": {
+        "task": "plane.dumont.access.tasks.dumont_access_full_sync",
+        "schedule": crontab(minute="*/5"),
+    },
     "push-instance-metrics": {
         "task": "plane.license.bgtasks.telemetry_metrics.push_instance_metrics",
         "schedule": schedule(run_every=timedelta(minutes=METRICS_PUSH_INTERVAL_MINUTES)),

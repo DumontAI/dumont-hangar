@@ -6,8 +6,16 @@ from datetime import datetime, timedelta
 import pytest
 import pytz
 
-from plane.authentication.adapter.error import AuthenticationException
+from plane.authentication.adapter.error import AUTHENTICATION_ERROR_CODES, AuthenticationException
 from plane.authentication.provider.oauth.dumont import DumontOAuthProvider
+
+
+@pytest.fixture(autouse=True)
+def _no_org_check_unless_asked(monkeypatch):
+    # The org check reads DUMONT_WEB_LOGIN_ORG_CHECK / DUMONT_ZITADEL_ORG_ID per login; the process env
+    # (e.g. a feature-on test run) must not leak into tests that are about something else.
+    monkeypatch.delenv("DUMONT_WEB_LOGIN_ORG_CHECK", raising=False)
+    monkeypatch.delenv("DUMONT_ZITADEL_ORG_ID", raising=False)
 
 
 def _provider(userinfo=None, token=None):
@@ -77,3 +85,146 @@ class TestDumontTokenData:
         provider = _provider(token={"access_token": "at"})
         provider.set_token_data()
         assert provider.token_data["access_token_expired_at"] is None
+
+
+ORG = "200000000000000001"
+CLAIM = "urn:zitadel:iam:user:resourceowner:id"
+
+
+def _userinfo(**extra):
+    return {"sub": "385793755363475461", "email": "carlos@shipeezi.com", "email_verified": True, **extra}
+
+
+def _enable(monkeypatch, org=ORG, flag="1"):
+    monkeypatch.setenv("DUMONT_WEB_LOGIN_ORG_CHECK", flag)
+    if org is not None:
+        monkeypatch.setenv("DUMONT_ZITADEL_ORG_ID", org)
+
+
+@pytest.mark.unit
+class TestDumontOrgBoundary:
+    """Dumont addition: DUMONT_WEB_LOGIN_ORG_CHECK=1 restricts the web login to DUMONT_ZITADEL_ORG_ID."""
+
+    def test_matching_org_passes(self, monkeypatch):
+        _enable(monkeypatch)
+        provider = _provider(_userinfo(**{CLAIM: ORG}))
+        provider.set_user_data()
+        assert provider.user_data["user"]["provider_id"] == "385793755363475461"
+
+    @pytest.mark.parametrize("claim", ["999999999999999999", None, "", ORG + " "])
+    def test_foreign_or_missing_org_is_refused(self, monkeypatch, claim):
+        _enable(monkeypatch)
+        info = _userinfo() if claim is None else _userinfo(**{CLAIM: claim})
+        provider = _provider(info)
+        with pytest.raises(AuthenticationException) as exc:
+            provider.set_user_data()
+        assert exc.value.error_code == AUTHENTICATION_ERROR_CODES["DUMONT_ORG_NOT_ALLOWED"] == 5116
+        assert not hasattr(provider, "user_data")
+
+    @pytest.mark.parametrize("flag", [None, "0", ""])
+    def test_flag_off_means_no_check_even_with_org_set(self, monkeypatch, flag):
+        # the bearer auth needs DUMONT_ZITADEL_ORG_ID; setting it must not change the web login by itself
+        monkeypatch.setenv("DUMONT_ZITADEL_ORG_ID", ORG)
+        if flag is not None:
+            monkeypatch.setenv("DUMONT_WEB_LOGIN_ORG_CHECK", flag)
+        provider = _provider(_userinfo(**{CLAIM: "999999999999999999"}))
+        provider.set_user_data()
+        assert provider.user_data["email"] == "carlos@shipeezi.com"
+
+    def test_unset_means_no_check(self):
+        provider = _provider(_userinfo())  # no claim at all, as before this check existed
+        provider.set_user_data()
+        assert provider.user_data["email"] == "carlos@shipeezi.com"
+
+    @pytest.mark.parametrize(
+        "flag,org",
+        [
+            ("1", None),  # enabled without an org
+            ("1", ""),
+            ("1", "2000:1"),  # enabled with a malformed org
+            ("true", ORG),  # strict parse: only "1" enables
+            ("yes", ORG),
+            ("2", ORG),
+        ],
+    )
+    def test_misconfigured_check_fails_closed(self, monkeypatch, flag, org):
+        _enable(monkeypatch, org=org, flag=flag)
+        provider = _provider(_userinfo(**{CLAIM: ORG}))
+        with pytest.raises(AuthenticationException) as exc:
+            provider.set_user_data()
+        assert exc.value.error_code == AUTHENTICATION_ERROR_CODES["DUMONT_NOT_CONFIGURED"] == 5113
+
+    def test_code_is_unique(self):
+        codes = list(AUTHENTICATION_ERROR_CODES.values())
+        assert codes.count(5116) == 1
+
+
+@pytest.mark.unit
+@pytest.mark.django_db
+class TestDumontOrgBoundaryScope:
+    """The resourceowner scope is requested only when the check is on: the default changes nothing."""
+
+    def _new(self, monkeypatch):
+        from django.test import RequestFactory
+
+        monkeypatch.setenv("DUMONT_CLIENT_ID", "client-id")
+        monkeypatch.setenv("DUMONT_CLIENT_SECRET", "client-secret")
+        request = RequestFactory().get("/auth/dumont/")
+        return DumontOAuthProvider(request=request, state="s")
+
+    def test_default_scope_is_unchanged(self, monkeypatch):
+        monkeypatch.setenv("DUMONT_ZITADEL_ORG_ID", ORG)  # set for the bearer auth; flag unset
+        provider = self._new(monkeypatch)
+        assert provider.scope == "openid email profile"
+        assert "resourceowner" not in provider.get_auth_url()
+
+    def test_scope_with_check_on(self, monkeypatch):
+        _enable(monkeypatch)
+        provider = self._new(monkeypatch)
+        assert provider.scope.split() == ["openid", "email", "profile", "urn:zitadel:iam:user:resourceowner"]
+        assert "urn%3Azitadel%3Aiam%3Auser%3Aresourceowner" in provider.get_auth_url()
+
+    def test_login_start_fails_closed_when_misconfigured(self, monkeypatch):
+        _enable(monkeypatch, org=None)
+        with pytest.raises(AuthenticationException) as exc:
+            self._new(monkeypatch)
+        assert exc.value.error_code == 5113
+
+
+@pytest.mark.unit
+@pytest.mark.django_db
+class TestDumontOrgBoundaryBeforeAnyUser:
+    """The refusal happens before Plane looks up, creates or links any user (no e-mail match)."""
+
+    def _authenticate(self, userinfo, monkeypatch):
+        provider = _provider(userinfo, token={"access_token": "at", "expires_in": 60})
+        reached = []
+
+        def complete_login_or_signup():
+            reached.append(True)
+            return "logged-in"
+
+        monkeypatch.setattr(provider, "complete_login_or_signup", complete_login_or_signup, raising=False)
+        return provider, reached
+
+    def test_foreign_org_never_reaches_user_lookup(self, monkeypatch):
+        from plane.db.models import Account, User
+
+        # a Hangar user with the same verified e-mail already exists: e-mail matching must not happen
+        User.objects.create(email="carlos@shipeezi.com", username="carlos")
+        users, accounts = User.objects.count(), Account.objects.count()
+        _enable(monkeypatch)
+        provider, reached = self._authenticate(_userinfo(**{CLAIM: "999999999999999999"}), monkeypatch)
+        with pytest.raises(AuthenticationException):
+            provider.authenticate()
+        assert reached == []
+        assert (User.objects.count(), Account.objects.count()) == (users, accounts)
+
+    def test_matching_org_reaches_the_login(self, monkeypatch):
+        _enable(monkeypatch)
+        provider, reached = self._authenticate(_userinfo(**{CLAIM: ORG}), monkeypatch)
+        assert provider.authenticate() == "logged-in" and reached == [True]
+
+    def test_unset_reaches_the_login_without_the_claim(self, monkeypatch):
+        provider, reached = self._authenticate(_userinfo(), monkeypatch)
+        assert provider.authenticate() == "logged-in" and reached == [True]

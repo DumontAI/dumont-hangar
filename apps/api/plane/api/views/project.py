@@ -41,6 +41,7 @@ from plane.db.models import (
 from plane.bgtasks.webhook_task import model_activity, webhook_activity
 from plane.utils.exception_logger import log_exception
 from .base import BaseAPIView
+from plane.dumont.access.guard import lock_project_create, lock_project_identifier_change  # Dumont addition
 from plane.utils.host import base_host
 from plane.utils.order_queryset import PROJECT_ORDER_BY_ALLOWLIST, sanitize_order_by
 from plane.api.serializers import (
@@ -221,6 +222,7 @@ class ProjectListCreateAPIEndpoint(BaseAPIView):
             409: PROJECT_NAME_TAKEN_RESPONSE,
         },
     )
+    @lock_project_create()
     def post(self, request, slug):
         """Create project
 
@@ -543,6 +545,7 @@ class ProjectDetailAPIEndpoint(BaseAPIView):
             409: PROJECT_NAME_TAKEN_RESPONSE,
         },
     )
+    @lock_project_identifier_change()
     def patch(self, request, slug, pk):
         """Update project
 

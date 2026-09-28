@@ -22,6 +22,11 @@ from plane.app.serializers import (
 )
 from plane.app.views.base import BaseAPIView
 from plane.db.models import Project, ProjectMember, WorkspaceMember, DraftIssue
+from plane.dumont.access.guard import (  # Dumont addition: ZITADEL-managed memberships
+    WORKSPACE_MEMBER_PREFERENCE_FIELDS,
+    lock_workspace_membership,
+    touches_fields_outside,
+)
 from plane.utils.cache import invalidate_cache
 
 from .. import BaseViewSet
@@ -74,6 +79,7 @@ class WorkSpaceMemberViewSet(BaseViewSet):
         return Response(serializer.data, status=status.HTTP_200_OK)
 
     @allow_permission(allowed_roles=[ROLE.ADMIN], level="WORKSPACE")
+    @lock_workspace_membership(only_if=touches_fields_outside(WORKSPACE_MEMBER_PREFERENCE_FIELDS))
     def partial_update(self, request, slug, pk):
         workspace_member = WorkspaceMember.objects.get(
             pk=pk, workspace__slug=slug, member__is_bot=False, is_active=True
@@ -96,6 +102,7 @@ class WorkSpaceMemberViewSet(BaseViewSet):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
     @allow_permission(allowed_roles=[ROLE.ADMIN], level="WORKSPACE")
+    @lock_workspace_membership()
     def destroy(self, request, slug, pk):
         # Check the user role who is deleting the user
         workspace_member = WorkspaceMember.objects.get(
@@ -158,6 +165,7 @@ class WorkSpaceMemberViewSet(BaseViewSet):
     @invalidate_cache(path="/api/users/me/settings/")
     @invalidate_cache(path="api/users/me/workspaces/", user=False, multiple=True)
     @allow_permission(allowed_roles=[ROLE.ADMIN, ROLE.MEMBER, ROLE.GUEST], level="WORKSPACE")
+    @lock_workspace_membership()
     def leave(self, request, slug):
         workspace_member = WorkspaceMember.objects.get(workspace__slug=slug, member=request.user, is_active=True)
 
