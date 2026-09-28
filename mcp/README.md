@@ -116,10 +116,16 @@ Behavior common to all writes:
   Dynamically registered clients (Codex, OpenCode, ...) get opaque tokens;
   Hangar introspects them again with the same checks
   (`DUMONT_API_INTROSPECTION_*` on the Hangar side). ID tokens, tokens for
-  another audience or issuer, inactive tokens, tokens whose introspection
-  failed, and tokens without an org-bound Hangar role are rejected by this
-  server (HTTP 401/403) and never reach Hangar. The token is never logged or
-  stored; it lives in the per-request Hangar client only.
+  another audience or issuer, inactive tokens and tokens without an
+  org-bound Hangar role are rejected by this server (HTTP 401/403) and never
+  reach Hangar. When introspection itself fails (timeout, non-200, bad
+  response) or is overloaded, this server answers HTTP 503 without a
+  challenge (retry, no new login) and nothing reaches Hangar. The token is
+  never logged or stored; it lives in the per-request Hangar client only.
+- **Revocation delay for opaque tokens**: both sides cache active
+  introspection answers, so a revoked opaque token can keep working for up to
+  max(`MCP_OIDC_INTROSPECTION_CACHE_SECONDS`, 60 s on Hangar), never past its
+  `exp`.
 - **Per-request isolation**: the HTTP layer builds a new McpServer and a new
   Hangar client bound to the verified caller for every request; there is no
   global "current user".
@@ -375,7 +381,19 @@ must accept it first, and this release refuses to start while
    configured and verified** (this release forwards introspected opaque
    tokens; without Hangar-side introspection, every user of a dynamically
    registered client, e.g. Codex or OpenCode, gets an error from Hangar on
-   every tool call). Every MCP user has signed in once to Hangar
+   every tool call). Verify both, printing no values:
+
+   ```bash
+   # On airbase-hel1: the Hangar api container has the introspection client
+   # id set (prints a count of the NAME only; expect 1).
+   sudo docker exec <hangar-api-container> env | grep -c '^DUMONT_API_INTROSPECTION_CLIENT_ID='
+   # From a workstation, with a real OPAQUE token from a DCR client (Codex or
+   # OpenCode) in the environment, never in argv or shell history; expect 200.
+   curl -s -o /dev/null -w '%{http_code}\n' -H @<(printf 'Authorization: Bearer %s\n' "$OPAQUE_TOKEN") \
+     https://hangar.getdumont.ai/api/v1/users/me/
+   ```
+
+   Every MCP user has signed in once to Hangar
    web with Dumont login (otherwise `ACCOUNT_NOT_LINKED`) and is a member of
    the projects they use. **Do not remove `HANGAR_API_KEY` /
    `HANGAR_WRITE_PROJECTS` before this is live**: the old MCP release (still
@@ -495,6 +513,13 @@ Never `cat` the env file: it holds secrets. Print key names only.
    many **that user** sees (capped at 50). `HANGAR_PROJECTS_READ_FAILED:ACCOUNT_NOT_LINKED` means that
    user never signed in to Hangar web with Dumont login;
    `…:UPSTREAM_UNAUTHORIZED` means Hangar does not accept the bearer (step 0).
+
+   **Repeat the read smoke with an opaque token** from a DCR client (Codex or
+   OpenCode) in `MCP_AUTH_TOKEN`. It must pass like the JWT run.
+   `…:UPSTREAM_UNAUTHORIZED` there (while the JWT run passed) means Hangar's
+   introspection (`DUMONT_API_INTROSPECTION_*`) is missing or broken: **roll
+   back** (step 7) and fix the Hangar side first.
+
    In the journal, audit lines now carry `plane_user_id` and no email.
 
 7. **Rollback**: the previous release needs the old env file (with

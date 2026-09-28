@@ -2,9 +2,10 @@
 // list the tool catalog, and read the project list. It never calls a write
 // tool. Prints only outcome codes and counts, never the token.
 //
-// The MCP forwards this token to Hangar and acts as its user, so it must be a
-// JWT from the pinned public client, and that user must have signed in once
-// to Hangar web with Dumont login. project_count is how many projects THAT
+// The MCP forwards this token to Hangar and acts as its user. It can be a JWT
+// from the pinned public client or an opaque token from a DCR client (Codex,
+// OpenCode; run the smoke with both after a deploy), and that user must have
+// signed in once to Hangar web with Dumont login. project_count is how many projects THAT
 // user sees, capped at 50 (the tool's page limit; 0 is a valid answer for a
 // user without projects). A tool error prints its
 // code, e.g. HANGAR_PROJECTS_READ_FAILED:ACCOUNT_NOT_LINKED.

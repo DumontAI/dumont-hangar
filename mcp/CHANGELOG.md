@@ -23,6 +23,12 @@ an error from Hangar on every tool call.
   failed introspection are rejected by this server and never reach Hangar.
   `TOKEN_NOT_FORWARDABLE` remains only as a defensive guard (no validated
   token on the request).
+- An introspection outage (timeout, non-200, unreadable response) now answers
+  HTTP 503 without a challenge, like local overload, instead of a 401 that
+  sent clients into a login that could not fix it.
+- A revoked opaque token can keep working for up to
+  max(`MCP_OIDC_INTROSPECTION_CACHE_SECONDS`, 60 s on Hangar): both sides
+  cache active introspection answers.
 - Per request, the HTTP layer builds a new McpServer and a Hangar client bound
   to the verified caller; no global mutable caller state.
 - Caches (project list, workspace members, Hangar user id) are keyed per token
