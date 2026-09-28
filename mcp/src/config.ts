@@ -199,6 +199,24 @@ function parseOidcAudience(env: NodeJS.ProcessEnv): string {
   return audience;
 }
 
+/**
+ * The ZITADEL instance is shared with other products' organizations, so every
+ * Hangar role is bound to this organization (see `hasRole` in auth.ts).
+ * Without it no token could be accepted, so it is a startup error.
+ */
+function parseAllowedOrgId(env: NodeJS.ProcessEnv): string {
+  const value = parseOptionalToken(env, "MCP_OIDC_ALLOWED_ORG_ID");
+  if (!value) {
+    throw new HangarConfigError(
+      "MCP_OIDC_ALLOWED_ORG_ID is required: the ZITADEL organization id whose role grants count (the ZITADEL instance is shared with other organizations)"
+    );
+  }
+  if (/\s/.test(value) || value.length > 200) {
+    throw new HangarConfigError("MCP_OIDC_ALLOWED_ORG_ID must be one organization id without whitespace");
+  }
+  return value;
+}
+
 function parseOidcScope(env: NodeJS.ProcessEnv, fallback: string): string {
   const scope = env.MCP_OIDC_REQUIRED_SCOPE?.trim() || fallback;
   if (!OIDC_SCOPE_PATTERN.test(scope)) {
@@ -333,7 +351,6 @@ export function loadHangarConfig(env: NodeJS.ProcessEnv = process.env): HangarCo
     ...new Set(["openid", "email", oidcRequiredScope, zitadelRoleScope(readerRole), zitadelRoleScope(writerRole)]),
   ];
   const allowedProjects = parseAllowedProjects(env);
-  const oidcAllowedOrgId = parseOptionalToken(env, "MCP_OIDC_ALLOWED_ORG_ID");
   const oidcAllowedSubjects = parseCsv(env, "MCP_OIDC_ALLOWED_SUBJECTS");
   const introspection = parseIntrospection(env, oidcIssuer);
   const cursorSecret = parseCursorSecret(env);
@@ -342,6 +359,7 @@ export function loadHangarConfig(env: NodeJS.ProcessEnv = process.env): HangarCo
   if (!oidcJwksUrl) throw new HangarConfigError("MCP_OIDC_JWKS_URL is required");
   if (!resourceUrl) throw new HangarConfigError("MCP_RESOURCE_URL is required");
   parseOidcAudience(env);
+  const oidcAllowedOrgId = parseAllowedOrgId(env);
 
   return {
     baseUrl: validateBaseUrl(env.HANGAR_BASE_URL?.trim() || DEFAULT_BASE_URL),
@@ -376,7 +394,13 @@ export function loadHangarConfig(env: NodeJS.ProcessEnv = process.env): HangarCo
 }
 
 export function assertHttpAuthConfigured(config: HangarConfig): void {
-  if (!config.oidcIssuer || !config.oidcJwksUrl || !config.oidcAudience || !config.resourceUrl) {
+  if (
+    !config.oidcIssuer ||
+    !config.oidcJwksUrl ||
+    !config.oidcAudience ||
+    !config.oidcAllowedOrgId ||
+    !config.resourceUrl
+  ) {
     throw new HangarConfigError("OIDC configuration is incomplete for Streamable HTTP");
   }
 }

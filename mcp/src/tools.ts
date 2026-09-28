@@ -86,16 +86,20 @@ const DENIAL_CODES = new Set([
   "WRITER_ROLE_REQUIRED",
   "PROJECT_ACCESS_DENIED",
   "UPSTREAM_FORBIDDEN",
+  "USER_NOT_ALLOWED",
 ]);
 
 // Failures of the caller's credential itself: when looking up the Hangar user
 // id hits one of these, the tool call stops there (every other call would fail
-// the same way). Any other lookup failure only leaves the audit id empty.
+// the same way; Hangar's token check being unavailable is included for that
+// reason). Any other lookup failure only leaves the audit id empty.
 const CREDENTIAL_FAILURES = new Set([
   "ACCOUNT_NOT_LINKED",
   "TOKEN_NOT_FORWARDABLE",
   "TOKEN_EXPIRED",
   "UPSTREAM_UNAUTHORIZED",
+  "USER_NOT_ALLOWED",
+  "UPSTREAM_AUTH_UNAVAILABLE",
 ]);
 
 type ResponseFormat = "json" | "markdown";

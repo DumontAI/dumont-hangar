@@ -12,6 +12,7 @@ function env(overrides: Record<string, string | undefined> = {}): NodeJS.Process
     MCP_OIDC_JWKS_URL: "https://auth.getdumont.ai/oauth/v2/keys",
     MCP_RESOURCE_URL: "https://hangar.getdumont.ai/mcp",
     MCP_OIDC_AUDIENCE: "390213468206137347",
+    MCP_OIDC_ALLOWED_ORG_ID: "300000000000000001",
     ...overrides,
   };
 }
@@ -111,6 +112,18 @@ describe("Hangar configuration", () => {
       expect(() => loadHangarConfig(env({ ...oidc, [missing]: undefined }))).toThrow(HangarConfigError);
     }
     expect(() => assertHttpAuthConfigured(loadHangarConfig(env()))).not.toThrow();
+  });
+
+  it("requires MCP_OIDC_ALLOWED_ORG_ID with a clear startup error", () => {
+    expect(loadHangarConfig(env()).oidcAllowedOrgId).toBe("300000000000000001");
+    for (const value of [undefined, "", "   "]) {
+      expect(() => loadHangarConfig(env({ MCP_OIDC_ALLOWED_ORG_ID: value }))).toThrow(
+        /MCP_OIDC_ALLOWED_ORG_ID is required/
+      );
+    }
+    expect(() => loadHangarConfig(env({ MCP_OIDC_ALLOWED_ORG_ID: "one two" }))).toThrow(HangarConfigError);
+    const config = loadHangarConfig(env());
+    expect(() => assertHttpAuthConfigured({ ...config, oidcAllowedOrgId: "" })).toThrow(HangarConfigError);
   });
 
   it("rejects the retired static MCP credential even with valid OIDC settings", () => {

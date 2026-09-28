@@ -635,6 +635,7 @@ describe("write configuration", () => {
     MCP_OIDC_JWKS_URL: "https://auth.getdumont.ai/oauth/v2/keys",
     MCP_RESOURCE_URL: "https://hangar.getdumont.ai/mcp",
     MCP_OIDC_AUDIENCE: "390213468206137347",
+    MCP_OIDC_ALLOWED_ORG_ID: "300000000000000001",
   };
 
   it("bounds HANGAR_WRITE_RATE_LIMIT to 1..120", () => {

@@ -21,7 +21,7 @@ function introspectionConfig() {
     oidcAudience: AUDIENCE,
     oidcRequiredScope: ROLE_SCOPE,
     oidcReaderRole: "hangar_reader",
-    oidcAllowedOrgId: "",
+    oidcAllowedOrgId: "dumont-org",
     oidcAllowedSubjects: [],
     resourceUrl: new URL("https://mcp-hangar.example.test/mcp"),
     oidcIntrospectionUrl: new URL(`${ISSUER}/oauth/v2/introspect`),
@@ -119,6 +119,18 @@ describe("opaque token introspection", () => {
       fetch: async () => jsonResponse(activeClaims({ "urn:zitadel:iam:org:project:roles": {} })),
     });
     expect((await withoutRole(request(SELF_CHECK_TOKEN))).failure).toBe("insufficient_scope");
+
+    // Same organization binding as the JWS path: a role granted in another org is refused.
+    const foreignOrg = createAuthorizer(introspectionConfig(), {
+      fetch: async () =>
+        jsonResponse(
+          activeClaims({
+            "urn:zitadel:iam:org:project:roles": { hangar_reader: { "foreign-org": "foreign.example.test" } },
+            "urn:zitadel:iam:user:resourceowner:id": "dumont-org",
+          })
+        ),
+    });
+    expect((await foreignOrg(request(SELF_CHECK_TOKEN))).failure).toBe("insufficient_scope");
 
     const wrongAudience = createAuthorizer(introspectionConfig(), {
       fetch: async () => jsonResponse(activeClaims({ aud: "another-project" })),

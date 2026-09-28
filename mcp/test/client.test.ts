@@ -365,6 +365,59 @@ describe("Hangar client maps Hangar errors for the user", () => {
     });
   });
 
+  it("maps Hangar's user-not-allowed answer (403, and the older 401) to a non-retryable USER_NOT_ALLOWED", async () => {
+    for (const status of [403, 401]) {
+      const { client: hangar } = client({}, async () =>
+        jsonResponse({ error_code: "DUMONT_USER_NOT_ALLOWED", error: "This Hangar user cannot use the API." }, status)
+      );
+      // oxlint-disable-next-line no-await-in-loop
+      await expect(hangar.listProjects(10)).rejects.toMatchObject({
+        code: "USER_NOT_ALLOWED",
+        retryable: false,
+        message: expect.stringContaining("logging in again will not help"),
+      });
+    }
+  });
+
+  it("maps Hangar's auth-unavailable 503 to a retryable error for reads and writes", async () => {
+    const unavailable: Fetcher = async (input, init) => {
+      const url = new URL(String(input));
+      if (init?.method === "GET" && url.pathname.endsWith("/projects/")) return projectsPage(HGR_PROJECT);
+      return jsonResponse({ error_code: "DUMONT_AUTH_UNAVAILABLE", error: "Retry shortly." }, 503);
+    };
+    const hangar = client({}, unavailable).client;
+    await expect(hangar.listStates("HGR", 10)).rejects.toMatchObject({
+      code: "UPSTREAM_AUTH_UNAVAILABLE",
+      retryable: true,
+    });
+    // Auth fails before any view runs, so even a write is safe to retry.
+    const project = await hangar.resolveProject("HGR");
+    await expect(hangar.addComment(project, HGR_WORK_ITEM.id, "<p>x</p>")).rejects.toMatchObject({
+      code: "UPSTREAM_AUTH_UNAVAILABLE",
+      retryable: true,
+    });
+    // A plain write 503 stays not retryable (it may have been applied).
+    const plain = client({}, async (input, init) => {
+      const url = new URL(String(input));
+      if (init?.method === "GET" && url.pathname.endsWith("/projects/")) return projectsPage(HGR_PROJECT);
+      return jsonResponse({ error: "down" }, 503);
+    }).client;
+    const plainProject = await plain.resolveProject("HGR");
+    await expect(plain.addComment(plainProject, HGR_WORK_ITEM.id, "<p>x</p>")).rejects.toMatchObject({
+      code: "UPSTREAM_UNAVAILABLE",
+      retryable: false,
+    });
+  });
+
+  it("maps Hangar's invalid_token 401 challenge to a tool error by error_code", async () => {
+    const { client: hangar } = client({}, async () => {
+      const response = jsonResponse({ error_code: "DUMONT_INVALID_TOKEN", error: "Invalid or expired" }, 401);
+      response.headers.set("www-authenticate", 'Bearer realm="api", error="invalid_token"');
+      return response;
+    });
+    await expect(hangar.listProjects(10)).rejects.toMatchObject({ code: "UPSTREAM_UNAUTHORIZED", retryable: false });
+  });
+
   it("keeps 5xx retryable for reads", async () => {
     const { client: hangar } = client({}, async () => jsonResponse({ error: "down" }, 503));
     await expect(hangar.listProjects(10)).rejects.toMatchObject({ code: "UPSTREAM_UNAVAILABLE", retryable: true });

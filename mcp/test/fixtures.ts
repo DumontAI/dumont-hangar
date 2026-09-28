@@ -48,7 +48,7 @@ export function testConfig(overrides: Partial<HangarConfig> = {}): HangarConfig 
       "urn:zitadel:iam:org:project:role:hangar_reader",
       "urn:zitadel:iam:org:project:role:hangar_writer",
     ],
-    oidcAllowedOrgId: "",
+    oidcAllowedOrgId: "dumont-org",
     oidcAllowedSubjects: [],
     resourceUrl: null,
     oidcIntrospectionUrl: null,

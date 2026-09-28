@@ -223,12 +223,132 @@ describe("OIDC authorization", () => {
         },
       } as never);
     expect(
-      (await outcome({ "urn:zitadel:iam:org:project:hangar-mcp-project:roles": { hangar_writer: { o: "d" } } }))
-        .principal?.roles
+      (
+        await outcome({
+          "urn:zitadel:iam:org:project:hangar-mcp-project:roles": { hangar_writer: { "dumont-org": "d" } },
+        })
+      ).principal?.roles
     ).toEqual(["hangar_writer"]);
     expect(
-      (await outcome({ "urn:zitadel:iam:org:project:other-project:roles": { hangar_writer: { o: "d" } } })).failure
+      (await outcome({ "urn:zitadel:iam:org:project:other-project:roles": { hangar_writer: { "dumont-org": "d" } } }))
+        .failure
     ).toBe("insufficient_scope");
+  });
+
+  describe("binds every role to MCP_OIDC_ALLOWED_ORG_ID (shared ZITADEL instance)", () => {
+    const rolesFor = async (claims: Record<string, unknown>) => {
+      const { config, token } = await setupOidc();
+      const authorize = createAuthorizer(config);
+      const outcome = await authorize({
+        headers: {
+          host: "127.0.0.1",
+          authorization: `Bearer ${await token({ "urn:zitadel:iam:org:project:roles": undefined, ...claims })}`,
+        },
+      } as never);
+      return outcome.failure ?? outcome.principal?.roles;
+    };
+
+    it("refuses a role map granted in a foreign organization, with our audience", async () => {
+      for (const claimName of [
+        "urn:zitadel:iam:org:project:hangar-mcp-project:roles",
+        "urn:zitadel:iam:org:project:roles",
+      ]) {
+        // oxlint-disable-next-line no-await-in-loop
+        expect(await rolesFor({ [claimName]: { hangar_writer: { "foreign-org": "foreign.example.test" } } })).toBe(
+          "insufficient_scope"
+        );
+        // Belonging to our org does not rescue a role map granted elsewhere.
+        expect(
+          // oxlint-disable-next-line no-await-in-loop
+          await rolesFor({
+            [claimName]: { hangar_writer: { "foreign-org": "foreign.example.test" } },
+            "urn:zitadel:iam:user:resourceowner:id": "dumont-org",
+          })
+        ).toBe("insufficient_scope");
+      }
+    });
+
+    it("refuses role maps whose org entry is not an object keyed by our org id", async () => {
+      const claim = "urn:zitadel:iam:org:project:roles";
+      expect(await rolesFor({ [claim]: { hangar_writer: ["dumont-org"] } })).toBe("insufficient_scope");
+      expect(await rolesFor({ [claim]: { hangar_writer: "dumont-org" } })).toBe("insufficient_scope");
+      expect(await rolesFor({ [claim]: { hangar_writer: { "foreign-org": "dumont-org" } } })).toBe(
+        "insufficient_scope"
+      );
+      expect(await rolesFor({ [claim]: { hangar_writer: null } })).toBe("insufficient_scope");
+    });
+
+    it("does not make our-org guest plus a foreign hangar_writer a writer", async () => {
+      const claim = "urn:zitadel:iam:org:project:roles";
+      expect(
+        await rolesFor({
+          [claim]: {
+            "hangar.project.hgr.guest": { "dumont-org": "dumont.example.test" },
+            hangar_writer: { "foreign-org": "foreign.example.test" },
+          },
+          "urn:zitadel:iam:user:resourceowner:id": "dumont-org",
+        })
+      ).toBe("insufficient_scope");
+      expect(
+        await rolesFor({
+          [claim]: {
+            hangar_reader: { "dumont-org": "dumont.example.test" },
+            hangar_writer: { "foreign-org": "foreign.example.test" },
+          },
+        })
+      ).toEqual(["hangar_reader"]);
+    });
+
+    it("counts array forms, legacy roles and my:zitadel:grants only for users of our organization", async () => {
+      const unbound = [
+        { roles: ["hangar_writer"] },
+        { roles: { hangar_writer: {} } },
+        { "urn:zitadel:iam:org:project:roles": ["hangar_writer"] },
+        { "urn:zitadel:iam:org:project:hangar-mcp-project:roles": ["hangar_writer"] },
+        { "my:zitadel:grants": ["hangar-mcp-project:hangar_writer"] },
+      ];
+      for (const claims of unbound) {
+        // No resourceowner, a foreign one, or only org_id: refused.
+        // oxlint-disable-next-line no-await-in-loop
+        expect(await rolesFor(claims)).toBe("insufficient_scope");
+        // oxlint-disable-next-line no-await-in-loop
+        expect(await rolesFor({ ...claims, "urn:zitadel:iam:user:resourceowner:id": "foreign-org" })).toBe(
+          "insufficient_scope"
+        );
+        // oxlint-disable-next-line no-await-in-loop
+        expect(await rolesFor({ ...claims, org_id: "dumont-org", "urn:zitadel:iam:org:id": "dumont-org" })).toBe(
+          "insufficient_scope"
+        );
+        // oxlint-disable-next-line no-await-in-loop
+        expect(await rolesFor({ ...claims, "urn:zitadel:iam:user:resourceowner:id": ["dumont-org"] })).toBe(
+          "insufficient_scope"
+        );
+        // oxlint-disable-next-line no-await-in-loop
+        expect(await rolesFor({ ...claims, "urn:zitadel:iam:user:resourceowner:id": "dumont-org" })).toEqual([
+          "hangar_writer",
+        ]);
+      }
+    });
+
+    it("accepts our-org hangar_reader and hangar_writer in ZITADEL's real shape", async () => {
+      for (const claimName of [
+        "urn:zitadel:iam:org:project:hangar-mcp-project:roles",
+        "urn:zitadel:iam:org:project:roles",
+      ]) {
+        // oxlint-disable-next-line no-await-in-loop
+        expect(await rolesFor({ [claimName]: { hangar_reader: { "dumont-org": "dumont.example.test" } } })).toEqual([
+          "hangar_reader",
+        ]);
+        expect(
+          // oxlint-disable-next-line no-await-in-loop
+          await rolesFor({
+            [claimName]: {
+              hangar_writer: { "foreign-org": "foreign.example.test", "dumont-org": "dumont.example.test" },
+            },
+          })
+        ).toEqual(["hangar_writer"]);
+      }
+    });
   });
 
   it("answers a reader calling a write tool with a tool error, not an HTTP 401/403", async () => {
@@ -354,6 +474,59 @@ describe("OIDC authorization", () => {
     expect(payload.result.structuredContent).toMatchObject({
       error: { code: "ACCOUNT_NOT_LINKED", message: expect.stringContaining("with Dumont login") },
     });
+  });
+
+  it("never turns Hangar's user-not-allowed, auth-unavailable or invalid_token answers into an MCP 401/403", async () => {
+    const { config, token } = await setupOidc();
+    const upstream: Array<[number, Record<string, unknown>, Record<string, string>, string, boolean]> = [
+      [403, { error_code: "DUMONT_USER_NOT_ALLOWED", error: "x" }, {}, "USER_NOT_ALLOWED", false],
+      [503, { error_code: "DUMONT_AUTH_UNAVAILABLE", error: "x" }, {}, "UPSTREAM_AUTH_UNAVAILABLE", true],
+      [
+        401,
+        { error_code: "DUMONT_INVALID_TOKEN", error: "x" },
+        { "www-authenticate": 'Bearer realm="api", error="invalid_token"' },
+        "UPSTREAM_UNAUTHORIZED",
+        false,
+      ],
+    ];
+    for (const [status, body, headers, code, retryable] of upstream) {
+      const server = createHangarHttpServer(
+        config,
+        undefined,
+        {},
+        {
+          fetch: async () => {
+            const response = jsonResponse(body, status);
+            for (const [name, value] of Object.entries(headers)) response.headers.set(name, value);
+            return response;
+          },
+        }
+      );
+      // oxlint-disable-next-line no-await-in-loop
+      const port = await listen(server);
+      // oxlint-disable-next-line no-await-in-loop
+      const response = await fetch(`http://127.0.0.1:${port}/mcp`, {
+        method: "POST",
+        headers: {
+          // oxlint-disable-next-line no-await-in-loop
+          authorization: `Bearer ${await token()}`,
+          accept: "application/json, text/event-stream",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: { name: "hangar_list_projects", arguments: { limit: 1 } },
+        }),
+      });
+      expect(response.status).toBe(200);
+      expect(response.headers.get("www-authenticate")).toBeNull();
+      // oxlint-disable-next-line no-await-in-loop
+      const payload = (await response.json()) as { result: { isError: boolean; structuredContent: unknown } };
+      expect(payload.result.isError).toBe(true);
+      expect(payload.result.structuredContent).toMatchObject({ error: { code, retryable } });
+    }
   });
 
   it("returns 401 metadata challenge and 403 for a valid token without the role", async () => {

@@ -14,6 +14,13 @@ export type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Res
 const PLANE_ACCOUNT_NOT_LINKED = "DUMONT_ACCOUNT_NOT_LINKED";
 const PLANE_WRITER_ROLE_REQUIRED = "DUMONT_WRITER_ROLE_REQUIRED";
 const PLANE_MANAGED_BY_ZITADEL = "DUMONT_MANAGED_BY_ZITADEL";
+// 403: the linked Hangar user is inactive, a bot, or ambiguous. A new login
+// cannot fix it, so it is not retryable.
+const PLANE_USER_NOT_ALLOWED = "DUMONT_USER_NOT_ALLOWED";
+// 503: Hangar could not check the token (Dumont Auth keys unreachable).
+// Raised before any view runs, so nothing was applied: retryable, and never a
+// reason to log in again.
+const PLANE_AUTH_UNAVAILABLE = "DUMONT_AUTH_UNAVAILABLE";
 // A Plane 401 this close to (or past) the token `exp` is treated as expiry.
 // The authorizer already refuses (HTTP 401) tokens with this little lifetime
 // left, so this only triggers when a call outlives that margin or the clocks
@@ -678,6 +685,22 @@ export class HangarClient {
     projectIdentifier?: string
   ): HangarError {
     const code = typeof json.error_code === "string" ? json.error_code : null;
+    if (status === 503 && code === PLANE_AUTH_UNAVAILABLE) {
+      return new HangarError(
+        "UPSTREAM_AUTH_UNAVAILABLE",
+        "Hangar could not verify your Dumont login right now (Dumont Auth unreachable from Hangar); nothing was changed. Retry shortly; logging in again will not help",
+        true
+      );
+    }
+    // Older Hangar releases answered this with 401; both mean the same.
+    if ((status === 403 || status === 401) && code === PLANE_USER_NOT_ALLOWED) {
+      return new HangarError(
+        "USER_NOT_ALLOWED",
+        "Your Hangar account cannot use the API (deactivated, a bot account, or linked more than once); logging in again will not help, ask a Hangar admin"
+      );
+    }
+    // A Plane 401 (its challenge carries `error="invalid_token"`) is mapped by
+    // `error_code` and never passed on as this server's 401.
     if (status === 401) {
       if (code === PLANE_ACCOUNT_NOT_LINKED) {
         return new HangarError(

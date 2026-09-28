@@ -82,43 +82,66 @@ function tokenScopes(payload: JWTPayload): Set<string> {
   return new Set(values);
 }
 
-function containsString(value: unknown, wanted: string): boolean {
-  if (value === wanted) return true;
-  if (Array.isArray(value)) return value.some((item) => containsString(item, wanted));
-  if (value && typeof value === "object") {
-    return Object.entries(value).some(([key, item]) => key === wanted || containsString(item, wanted));
-  }
-  return false;
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 /**
- * Role sources, all on a token already bound to our issuer and audience:
- * - `urn:zitadel:iam:org:project:<audience>:roles`: ZITADEL's project-scoped
- *   claim; only roles of the audience project can appear under it.
- * - `urn:zitadel:iam:org:project:roles`: ZITADEL puts the roles of the
- *   project of the requesting application here. Our clients (the pinned
- *   public client and DCR apps) live in the audience project, so these are
- *   audience-project roles. A client of ANOTHER project that also requests
- *   our audience would carry its own project's roles here; same-named roles
- *   there would be accepted, so role names must stay unique per instance and
- *   no other project may define `hangar_reader`/`hangar_writer`.
- * - `roles`: legacy flat claim, same caveat.
- * - `my:zitadel:grants`: custom Action claim, only the exact
- *   `<audience>:<role>` entry.
+ * ZITADEL's role map `{ <role>: { <orgId>: <orgDomain> } }`: the role counts
+ * only when it was granted in the allowed organization, i.e. `claim[role]` is
+ * an object with the allowed org id as an own key.
+ */
+function roleGrantedInOrg(claimValue: unknown, role: string, organizationId: string): boolean {
+  if (!isJsonObject(claimValue) || !Object.hasOwn(claimValue, role)) return false;
+  const organizations = claimValue[role];
+  return isJsonObject(organizations) && Object.hasOwn(organizations, organizationId);
+}
+
+/**
+ * Role sources, all on a token already bound to our issuer and audience. The
+ * ZITADEL instance is shared with other products and their organizations, so
+ * a role name alone proves nothing: any organization can define a project
+ * role called `hangar_writer`, and any organization's Actions can set the
+ * legacy claims. Every role is therefore bound to MCP_OIDC_ALLOWED_ORG_ID:
+ *
+ * - `urn:zitadel:iam:org:project:<audience>:roles` and
+ *   `urn:zitadel:iam:org:project:roles` in ZITADEL's object form count only
+ *   when `claim[role]` is an object keyed by the allowed org id (the role was
+ *   granted in our organization). A grant of a different role in our org
+ *   never vouches for this role.
+ * - Any other form (an array of these claims, the legacy flat `roles` claim,
+ *   the `my:zitadel:grants` Action claim as the exact `<audience>:<role>`)
+ *   counts only when the user belongs to the allowed organization:
+ *   `urn:zitadel:iam:user:resourceowner:id` equal to it. `org_id` is never
+ *   used (it names the org of the request context, not of the user).
+ *
+ * The same rules apply to JWS and introspected (opaque) tokens, and Hangar
+ * applies them to the forwarded token.
  */
 function hasRole(payload: JWTPayload, config: HangarConfig, role: string): boolean {
-  const roleClaims = new Set([
-    "roles",
-    "urn:zitadel:iam:org:project:roles",
+  const organizationId = config.oidcAllowedOrgId;
+  if (!organizationId) return false;
+  const userInAllowedOrg = payload["urn:zitadel:iam:user:resourceowner:id"] === organizationId;
+
+  const projectRoleClaims = [
     `urn:zitadel:iam:org:project:${config.oidcAudience}:roles`,
-  ]);
-  for (const [claimName, claimValue] of Object.entries(payload)) {
-    if (!roleClaims.has(claimName)) continue;
-    if (Array.isArray(claimValue) && claimValue.some((value) => value === role)) return true;
-    if (claimValue && typeof claimValue === "object" && Object.prototype.hasOwnProperty.call(claimValue, role)) {
+    "urn:zitadel:iam:org:project:roles",
+  ];
+  for (const claimName of projectRoleClaims) {
+    if (!Object.hasOwn(payload, claimName)) continue;
+    const claimValue = payload[claimName];
+    if (isJsonObject(claimValue)) {
+      if (roleGrantedInOrg(claimValue, role, organizationId)) return true;
+    } else if (userInAllowedOrg && Array.isArray(claimValue) && claimValue.some((value) => value === role)) {
       return true;
     }
   }
+
+  if (!userInAllowedOrg) return false;
+
+  const legacyRoles = payload.roles;
+  if (Array.isArray(legacyRoles) && legacyRoles.some((value) => value === role)) return true;
+  if (isJsonObject(legacyRoles) && Object.hasOwn(legacyRoles, role)) return true;
 
   // Custom claim from a ZITADEL Action (`<projectId>:<role>` strings). A bare
   // role, or a role of another project, is never enough: only the exact
@@ -142,18 +165,6 @@ function usesZitadelRoleScope(config: HangarConfig): boolean {
   return (
     config.oidcRequiredScope === zitadelRoleScope(config.oidcReaderRole) ||
     config.oidcRequiredScope === zitadelRoleScope(config.oidcWriterRole)
-  );
-}
-
-function hasAllowedOrganization(payload: JWTPayload, organizationId: string): boolean {
-  return (
-    containsString(payload["urn:zitadel:iam:user:resourceowner"], organizationId) ||
-    payload["urn:zitadel:iam:user:resourceowner:id"] === organizationId ||
-    containsString(payload["urn:zitadel:iam:org:id"], organizationId) ||
-    containsString(payload.org_id, organizationId) ||
-    Object.entries(payload)
-      .filter(([claimName]) => claimName.endsWith(":roles"))
-      .some(([, claimValue]) => containsString(claimValue, organizationId))
   );
 }
 
@@ -229,6 +240,8 @@ function oidcAccessAllowed(payload: JWTPayload, config: HangarConfig): Authoriza
   // Server-level gate: the reader or the writer role (writer implies reader).
   // Per-tool checks happen in the tool layer, so a reader calling a write tool
   // gets a tool error instead of a 401/403 that would restart the login.
+  // This is also the organization gate: `hasRole` only counts a role bound to
+  // MCP_OIDC_ALLOWED_ORG_ID (no separate, looser org check).
   if (grantedRoles(payload, config).length === 0) {
     return "insufficient_scope";
   }
@@ -237,9 +250,6 @@ function oidcAccessAllowed(payload: JWTPayload, config: HangarConfig): Authoriza
   // role claim remains mandatory, while other OIDC scopes still require a
   // literal scope claim.
   if (!scopes.has(config.oidcRequiredScope) && !usesZitadelRoleScope(config)) {
-    return "insufficient_scope";
-  }
-  if (config.oidcAllowedOrgId && !hasAllowedOrganization(payload, config.oidcAllowedOrgId)) {
     return "insufficient_scope";
   }
   if (
