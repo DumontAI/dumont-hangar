@@ -48,6 +48,9 @@ import sys
 import requests
 
 EXPORT_FORMAT = "hangar-zitadel-access-export/v1"
+# Same string as plane.dumont.auth.config.USER_AGENT (this script cannot import it). Explicit because
+# Cloudflare in front of Dumont Auth answers 403 to some library-default User-Agents.
+USER_AGENT = "dumont-hangar-api (+https://hangar.getdumont.ai)"
 TIMEOUT = 10
 PAGE_SIZE = 100
 MAX_PAGES = 500
@@ -72,6 +75,7 @@ class Zitadel:
             "Authorization": f"Bearer {self._pat}",
             "x-zitadel-orgid": self.org_id,
             "Accept": "application/json",
+            "User-Agent": USER_AGENT,
         }
         try:
             response = self.session.request(
@@ -100,7 +104,9 @@ class Zitadel:
                 body["queries"] = queries
             data = self.request("POST", path, body)
             # Same rules as plane/dumont/access/zitadel.py:
-            # - a missing `result` is an empty list only when details.totalResult is present and 0;
+            # - a missing `result` is an empty page only when `details` is an object and details.totalResult
+            #   is absent or 0 (production answers an empty search with exactly
+            #   {"details": {"viewTimestamp": "..."}}); no `details`, or totalResult > 0, is an error;
             # - the largest totalResult any page announced must be reached; an empty page before it is a
             #   truncated answer; only when no page ever carried a total does a short page end the list;
             # - rows are de-duplicated by id (a row that moved between pages is served twice and another
@@ -109,7 +115,7 @@ class Zitadel:
                 raise BootstrapError(f"POST {path}: response is not a JSON object")
             total = _total_result(data, path)
             if "result" not in data:
-                if total != 0:
+                if not isinstance(data.get("details"), dict) or (total is not None and total != 0):
                     raise BootstrapError(f"POST {path}: response has no 'result' (API shape changed?)")
                 page = []
             else:

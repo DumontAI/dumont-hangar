@@ -17,6 +17,7 @@ from plane.tests.unit.dumont.access.conftest import (
     BASE_URL,
     ORG_ID,
     PROJECT_ID,
+    ZITADEL_EMPTY_SEARCH_BODY,
     make_project,
     make_user,
     pr_member,
@@ -196,6 +197,16 @@ class TestBootstrapScript:
         assert "legacy@example.test: hangar.project.mo.guest, hangar.workspace.guest  [by e-mail]" in text
         assert PAT not in text
 
+    def test_explicit_user_agent(self, plane_world, fake_zitadel, bootstrap, tmp_path):
+        from plane.dumont.auth.config import USER_AGENT
+
+        fake_zitadel.issued.add(PAT)
+        export_path, _ = _export(tmp_path)
+        code, _ = _run_script(bootstrap, fake_zitadel, export_path)
+        assert code == 0
+        assert fake_zitadel.user_agents and set(fake_zitadel.user_agents) == {USER_AGENT}
+        assert bootstrap.USER_AGENT == USER_AGENT
+
     def test_apply_requires_yes(self, plane_world, fake_zitadel, bootstrap, tmp_path):
         export_path, _ = _export(tmp_path)
         with pytest.raises(SystemExit):
@@ -328,7 +339,8 @@ class TestBootstrapScript:
             ("truncate_after", 0, "empty page"),
             ("raw_body_on", ("roles", {"details": {"totalResult": "3"}}), "no 'result'"),
             ("raw_body_on", ("roles", {}), "no 'result'"),
-            ("raw_body_on", ("roles", {"details": {"viewTimestamp": "x"}}), "no 'result'"),
+            ("raw_body_on", ("roles", {"details": "x"}), "no 'result'"),
+            ("raw_body_on", ("roles", {"details": {"totalResult": "2", "viewTimestamp": "x"}}), "no 'result'"),
             ("raw_body_on", ("roles", {"details": {"totalResult": "x"}, "result": []}), "unreadable"),
         ],
     )
@@ -341,11 +353,16 @@ class TestBootstrapScript:
         assert code == 1 and message in text
         assert fake_zitadel.writes == []
 
-    @pytest.mark.parametrize("details", [{"totalResult": "0"}, {"totalResult": 0}])
-    def test_omitted_result_with_zero_total_is_empty(self, plane_world, fake_zitadel, bootstrap, tmp_path, details):
-        # proto3 JSON omits an empty `result`; an explicit zero total says it is empty: create every role
+    @pytest.mark.parametrize(
+        "body",
+        [ZITADEL_EMPTY_SEARCH_BODY, {"details": {"totalResult": "0"}}, {"details": {"totalResult": 0}}],
+        ids=["production-empty", "zero-string", "zero-number"],
+    )
+    def test_omitted_result_without_positive_total_is_empty(self, plane_world, fake_zitadel, bootstrap, tmp_path, body):
+        # proto3 JSON omits an empty `result` (and a zero total): production's empty answer is
+        # {"details": {"viewTimestamp": ...}}. No roles exist yet, so the plan creates every role.
         fake_zitadel.issued.add(PAT)
-        fake_zitadel.raw_body_on = ("roles", {"details": details})
+        fake_zitadel.raw_body_on = ("roles", body)
         export_path, _ = _export(tmp_path)
         code, text = _run_script(bootstrap, fake_zitadel, export_path, "--json")
         assert code == 0, text
@@ -369,7 +386,24 @@ class TestBootstrapScript:
         assert code == 1 and "3 distinct rows for totalResult 4" in text
         assert fake_zitadel.writes == []
 
-    def test_total_is_remembered_across_pages(self, plane_world, fake_zitadel, bootstrap, tmp_path, monkeypatch):
+    def test_production_empty_user_search_is_no_match(self, plane_world, fake_zitadel, bootstrap, tmp_path):
+        # The production --plan failed here: users/_search found nobody and answered the real empty body.
+        fake_zitadel.issued.add(PAT)
+        fake_zitadel.add_user("zitadel-legacy", "LEGACY@example.test")
+        fake_zitadel.raw_body_on = ("users/_search", ZITADEL_EMPTY_SEARCH_BODY)
+        export_path, _ = _export(tmp_path)
+        code, text = _run_script(bootstrap, fake_zitadel, export_path)
+        assert code == 0, text
+        assert "PLAN" in text and "no 'result'" not in text
+        assert "legacy@example.test: hangar.project.mo.guest" not in text  # not matched, so not granted
+        assert fake_zitadel.writes == []
+
+    @pytest.mark.parametrize(
+        "later_page", [{"result": []}, ZITADEL_EMPTY_SEARCH_BODY], ids=["empty-result", "production-empty"]
+    )
+    def test_total_is_remembered_across_pages(
+        self, plane_world, fake_zitadel, bootstrap, tmp_path, monkeypatch, later_page
+    ):
         # page 1 of the grants search announces 5 rows; page 2 is empty without a total
         fake_zitadel.issued.add(PAT)
         monkeypatch.setattr(bootstrap, "PAGE_SIZE", 2)
@@ -381,7 +415,7 @@ class TestBootstrapScript:
             if "grants" in request.url and int(parsed["query"]["offset"]) > 0:
                 from plane.tests.unit.dumont.access.conftest import _response
 
-                return _response(request, 200, {"result": []})
+                return _response(request, 200, later_page)
             return real_page(request, parsed, rows)
 
         monkeypatch.setattr(fake_zitadel, "_page", page)

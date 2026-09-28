@@ -86,6 +86,13 @@ class TestHealthEndpoint:
             assert run_full_sync()["status"] == "error"
         assert _get()[1]["reason"] == "zero_grants"
 
+    def test_zero_role_keys_reason(self, world):
+        world["fake"].roles = []
+        for _ in range(2):
+            assert run_full_sync()["status"] == "error"
+        status, body = _get()
+        assert status == 503 and body["reason"] == "zero_role_keys"
+
     def test_stale_run_is_503(self, world, monkeypatch):
         run_full_sync()
         later = time.time() + H.STALE_AFTER_SECONDS + 60

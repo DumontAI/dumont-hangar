@@ -9,6 +9,7 @@ from plane.db.models import ProjectMember, ProjectUserProperty, WorkspaceMember
 from plane.dumont.access import hooks
 from plane.dumont.access.sync import (
     MANAGED_STATE_KEY,
+    ZERO_ROLE_KEYS_ERROR,
     ZITADEL_BACKOFF_KEY,
     ZITADEL_BACKOFF_TTL,
     run_full_sync,
@@ -17,6 +18,7 @@ from plane.dumont.access.sync import (
 from plane.license.models import Instance, InstanceAdmin
 from plane.tests.unit.dumont.access.conftest import (
     ORG_ID,
+    ZITADEL_EMPTY_SEARCH_BODY,
     make_project,
     make_user,
     pr_member,
@@ -181,6 +183,26 @@ class TestFullSync:
         report = run_full_sync(max_removals=3)
         assert report["status"] == "applied", report
         assert ws_row(world["workspace"], world["users"]["alice"]).is_active is False
+
+    @pytest.mark.parametrize("mode", [None, "dry-run"])
+    def test_zero_role_keys_is_an_error_and_stores_no_managed_state(self, world, mode):
+        assert run_full_sync()["status"] == "applied"  # a good run stores the managed-scope state
+        stored = cache.get(MANAGED_STATE_KEY)
+        assert stored
+        world["fake"].roles = []  # e.g. ZITADEL's real empty search answer for the roles
+        before = state(world)
+        world["fake"].calls.clear()
+        report = run_full_sync(mode=mode)
+        assert report["status"] == "error" and report["reason"] == "zero_role_keys", report
+        assert report["error"] == ZERO_ROLE_KEYS_ERROR
+        assert cache.get(MANAGED_STATE_KEY) == stored  # not overwritten with "nothing managed"
+        assert world["fake"].api_calls("grants") == []  # stopped right after the roles search
+        assert state(world) == before
+
+    def test_zero_role_keys_needs_the_explicit_override(self, world):
+        world["fake"].roles = []
+        report = run_full_sync(max_removals=10)
+        assert report.get("reason") != "zero_role_keys", report
 
     def test_absolute_brake(self, world, monkeypatch):
         monkeypatch.setenv("DUMONT_ACCESS_MAX_REMOVALS", "0")
@@ -680,9 +702,21 @@ def _small_state(w):
 class TestNoSilentWipe:
     """Second-round review: answers that used to wipe a small workspace now write nothing."""
 
-    def test_grants_answer_without_result_and_total_is_an_error(self, small_world):
-        # reviewer probe: grants/_search answers 200 {"details": {"viewTimestamp": ...}}
-        small_world["fake"].raw_body_on = ("grants", {"details": {"viewTimestamp": "2026-09-28T00:00:00Z"}})
+    def test_real_empty_grants_answer_hits_the_zero_grants_guard(self, small_world):
+        # grants/_search answers 200 with ZITADEL's real empty body {"details": {"viewTimestamp": ...}}.
+        # That is a legitimately empty list for the client; the full sync's zero-grants guard is what
+        # keeps it from wiping the workspace.
+        from plane.dumont.access.sync import ZERO_GRANTS_ERROR
+
+        small_world["fake"].raw_body_on = ("grants", ZITADEL_EMPTY_SEARCH_BODY)
+        dry = run_full_sync(mode="dry-run")
+        assert ZERO_GRANTS_ERROR in dry["would_refuse"], dry
+        report = run_full_sync()
+        assert report["status"] == "error" and report["error"] == ZERO_GRANTS_ERROR, report
+        assert _small_state(small_world) == [(True, True, True)] * 4
+
+    def test_answer_without_details_is_an_error(self, small_world):
+        small_world["fake"].raw_body_on = ("grants", {})
         report = run_full_sync()
         assert report["status"] == "error" and "no 'result'" in report["error"]
         assert _small_state(small_world) == [(True, True, True)] * 4

@@ -23,6 +23,9 @@ PROJECT_ID = "300000000000000042"
 ORG_ID = "200000000000000001"
 KEY_ID = "key-0001"
 SERVICE_USER_ID = "svc-hangar-sync"
+# The exact shape production ZITADEL returns for an EMPTY management v1 search (verified 2026-09-28 on
+# users/_search): no `result` and no `details.totalResult`. Only the timestamp value is made up.
+ZITADEL_EMPTY_SEARCH_BODY = {"details": {"viewTimestamp": "2026-09-28T12:00:00.000000Z"}}
 
 
 @pytest.fixture(scope="session")
@@ -61,6 +64,7 @@ class FakeZitadel(requests.adapters.BaseAdapter):
         self.writes = []  # write calls received (bootstrap script tests)
         self.calls = []  # (method, path, parsed body)
         self.timeouts = []
+        self.user_agents = []  # User-Agent header of every request received
         self.token_requests = 0
         self.issued = set()
         self.fail = None  # None | int status | "timeout" | "badjson"
@@ -113,6 +117,7 @@ class FakeZitadel(requests.adapters.BaseAdapter):
         if isinstance(body, bytes):
             body = body.decode()
         self.timeouts.append(timeout)
+        self.user_agents.append(request.headers.get("User-Agent"))
         if not request.url.startswith(BASE_URL + "/"):
             raise AssertionError(f"unexpected outbound URL {request.url}")
         if self.fail is not None and (self.fail_on is None or self.fail_on in path):
