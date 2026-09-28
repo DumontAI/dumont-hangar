@@ -88,8 +88,12 @@ How a bearer is handled:
 
 - A compact JWS (3 base64url segments) always takes the JWKS path above and never reaches the
   issuer, so ID tokens and forged JWTs cannot trigger introspection calls.
-- Anything else: 401 `invalid_token` when introspection is off (as before). When it is on, the
-  token must be at most 16 KiB of RFC 6750 `b64token` characters, then it is POSTed as
+- Anything else: 401 `invalid_token` when introspection is off (as before). When it is on, only
+  ZITADEL's exact opaque access-token shape is introspected (the same check as the MCP's
+  `isZitadelOpaqueToken`): a compact JWE of 5 base64url segments, header `alg` `A256GCMKW`, `enc`
+  `A256GCM` and a non-empty `kid`, encrypted key 43 chars, IV 16, tag 22, non-empty ciphertext,
+  at most 16 KiB. Any other bearer is 401 `invalid_token` without calling the issuer, so random
+  tokens from unauthenticated callers never turn into issuer calls. A matching token is POSTed as
   `token=<t>&token_type_hint=access_token` with HTTP Basic client authentication (id and secret
   form-encoded first, as the MCP does), 5 s timeout, no redirects, 64 KiB response cap.
 - Only HTTP 200 with a JSON object is an answer. Anything else (network error, timeout, redirect,

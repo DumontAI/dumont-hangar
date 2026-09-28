@@ -11,10 +11,12 @@
 # by its SHA-256. The client secret is never logged either.
 
 import base64
+import binascii
 import hashlib
 import json
 import logging
 import math
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -37,6 +39,39 @@ NEGATIVE_CACHE_SECONDS = 30
 CACHE_KEY_PREFIX = "dumont_bearer:introspection:v1:"
 
 _INACTIVE = {"active": False}
+
+
+# ZITADEL's opaque access token is a compact JWE with alg A256GCMKW / enc A256GCM: the wrapped
+# 32-byte CEK is 43 base64url chars, the 12-byte IV 16 and the 16-byte tag 22. Only this exact
+# shape is sent to introspection (mirror of the MCP's isZitadelOpaqueToken), so arbitrary
+# bearers from unauthenticated callers never turn into calls to the issuer.
+_JWE_ENCRYPTED_KEY_LENGTH = 43
+_JWE_IV_LENGTH = 16
+_JWE_TAG_LENGTH = 22
+_BASE64URL = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def is_zitadel_opaque_token(token):
+    """True only for the exact compact-JWE shape ZITADEL issues as opaque access token."""
+    parts = token.split(".")
+    if len(parts) != 5 or not all(_BASE64URL.match(part) for part in parts):
+        return False
+    header_segment, encrypted_key, iv, ciphertext, tag = parts
+    if (
+        len(encrypted_key) != _JWE_ENCRYPTED_KEY_LENGTH
+        or len(iv) != _JWE_IV_LENGTH
+        or len(tag) != _JWE_TAG_LENGTH
+        or not ciphertext
+    ):
+        return False
+    try:
+        header = json.loads(base64.urlsafe_b64decode(header_segment + "=" * (-len(header_segment) % 4)))
+    except (binascii.Error, ValueError, UnicodeDecodeError):
+        return False
+    if not isinstance(header, dict):
+        return False
+    kid = header.get("kid")
+    return header.get("alg") == "A256GCMKW" and header.get("enc") == "A256GCM" and isinstance(kid, str) and len(kid) > 0
 
 
 class IntrospectionUnavailable(Exception):
@@ -112,7 +147,7 @@ def _cache_set(key, value, ttl):
 
 
 def _call_issuer(token, config):
-    """One introspection request. Returns the response object; raises IntrospectionUnavailable."""
+    """One introspection request. Returns the parsed JSON object; raises IntrospectionUnavailable."""
     body = urllib.parse.urlencode({"token": token, "token_type_hint": "access_token"}).encode("ascii")
     headers = {
         "Accept": "application/json",

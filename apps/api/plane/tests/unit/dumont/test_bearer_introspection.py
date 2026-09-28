@@ -45,15 +45,33 @@ LOGGER_NAME = "plane.authentication.dumont_bearer"
 
 
 def opaque_token():
-    return "opq_" + secrets.token_urlsafe(32)
+    # A fresh token in ZITADEL's opaque access-token shape (the only shape that is introspected).
+    return zitadel_jwe_token()
+
+
+def _jwe(
+    alg="A256GCMKW",
+    enc="A256GCM",
+    kid="k",
+    encrypted_key="B" * 43,
+    iv="C" * 16,
+    ciphertext=None,
+    tag="D" * 22,
+    header_segment=None,
+):
+    """A compact JWE; the defaults give the exact shape ZITADEL issues as opaque access token."""
+    if header_segment is None:
+        header = {"alg": alg, "enc": enc, "kid": kid, "iv": "A" * 16, "tag": "A" * 22}
+        header = {k: v for k, v in header.items() if v is not DROP}
+        header_segment = base64.urlsafe_b64encode(json.dumps(header).encode()).rstrip(b"=").decode()
+    if ciphertext is None:
+        ciphertext = secrets.token_urlsafe(24)
+    return ".".join([header_segment, encrypted_key, iv, ciphertext, tag])
 
 
 def zitadel_jwe_token():
     # The 5-part shape ZITADEL issues as opaque access token (alg A256GCMKW / enc A256GCM).
-    header = base64.urlsafe_b64encode(
-        json.dumps({"alg": "A256GCMKW", "enc": "A256GCM", "kid": "k", "iv": "A" * 16, "tag": "A" * 22}).encode()
-    )
-    return ".".join([header.rstrip(b"=").decode(), "B" * 43, "C" * 16, secrets.token_urlsafe(24), "D" * 22])
+    return _jwe()
 
 
 def introspection_claims(**overrides):
@@ -362,7 +380,31 @@ class TestIntrospectionRejected:
         assert response.status_code == status.HTTP_403_FORBIDDEN
         assert response.json()["error_code"] == "DUMONT_USER_NOT_ALLOWED"
 
-    @pytest.mark.parametrize("token", ["bad!token", "tok,en", 'tok"en', "=abc", "abc=def"])
+    @pytest.mark.parametrize(
+        "token",
+        [
+            "bad!token",
+            "tok,en",
+            'tok"en',
+            "=abc",
+            "abc=def",
+            # Valid RFC 6750 b64tokens, but not ZITADEL's opaque shape: never worth an issuer call.
+            "opq_" + secrets.token_urlsafe(32),
+            secrets.token_urlsafe(48),
+            "a.b.c.d",
+            _jwe(alg="RSA-OAEP"),
+            _jwe(enc="A128GCM"),
+            _jwe(kid=""),
+            _jwe(kid=DROP),
+            _jwe(encrypted_key="B" * 42),
+            _jwe(iv="C" * 17),
+            _jwe(tag="D" * 21),
+            _jwe(ciphertext=""),
+            _jwe(header_segment="bm90anNvbg"),  # "notjson"
+            _jwe(header_segment="WzFd"),  # "[1]": JSON, not an object
+            _jwe() + ".extra",
+        ],
+    )
     def test_malformed_opaque_token_never_reaches_issuer(
         self, introspection_enabled, linked_account, fake_introspection, token
     ):

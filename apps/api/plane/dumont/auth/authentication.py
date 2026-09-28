@@ -20,7 +20,12 @@ from rest_framework import status
 from rest_framework.authentication import BaseAuthentication
 from rest_framework.exceptions import APIException, AuthenticationFailed, PermissionDenied
 
-from plane.dumont.auth.introspection import IntrospectionUnavailable, introspect, token_fingerprint
+from plane.dumont.auth.introspection import (
+    IntrospectionUnavailable,
+    introspect,
+    is_zitadel_opaque_token,
+    token_fingerprint,
+)
 from plane.dumont.auth.jwks import UnknownKid, get_jwks_client
 from plane.dumont.auth.roles import granted_roles
 
@@ -33,8 +38,6 @@ NOT_BEFORE_LEEWAY_SECONDS = 30
 BEARER_HEADER = re.compile(r"^Bearer[ \t]+([^ \t]+)$", re.IGNORECASE)
 BEARER_SCHEME = re.compile(r"^Bearer(?:[ \t]|$)", re.IGNORECASE)
 BASE64URL_SEGMENT = re.compile(r"^[A-Za-z0-9_-]+$")
-# RFC 6750 `b64token`: the only shape a non-JWS bearer may have before it is sent to introspection.
-OPAQUE_TOKEN = re.compile(r"^[A-Za-z0-9\-._~+/]+=*$")
 # `token_type` values an introspection answer may carry for an access token (as in the MCP).
 ACCESS_TOKEN_TYPES = frozenset({"bearer", "access_token", "urn:ietf:params:oauth:token-type:access_token"})
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
@@ -195,8 +198,9 @@ class ZitadelBearerAuthentication(BaseAuthentication):
             return claims, self._token_id(claims, token)
         if not config.introspection_enabled:
             raise _invalid("not_jws")
-        if not OPAQUE_TOKEN.match(token):
-            raise _invalid("malformed_token")
+        if not is_zitadel_opaque_token(token):
+            # Only ZITADEL's opaque shape is worth an issuer call; anything else is invalid here.
+            raise _invalid("not_zitadel_opaque")
         return self._verify_by_introspection(token, config)
 
     def _verify_by_introspection(self, token, config):
