@@ -2,15 +2,19 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { NodeStreamableHTTPServerTransport } from "@modelcontextprotocol/node";
 import { assertHttpAuthConfigured, loadHangarConfig } from "./config.js";
 import {
+  bearerToken,
   authorizationChallenge,
   createAuthorizer,
   type AuthorizerDependencies,
   protectedResourceMetadata,
   protectedResourceMetadataPaths,
 } from "./auth.js";
+import { WriteRateLimiter } from "./access.js";
+import { HangarClient } from "./client.js";
 import { isMainModule } from "./runtime.js";
 import { createHangarServer } from "./tools.js";
-import { HangarError, type HangarConfig } from "./types.js";
+import { HangarError, type HangarConfig, type Principal } from "./types.js";
+import { UserinfoEmailResolver, type UserinfoDependencies } from "./userinfo.js";
 
 const MAX_REQUEST_BYTES = 1024 * 1024;
 
@@ -58,12 +62,31 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   }
 }
 
+/**
+ * Builds the per-request McpServer. `resolveEmail` looks the caller's email up
+ * lazily (userinfo with the caller's own bearer); tools call it only for
+ * attribution or assignee "me".
+ */
+export type HangarServerFactory = (
+  principal: Principal,
+  resolveEmail: () => Promise<string | null>
+) => ReturnType<typeof createHangarServer>;
+
 export function createHangarHttpServer(
   config: HangarConfig = loadHangarConfig(),
-  serverFactory: () => ReturnType<typeof createHangarServer> = () => createHangarServer(config),
-  authorizerDependencies: AuthorizerDependencies = {}
+  serverFactory?: HangarServerFactory,
+  authorizerDependencies: AuthorizerDependencies = {},
+  userinfoDependencies: UserinfoDependencies = {}
 ): Server {
   assertHttpAuthConfigured(config);
+  // One limiter and one email cache per process: each request gets its own
+  // stateless McpServer, but the per-user window and the cache span requests.
+  const rateLimiter = new WriteRateLimiter(config.writeRateLimit);
+  const userinfo = new UserinfoEmailResolver(config, userinfoDependencies);
+  const factory: HangarServerFactory =
+    serverFactory ??
+    ((principal, resolveEmail) =>
+      createHangarServer(config, new HangarClient(config), { principal, rateLimiter, resolveEmail }));
   const authorize = createAuthorizer(config, authorizerDependencies);
   const metadata = protectedResourceMetadata(config);
   const metadataPaths = protectedResourceMetadataPaths(config);
@@ -86,9 +109,10 @@ export function createHangarHttpServer(
       responseError(res, 503, "MCP authorization is temporarily unavailable", { "retry-after": "1" });
       return;
     }
-    if (authorization.failure) {
-      const status = authorization.failure === "insufficient_scope" ? 403 : 401;
-      const challenge = authorizationChallenge(config, authorization.failure);
+    if (authorization.failure || !authorization.principal) {
+      const failure = authorization.failure ?? "invalid_credentials";
+      const status = failure === "insufficient_scope" ? 403 : 401;
+      const challenge = authorizationChallenge(config, failure);
       responseError(
         res,
         status,
@@ -111,7 +135,12 @@ export function createHangarHttpServer(
 
     try {
       const body = req.method === "POST" ? await readJsonBody(req) : undefined;
-      const server = serverFactory();
+      const principal = authorization.principal;
+      // The bearer stays in this closure; it is sent only to the same-origin
+      // userinfo endpoint and never logged.
+      const token = bearerToken(req) ?? "";
+      const resolveEmail = () => userinfo.emailFor(principal.sub, token);
+      const server = factory(principal, resolveEmail);
       const transport = new NodeStreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
         enableJsonResponse: true,

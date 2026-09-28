@@ -80,6 +80,80 @@ export function redactText(value: string, maxLength = 4000): string {
   return redacted.slice(0, maxLength);
 }
 
+// Credential detectors for text that is about to be WRITTEN to Hangar.
+//
+// 1. Specific token shapes (JWT, PEM private key, plane_api_, GitHub, GitLab,
+//    Slack, AWS access key id, sk- keys, Twilio SID:secret) and connection
+//    strings / URLs that embed a password always block.
+// 2. `key: value` / `key=value` with a credential-ish key (password, senha,
+//    pwd, passphrase, secret, client_secret, token, api_key, private_key,
+//    access_key, dsn, authorization, cookie) and `Bearer <value>` block only
+//    when the VALUE looks like a secret: at least 12 characters, not natural
+//    words (letters with -, _ or spaces only), not an http(s) URL without
+//    userinfo, and either mixing letters and digits or of high entropy.
+//    This lets prose such as "O token: expirado ontem", "token=undefined" or
+//    "tokenUrl: https://…" through, in Portuguese or English.
+// Emails and IP addresses are redacted on read but are not credentials.
+const CREDENTIAL_KEY = String.raw`[A-Za-z0-9_.-]*(?:password|passwd|passphrase|senha|pwd|secret|token|api[-_]?key|private[-_]?key|access[-_]?key|dsn|authorization|cookie)[A-Za-z0-9_.-]*`;
+const CREDENTIAL_SHAPES: readonly RegExp[] = [
+  /\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|rediss|amqps?):\/\/[^\s:@/]+:[^\s@/]+@/i,
+  /\bhttps?:\/\/[^/\s:@]+:[^/\s@]+@/i,
+  /\bplane_api_[0-9a-f]{32}\b/i,
+  /\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/,
+  /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----/,
+  /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/,
+  /\bgh[pousr]_[A-Za-z0-9]{36,}\b/,
+  /\bgithub_pat_[A-Za-z0-9_]{40,}\b/,
+  /\bglpat-[A-Za-z0-9_-]{20,}\b/,
+  /\bxox[abprs]-[A-Za-z0-9-]{10,}\b/,
+  /\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{20,}\b/,
+  /\bAC[0-9a-f]{32}:[0-9a-f]{32}\b/i,
+];
+const CREDENTIAL_ASSIGNMENT = new RegExp(String.raw`["']?(${CREDENTIAL_KEY})["']?\s*[:=]\s*["']?([^\s"',;}\]]+)`, "gi");
+const BEARER_VALUE = /\bBearer\s+([A-Za-z0-9._~+/=-]+)/gi;
+const NATURAL_WORDS = /^[\p{L}]+(?:[-_ ][\p{L}]+)*[.!?]?$/u;
+const PLAIN_HTTP_URL = /^https?:\/\/[^\s/@]+(?:[/?#][^\s@]*)?$/i;
+
+function shannonEntropy(value: string): number {
+  const counts = new Map<string, number>();
+  for (const char of value) counts.set(char, (counts.get(char) ?? 0) + 1);
+  let entropy = 0;
+  for (const count of counts.values()) {
+    const p = count / value.length;
+    entropy -= p * Math.log2(p);
+  }
+  return entropy;
+}
+
+/** A value shaped like a secret rather than like a word, a number or a URL. */
+export function looksLikeSecretValue(value: string): boolean {
+  if (value.length < 12) return false;
+  if (NATURAL_WORDS.test(value)) return false;
+  if (PLAIN_HTTP_URL.test(value)) return false;
+  const mixed = /\p{L}/u.test(value) && /\d/.test(value);
+  return mixed || (value.length >= 20 && shannonEntropy(value) >= 3.5);
+}
+
+/**
+ * True when the text looks like it carries a credential. Used to refuse a
+ * write outright; the matched value is never returned or logged.
+ */
+export function containsCredential(value: string): boolean {
+  if (CREDENTIAL_SHAPES.some((pattern) => pattern.test(value))) return true;
+  for (const pattern of [CREDENTIAL_ASSIGNMENT, BEARER_VALUE]) {
+    pattern.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(value))) {
+      const candidate = match[match.length - 1] ?? "";
+      if (looksLikeSecretValue(candidate)) return true;
+      // Rescan from the start of the value, so a secret nested inside it
+      // (e.g. "tokenUrl: https://x/cb?token=…") is still seen.
+      pattern.lastIndex = match.index + match[0].length - candidate.length;
+    }
+  }
+  return false;
+}
+
 function record(value: unknown): JsonRecord {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as JsonRecord) : {};
 }

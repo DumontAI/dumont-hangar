@@ -22,8 +22,18 @@ describe("Hangar configuration", () => {
     expect(config.baseUrl.toString()).toBe("https://hangar.getdumont.ai/");
     expect(config.workspaceSlug).toBe("dumont");
     expect(config.allowedProjects).toEqual(["HGR"]);
-    expect(config.oidcRequiredRole).toBe("hangar_reader");
+    expect(config.oidcReaderRole).toBe("hangar_reader");
+    expect(config.oidcWriterRole).toBe("hangar_writer");
     expect(config.oidcRequiredScope).toBe("urn:zitadel:iam:org:project:role:hangar_reader");
+    expect(config.oidcScopesSupported).toEqual([
+      "openid",
+      "email",
+      "urn:zitadel:iam:org:project:role:hangar_reader",
+      "urn:zitadel:iam:org:project:role:hangar_writer",
+    ]);
+    expect(config.oidcUserinfoUrl?.href).toBe("https://auth.getdumont.ai/oidc/v1/userinfo");
+    expect(config.writeProjects).toEqual([]);
+    expect(config.writeRateLimit).toBe(20);
     expect(isApiKey(config.apiKey)).toBe(true);
   });
 

@@ -1,0 +1,66 @@
+name: Hangar MCP CI
+
+# DumontAI/dumont-hangar is a PUBLIC repository, so this workflow is CI only:
+# typecheck, test and build on GitHub-hosted `ubuntu-latest`, with read-only
+# repository permissions and no secrets. There is no deploy job and no
+# self-hosted runner here; the MCP is deployed by hand (mcp/README.md,
+# "Manual deploy"). Automated deploy belongs in a later ticket, driven from a
+# private repository.
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/hangar-mcp.yml"
+      - "mcp/**"
+  push:
+    branches:
+      - dumont
+    paths:
+      - ".github/workflows/hangar-mcp.yml"
+      - "mcp/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hangar-mcp-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "22"
+  PNPM_VERSION: "10.33.2"
+
+jobs:
+  ci:
+    name: MCP quality gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Use pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          # mcp/ is its own package (pnpm@10.33.2); the repo root pins pnpm 11.
+          package_json_file: mcp/package.json
+
+      - name: Use Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: mcp/pnpm-lock.yaml
+
+      # mcp/ is not part of the root pnpm workspace; install it on its own.
+      - name: Install MCP dependencies
+        run: pnpm --dir mcp install --frozen-lockfile --ignore-workspace
+
+      - name: Typecheck
+        run: pnpm --dir mcp run typecheck
+
+      - name: Test
+        run: pnpm --dir mcp test
+
+      - name: Build
+        run: pnpm --dir mcp run build

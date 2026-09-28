@@ -337,6 +337,15 @@ export class HangarClient {
     if (parts.length === 0 || parts.length > 10) {
       throw new HangarError("INVALID_ARGUMENT", `${label} has an invalid format`);
     }
+    return this.resolveNamedIds(label, parts, load);
+  }
+
+  /** Exact (case-insensitive) name or UUID match, loading the records once. */
+  private async resolveNamedIds(
+    label: "state" | "label",
+    parts: readonly string[],
+    load: () => Promise<JsonRecord[]>
+  ): Promise<string[]> {
     const records = parts.every((part) => PROJECT_UUID.test(part)) ? [] : await load();
     return parts.map((part) => {
       if (PROJECT_UUID.test(part)) return part;
@@ -355,6 +364,245 @@ export class HangarClient {
       if (!id) throw new HangarError("INVALID_ARGUMENT", `${label} "${part}" did not match any name in this project`);
       return id;
     });
+  }
+
+  // ---------------------------------------------------------------- writes
+
+  isWritableProject(project: ProjectRecord): boolean {
+    return (
+      this.config.writeProjects.includes(project.identifier) ||
+      this.config.writeProjects.includes(project.id.toLowerCase())
+    );
+  }
+
+  /** Allowlisted AND write-enabled project, or a PROJECT_NOT_WRITABLE error. */
+  async resolveWritableProject(reference: string): Promise<ProjectRecord> {
+    const project = await this.resolveProject(reference);
+    this.assertWritable(project);
+    return project;
+  }
+
+  assertWritable(project: ProjectRecord): void {
+    if (!this.isWritableProject(project)) {
+      throw new HangarError(
+        "PROJECT_NOT_WRITABLE",
+        `Project ${project.identifier} is readable but not enabled for writes (HANGAR_WRITE_PROJECTS)`
+      );
+    }
+  }
+
+  /**
+   * Loads the work item a write targets (IDENTIFIER-N, or UUID together with
+   * project) and returns it with its allowlisted, write-enabled project.
+   */
+  async workItemForWrite(
+    workItem: string,
+    projectReference?: string
+  ): Promise<{ project: ProjectRecord; record: JsonRecord; id: string }> {
+    const value = workItem.trim();
+    let record: JsonRecord;
+    let project: ProjectRecord | null;
+    if (PROJECT_UUID.test(value)) {
+      if (!projectReference) {
+        throw new HangarError("INVALID_ARGUMENT", "Pass project together with a work item UUID, or use IDENTIFIER-N");
+      }
+      project = await this.resolveProject(projectReference);
+      record = await this.getWorkItemById(project.id, value);
+    } else {
+      record = await this.getWorkItemByIdentifier(value);
+      project = this.projectRecord(record) ?? (await this.projectOfRecord(record));
+      if (!project) {
+        throw new HangarError("PROJECT_SCOPE_MISMATCH", "The work item could not be verified against its project");
+      }
+      if (projectReference) {
+        const expected = await this.resolveProject(projectReference);
+        if (expected.id !== project.id) {
+          throw new HangarError("INVALID_ARGUMENT", "work_item does not belong to the given project");
+        }
+      }
+    }
+    this.assertWritable(project);
+    const id = stringField(record, "id");
+    if (!id || !PROJECT_UUID.test(id)) {
+      throw new HangarError("UPSTREAM_INVALID_RESPONSE", "Hangar returned an invalid work item");
+    }
+    return { project, record, id: id.toLowerCase() };
+  }
+
+  async resolveStateId(project: ProjectRecord, reference: string): Promise<string> {
+    const [id] = await this.resolveNamedIds("state", [reference.trim()], () => this.rawStates(project));
+    return id!;
+  }
+
+  async resolveLabelIds(project: ProjectRecord, references: readonly string[]): Promise<string[]> {
+    const parts = references.map((reference) => reference.trim()).filter(Boolean);
+    if (parts.length === 0) return [];
+    return [...new Set(await this.resolveNamedIds("label", parts, () => this.rawLabels(project)))];
+  }
+
+  /**
+   * Member UUID, exact display name / full name, or "me" (the workspace member
+   * whose email equals the caller's verified token email).
+   */
+  async resolveAssigneeIds(
+    project: ProjectRecord,
+    references: readonly string[],
+    callerEmail: string | null
+  ): Promise<string[]> {
+    const parts = references.map((reference) => reference.trim()).filter(Boolean);
+    if (parts.length === 0) return [];
+    const members = await this.loadWorkspaceMembers();
+    const ids = parts.map((part) => {
+      if (part.toLowerCase() !== "me") return this.resolveMember(project, part, members);
+      if (!callerEmail) {
+        throw new HangarError(
+          "FORBIDDEN",
+          'assignee "me" needs your email, which neither the token nor userinfo provided (log in again with the openid and email scopes)'
+        );
+      }
+      const matches = members.filter((member) => stringField(member, "email")?.toLowerCase() === callerEmail);
+      const id = matches.length === 1 ? stringField(matches[0]!, "id") : null;
+      if (!id) {
+        throw new HangarError(
+          "FORBIDDEN",
+          'assignee "me" did not match exactly one Hangar workspace member with the token email'
+        );
+      }
+      return id;
+    });
+    return [...new Set(ids)];
+  }
+
+  /** Parent by IDENTIFIER-N or UUID; Plane only accepts a parent in the same project. */
+  async resolveParentId(project: ProjectRecord, reference: string): Promise<string> {
+    const value = reference.trim();
+    const record = PROJECT_UUID.test(value)
+      ? await this.getWorkItemById(project.id, value)
+      : await this.getWorkItemByIdentifier(value);
+    const parentProject = stringField(record, "project");
+    if (!parentProject || parentProject.toLowerCase() !== project.id.toLowerCase()) {
+      throw new HangarError("INVALID_ARGUMENT", "parent must be a work item of the same project");
+    }
+    const id = stringField(record, "id");
+    if (!id || !PROJECT_UUID.test(id)) {
+      throw new HangarError("UPSTREAM_INVALID_RESPONSE", "Hangar returned an invalid work item");
+    }
+    return id.toLowerCase();
+  }
+
+  /**
+   * POST a work item. With an external_id/external_source pair Plane answers
+   * 409 {"id": <existing>} for a repeat (apps/api/plane/api/views/issue.py,
+   * IssueListCreateAPIEndpoint.post); that existing item is returned instead.
+   */
+  async createWorkItem(project: ProjectRecord, body: JsonRecord): Promise<{ record: JsonRecord; replayed: boolean }> {
+    const response = await this.write("POST", `/projects/${project.id}/issues/`, body, [409]);
+    if (response.status === 409) {
+      const existing = stringField(response.json, "id");
+      if (!existing || !PROJECT_UUID.test(existing)) {
+        throw new HangarError("UPSTREAM_CONFLICT", "Hangar reported a conflicting work item without its id");
+      }
+      return { record: await this.getWorkItemById(project.id, existing), replayed: true };
+    }
+    this.assertRecordProject(response.json, project);
+    return { record: response.json, replayed: false };
+  }
+
+  async updateWorkItem(project: ProjectRecord, workItemId: string, body: JsonRecord): Promise<JsonRecord> {
+    const id = validId(workItemId, "work_item_id");
+    const response = await this.write("PATCH", `/projects/${project.id}/issues/${encodeURIComponent(id)}/`, body);
+    this.assertRecordProject(response.json, project);
+    return response.json;
+  }
+
+  async addComment(project: ProjectRecord, workItemId: string, commentHtml: string): Promise<JsonRecord> {
+    const id = validId(workItemId, "work_item_id");
+    const response = await this.write("POST", `/projects/${project.id}/issues/${encodeURIComponent(id)}/comments/`, {
+      comment_html: commentHtml,
+    });
+    this.assertRecordProject(response.json, project);
+    return response.json;
+  }
+
+  private async write(
+    method: "POST" | "PATCH",
+    path: string,
+    body: JsonRecord,
+    passStatuses: readonly number[] = []
+  ): Promise<{ status: number; json: JsonRecord }> {
+    const url = new URL(
+      `/api/v1/workspaces/${encodeURIComponent(this.config.workspaceSlug)}${path}`,
+      this.config.baseUrl
+    );
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.config.timeoutMs);
+    try {
+      const response = await this.fetcher(url, {
+        method,
+        redirect: "error",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          "x-api-key": this.config.apiKey,
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+      const text = await this.readBody(response, controller);
+      let json: JsonRecord = {};
+      try {
+        json = asRecord(text ? JSON.parse(text) : {}) ?? {};
+      } catch {
+        if (response.ok) throw new HangarError("UPSTREAM_INVALID_RESPONSE", "Hangar returned invalid JSON");
+      }
+      if (!response.ok && !passStatuses.includes(response.status)) throw this.writeError(response.status, json);
+      return { status: response.status, json };
+    } catch (error) {
+      if (error instanceof HangarError) throw error;
+      // A write that timed out may or may not have been applied: never retryable blindly.
+      if (controller.signal.aborted) {
+        throw new HangarError(
+          "UPSTREAM_TIMEOUT",
+          "Hangar did not answer before the timeout; the write may or may not have been applied, check before retrying (or pass idempotency_key)"
+        );
+      }
+      throw new HangarError("UPSTREAM_UNAVAILABLE", "Hangar write operation could not be completed");
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private writeError(status: number, json: JsonRecord): HangarError {
+    if (status === 400) {
+      // Only the field names Plane complained about; messages may echo input.
+      const fields = Object.keys(json)
+        .filter((key) => /^[a-z_]{1,40}$/.test(key))
+        .slice(0, 10);
+      return new HangarError(
+        "UPSTREAM_VALIDATION_FAILED",
+        fields.length > 0
+          ? `Hangar rejected the write; check these fields: ${fields.join(", ")}`
+          : "Hangar rejected the write as invalid"
+      );
+    }
+    if (status === 401) return new HangarError("UPSTREAM_UNAUTHORIZED", "Hangar rejected the service credential");
+    if (status === 403) {
+      return new HangarError(
+        "UPSTREAM_FORBIDDEN",
+        "Hangar denied the write; the MCP service account must be a Member of the project"
+      );
+    }
+    if (status === 404) return new HangarError("UPSTREAM_NOT_FOUND", "Hangar did not find the requested resource");
+    if (status === 409) return new HangarError("UPSTREAM_CONFLICT", "Hangar reported a conflicting resource");
+    if (status === 429)
+      return new HangarError("UPSTREAM_RATE_LIMITED", "Hangar rate-limited the write operation", true);
+    if (status >= 500) {
+      return new HangarError(
+        "UPSTREAM_UNAVAILABLE",
+        "Hangar failed while writing; the write may or may not have been applied, check before retrying"
+      );
+    }
+    return new HangarError("UPSTREAM_REQUEST_FAILED", "Hangar rejected the write operation");
   }
 
   private async rawStates(project: ProjectRecord): Promise<JsonRecord[]> {

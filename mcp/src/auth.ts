@@ -1,7 +1,8 @@
 import { createRemoteJWKSet, jwtVerify, type JWTPayload } from "jose";
 import type { IncomingMessage } from "node:http";
 import { createIntrospector, isZitadelOpaqueToken, type IntrospectionDependencies } from "./introspection.js";
-import type { HangarConfig } from "./types.js";
+import { zitadelRoleScope } from "./config.js";
+import type { HangarConfig, Principal } from "./types.js";
 
 const MAX_BEARER_BYTES = 16 * 1024;
 // Small allowance for clock skew between this host and the issuer on `nbf`.
@@ -24,7 +25,13 @@ export type AuthorizationFailure =
 export interface AuthorizationResult {
   readonly failure: AuthorizationFailure | null;
   readonly subject: string | null;
+  /** Set only when failure is null: the verified caller handed to the tools. */
+  readonly principal?: Principal | null;
 }
+
+// Loose shape check only: the value is used for attribution and to match the
+// caller's Hangar workspace member, never as a credential.
+const EMAIL_CLAIM = /^[^\s@<>"]{1,128}@[^\s@<>"]{1,253}$/;
 
 function requestHost(req: IncomingMessage): string {
   const raw = req.headers.host?.trim().toLowerCase() ?? "";
@@ -47,7 +54,7 @@ function requestOriginAllowed(req: IncomingMessage, config: HangarConfig): boole
   return !origin || config.allowedOrigins.includes(origin);
 }
 
-function bearerToken(req: IncomingMessage): string | null {
+export function bearerToken(req: IncomingMessage): string | null {
   const authorization = req.headers.authorization ?? "";
   const match = /^Bearer[ \t]+([^ \t]+)$/i.exec(authorization);
   const token = match?.[1] ?? "";
@@ -73,7 +80,22 @@ function containsString(value: unknown, wanted: string): boolean {
   return false;
 }
 
-function hasRequiredRole(payload: JWTPayload, config: HangarConfig): boolean {
+/**
+ * Role sources, all on a token already bound to our issuer and audience:
+ * - `urn:zitadel:iam:org:project:<audience>:roles`: ZITADEL's project-scoped
+ *   claim; only roles of the audience project can appear under it.
+ * - `urn:zitadel:iam:org:project:roles`: ZITADEL puts the roles of the
+ *   project of the requesting application here. Our clients (the pinned
+ *   public client and DCR apps) live in the audience project, so these are
+ *   audience-project roles. A client of ANOTHER project that also requests
+ *   our audience would carry its own project's roles here; same-named roles
+ *   there would be accepted, so role names must stay unique per instance and
+ *   no other project may define `hangar_reader`/`hangar_writer`.
+ * - `roles`: legacy flat claim, same caveat.
+ * - `my:zitadel:grants`: custom Action claim, only the exact
+ *   `<audience>:<role>` entry.
+ */
+function hasRole(payload: JWTPayload, config: HangarConfig, role: string): boolean {
   const roleClaims = new Set([
     "roles",
     "urn:zitadel:iam:org:project:roles",
@@ -81,29 +103,43 @@ function hasRequiredRole(payload: JWTPayload, config: HangarConfig): boolean {
   ]);
   for (const [claimName, claimValue] of Object.entries(payload)) {
     if (!roleClaims.has(claimName)) continue;
-    if (Array.isArray(claimValue) && claimValue.some((role) => role === config.oidcRequiredRole)) return true;
-    if (
-      claimValue &&
-      typeof claimValue === "object" &&
-      Object.prototype.hasOwnProperty.call(claimValue, config.oidcRequiredRole)
-    ) {
+    if (Array.isArray(claimValue) && claimValue.some((value) => value === role)) return true;
+    if (claimValue && typeof claimValue === "object" && Object.prototype.hasOwnProperty.call(claimValue, role)) {
       return true;
     }
   }
 
+  // Custom claim from a ZITADEL Action (`<projectId>:<role>` strings). A bare
+  // role, or a role of another project, is never enough: only the exact
+  // `<configured audience project>:<role>` entry counts.
   const grants = payload["my:zitadel:grants"];
+  const scoped = `${config.oidcAudience}:${role}`;
+  return Boolean(config.oidcAudience) && Array.isArray(grants) && grants.some((grant) => grant === scoped);
+}
+
+/** The configured Hangar roles (reader, writer) this token carries, in that order. */
+export function grantedRoles(payload: JWTPayload, config: HangarConfig): string[] {
+  return [config.oidcReaderRole, config.oidcWriterRole].filter((role) => hasRole(payload, config, role));
+}
+
+/**
+ * The default required scope is a ZITADEL reserved role scope. ZITADEL JWT
+ * access tokens do not necessarily echo it in `scope`/`scp`, so the role claim
+ * is what gets checked. Only a custom MCP_OIDC_REQUIRED_SCOPE must be literal.
+ */
+function usesZitadelRoleScope(config: HangarConfig): boolean {
   return (
-    Array.isArray(grants) &&
-    grants.some(
-      (grant) =>
-        typeof grant === "string" &&
-        (grant === config.oidcRequiredRole || grant.endsWith(`:${config.oidcRequiredRole}`))
-    )
+    config.oidcRequiredScope === zitadelRoleScope(config.oidcReaderRole) ||
+    config.oidcRequiredScope === zitadelRoleScope(config.oidcWriterRole)
   );
 }
 
-function usesZitadelRoleScope(config: HangarConfig): boolean {
-  return config.oidcRequiredScope === `urn:zitadel:iam:org:project:role:${config.oidcRequiredRole}`;
+function principalEmail(payload: JWTPayload): string | null {
+  const email = payload.email;
+  // Only an email the issuer marks verified (strictly `true`) is trusted for
+  // attribution or "me"; anything else falls through to the userinfo lookup.
+  if (payload.email_verified !== true) return null;
+  return typeof email === "string" && EMAIL_CLAIM.test(email) ? email.toLowerCase() : null;
 }
 
 function hasAllowedOrganization(payload: JWTPayload, organizationId: string): boolean {
@@ -144,7 +180,13 @@ export function evaluateAccessClaims(
     return invalidCredentials();
   }
   if (typeof claims.sub !== "string" || claims.sub.length === 0) return invalidCredentials();
-  return { failure: oidcAccessAllowed(claims, config), subject: claims.sub };
+  const failure = oidcAccessAllowed(claims, config);
+  if (failure) return { failure, subject: claims.sub, principal: null };
+  return {
+    failure: null,
+    subject: claims.sub,
+    principal: { sub: claims.sub, email: principalEmail(claims), roles: grantedRoles(claims, config) },
+  };
 }
 
 type TokenShape = "jws" | "jwe" | "other";
@@ -180,14 +222,16 @@ function isAccessTokenType(value: unknown): boolean {
 
 function oidcAccessAllowed(payload: JWTPayload, config: HangarConfig): AuthorizationFailure | null {
   const scopes = tokenScopes(payload);
-  const roleAllowed = hasRequiredRole(payload, config);
-  if (!roleAllowed) {
+  // Server-level gate: the reader or the writer role (writer implies reader).
+  // Per-tool checks happen in the tool layer, so a reader calling a write tool
+  // gets a tool error instead of a 401/403 that would restart the login.
+  if (grantedRoles(payload, config).length === 0) {
     return "insufficient_scope";
   }
-  // ZITADEL uses this reserved OAuth scope to request/assert the role claim;
-  // its JWT access tokens do not necessarily echo the reserved value in
-  // `scope`/`scp`. The role claim remains mandatory, while other OIDC scopes
-  // still require a literal scope claim.
+  // ZITADEL uses the reserved role scopes to request/assert the role claim;
+  // its JWT access tokens do not necessarily echo them in `scope`/`scp`. A
+  // role claim remains mandatory, while other OIDC scopes still require a
+  // literal scope claim.
   if (!scopes.has(config.oidcRequiredScope) && !usesZitadelRoleScope(config)) {
     return "insufficient_scope";
   }
@@ -263,7 +307,7 @@ export function protectedResourceMetadata(config: HangarConfig): Record<string, 
   return {
     resource: canonicalUrl(config.resourceUrl),
     authorization_servers: [canonicalUrl(config.oidcIssuer)],
-    scopes_supported: [config.oidcRequiredScope],
+    scopes_supported: [...config.oidcScopesSupported],
     bearer_methods_supported: ["header"],
   };
 }
@@ -285,7 +329,9 @@ export function authorizationChallenge(config: HangarConfig, failure: Authorizat
   if (failure === "temporarily_unavailable") return null;
   const metadata = metadataUrl(config);
   if (!metadata) return null;
-  const scope = quote(config.oidcRequiredScope);
+  // RFC 6750 scope is space-delimited: ask for both role scopes so a new login
+  // can carry the writer role when the user has it.
+  const scope = quote(config.oidcScopesSupported.join(" "));
   const resourceMetadata = quote(metadata.href);
   if (failure === "insufficient_scope") {
     return `Bearer error="insufficient_scope", scope=${scope}, resource_metadata=${resourceMetadata}`;

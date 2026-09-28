@@ -13,7 +13,7 @@ function introspectionConfig() {
     oidcJwksUrl: new URL(`${ISSUER}/oauth/v2/keys`),
     oidcAudience: AUDIENCE,
     oidcRequiredScope: ROLE_SCOPE,
-    oidcRequiredRole: "hangar_reader",
+    oidcReaderRole: "hangar_reader",
     oidcAllowedOrgId: "",
     oidcAllowedSubjects: [],
     resourceUrl: new URL("https://mcp-hangar.example.test/mcp"),
