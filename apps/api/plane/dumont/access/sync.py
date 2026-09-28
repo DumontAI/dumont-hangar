@@ -22,7 +22,7 @@ from django.core.cache import cache
 from plane.dumont.access import roles as R
 from plane.dumont.access.apply import apply_plan
 from plane.dumont.access.config import MODE_DRY_RUN, MODE_ENFORCE, MODE_OFF, AccessConfigError, load_access_config
-from plane.dumont.access.plan import compute_plan, managed_scopes
+from plane.dumont.access.plan import compute_plan, managed_scopes, scopes_losing_most_members
 from plane.dumont.access.snapshot import WorkspaceNotFound, build_snapshot, dumont_subs_of, load_workspace
 from plane.dumont.access.zitadel import ZitadelClient, ZitadelError
 
@@ -44,6 +44,8 @@ STATUS_BRAKE = "aborted_brake"
 STATUS_ERROR = "error"
 STATUS_BUSY = "busy"
 STATUS_SKIPPED = "skipped"
+
+ZERO_GRANTS_ERROR = "managed scopes but zero grants"
 
 
 def make_client(cfg):
@@ -251,7 +253,7 @@ def run_full_sync(mode=None, max_removals=None):
     if not acquired:
         return _report(STATUS_BUSY, mode, "full")
     try:
-        return _full_sync(cfg, mode)
+        return _full_sync(cfg, mode, override=max_removals is not None)
     except Exception as exc:  # last line of defence: a sync bug must never escape into beat/commands
         logger.exception("dumont access: full sync failed")
         return _report(STATUS_ERROR, mode, "full", error=f"internal error ({exc.__class__.__name__})")
@@ -262,7 +264,7 @@ def run_full_sync(mode=None, max_removals=None):
             pass
 
 
-def _full_sync(cfg, mode):
+def _full_sync(cfg, mode, override=False):
     try:
         cfg.require_complete()
         workspace = load_workspace(cfg.workspace_slug)
@@ -280,9 +282,47 @@ def _full_sync(cfg, mode):
     plan = compute_plan(snapshot)
     plan.ignored_grants = _ignored_grants(client)
 
+    # Guards that no absolute limit catches. Both are bypassed only by an explicit per-run
+    # --max-removals (max_removals=...), given after a dry-run showed the removals are real.
+    managed_anything = plan.managed_workspace or bool(plan.managed_projects)
+    zero_grants = managed_anything and not grants
+    mostly_losing = scopes_losing_most_members(plan, snapshot)
+
     if mode == MODE_DRY_RUN:
         _log_cascade(plan.changes, "planned (dry-run, not written)")
-        report = _report(STATUS_DRY_RUN, mode, "full", plan, snapshot)
+        would_refuse = []
+        if zero_grants:
+            would_refuse.append(ZERO_GRANTS_ERROR)
+        if mostly_losing:
+            would_refuse.append("relative brake: more than half of a managed scope would lose access")
+        report = _report(
+            STATUS_DRY_RUN, mode, "full", plan, snapshot, would_refuse=would_refuse, relative_brake=mostly_losing
+        )
+        _log_plan(report)
+        return report
+
+    if zero_grants and not override:
+        logger.critical(
+            "dumont access: %s; nothing was written. An empty grant list for managed scopes is far more likely "
+            "a ZITADEL-side problem (wrong project, lost permission) than a decision to remove everyone. If it "
+            "is real, run once with `manage.py dumont_access_sync --max-removals N`.",
+            ZERO_GRANTS_ERROR,
+        )
+        report = _report(STATUS_ERROR, mode, "full", plan, snapshot, error=ZERO_GRANTS_ERROR)
+        _log_plan(report)
+        return report
+
+    if mostly_losing and not override:
+        logger.critical(
+            "dumont access: SAFETY BRAKE (relative) - the full sync would remove or reduce the access of more than "
+            "half of the members of %s; nothing was written. Review with `--mode dry-run`; if it is real, run "
+            "once with `--max-removals N`.",
+            ", ".join(f"{item['scope']} ({item['losing']}/{item['members']})" for item in mostly_losing),
+        )
+        _log_cascade(plan.changes, "planned (brake, not written)")
+        report = _report(
+            STATUS_BRAKE, mode, "full", plan, snapshot, max_removals=cfg.max_removals, relative_brake=mostly_losing
+        )
         _log_plan(report)
         return report
 

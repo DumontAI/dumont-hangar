@@ -123,27 +123,24 @@ class TestZitadelClient:
             client.list_user_grants(PROJECT_ID)
         assert "no 'result'" in str(exc.value)
 
-    @pytest.mark.parametrize(
-        "body",
-        [
-            {"details": {"viewTimestamp": "2026-09-28T00:00:00Z"}},  # no totalResult at all
-            {"details": {"totalResult": "0"}},  # uint64 as a string
-            {"details": {"totalResult": 0}},
-        ],
-    )
-    def test_omitted_result_with_zero_total_is_empty(self, client, fake_zitadel, body):
-        # proto3 JSON without EmitUnpopulated omits an empty `result` (and a zero totalResult)
+    @pytest.mark.parametrize("body", [{"details": {"totalResult": "0"}}, {"details": {"totalResult": 0}}])
+    def test_omitted_result_with_explicit_zero_total_is_empty(self, client, fake_zitadel, body):
+        # proto3 JSON without EmitUnpopulated omits an empty `result`; only an explicit zero total says so
         fake_zitadel.raw_body_on = ("roles", body)
         assert client.list_project_role_keys(PROJECT_ID) == []
 
     @pytest.mark.parametrize(
         "body,message",
         [
+            # reviewer probe: no result AND no totalResult is NOT an empty list
+            ({"details": {"viewTimestamp": "2026-09-28T00:00:00Z"}}, "no 'result'"),
             ({"details": {"totalResult": "3"}}, "no 'result'"),  # rows exist but none were sent
             ({}, "no 'result'"),  # no details at all
             ({"details": "x"}, "no 'result'"),
             ({"details": {"totalResult": "0"}, "result": {"a": 1}}, "'result' is not a list"),
             ({"details": {"totalResult": "1"}, "result": None}, "'result' is not a list"),
+            ({"details": {"totalResult": "many"}, "result": []}, "unreadable details.totalResult"),
+            ({"details": {"totalResult": "-1"}, "result": []}, "unreadable details.totalResult"),
         ],
     )
     def test_other_shapes_without_a_result_list_are_errors(self, client, fake_zitadel, body, message):
@@ -159,6 +156,62 @@ class TestZitadelClient:
         assert len(client.list_project_role_keys(PROJECT_ID)) == 75
         offsets = [call[2]["query"]["offset"] for call in fake_zitadel.api_calls("roles")]
         assert offsets == ["0", "30", "60"]
+
+    def _scripted(self, monkeypatch, fake, pages):
+        """Serve `pages` (response bodies) in order for the roles search."""
+        served = []
+
+        def page(request, parsed, rows):
+            from plane.tests.unit.dumont.access.conftest import _response
+
+            served.append(parsed["query"]["offset"])
+            return _response(request, 200, pages[len(served) - 1])
+
+        monkeypatch.setattr(fake, "_page", page)
+        return served
+
+    def test_total_is_remembered_across_pages(self, client, fake_zitadel, monkeypatch):
+        # reviewer probe (PAGE_SIZE=2): page 1 announces 5 rows; page 2 omits result AND totalResult
+        monkeypatch.setattr(Z, "PAGE_SIZE", 2)
+        self._scripted(
+            monkeypatch,
+            fake_zitadel,
+            [
+                {"details": {"totalResult": "5"}, "result": [{"key": "a"}, {"key": "b"}]},
+                {"details": {"viewTimestamp": "x"}},
+            ],
+        )
+        with pytest.raises(Z.ZitadelError):
+            client.list_project_role_keys(PROJECT_ID)
+
+    def test_short_page_without_total_after_a_total_keeps_paging(self, client, fake_zitadel, monkeypatch):
+        # page 2 is short and carries no total, but page 1 said 5: 3 rows are still owed
+        monkeypatch.setattr(Z, "PAGE_SIZE", 2)
+        served = self._scripted(
+            monkeypatch,
+            fake_zitadel,
+            [
+                {"details": {"totalResult": "5"}, "result": [{"key": "a"}, {"key": "b"}]},
+                {"result": [{"key": "c"}]},
+                {"result": []},
+            ],
+        )
+        with pytest.raises(Z.ZitadelError) as exc:
+            client.list_project_role_keys(PROJECT_ID)
+        assert "empty page at offset 3 of totalResult 5" in str(exc.value)
+        assert served == ["0", "2", "3"]
+
+    def test_largest_total_wins(self, client, fake_zitadel, monkeypatch):
+        monkeypatch.setattr(Z, "PAGE_SIZE", 2)
+        self._scripted(
+            monkeypatch,
+            fake_zitadel,
+            [
+                {"details": {"totalResult": "4"}, "result": [{"key": "a"}, {"key": "b"}]},
+                {"details": {"totalResult": "2"}, "result": [{"key": "c"}, {"key": "d"}]},
+            ],
+        )
+        assert client.list_project_role_keys(PROJECT_ID) == ["a", "b", "c", "d"]
 
     def test_empty_page_before_total_is_an_error(self, client, fake_zitadel):
         # 150 grants exist (totalResult 150) but the server stops handing rows out after 100

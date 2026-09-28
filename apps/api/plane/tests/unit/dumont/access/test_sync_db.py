@@ -165,16 +165,28 @@ class TestFullSync:
         assert run_full_sync()["status"] == "error"
         assert state(world) == before
 
-    def test_safety_brake(self, world, monkeypatch):
-        monkeypatch.setenv("DUMONT_ACCESS_MAX_REMOVALS", "2")
-        # ZITADEL suddenly answers "no grants at all" (the explicit, empty `result`)
+    def test_zero_grants_with_managed_scopes_is_an_error(self, world, monkeypatch):
+        # ZITADEL suddenly answers "no grants at all" (an explicit, empty `result`), even under the limit
+        monkeypatch.setenv("DUMONT_ACCESS_MAX_REMOVALS", "50")
         world["fake"].grants.clear()
         before = state(world)
         report = run_full_sync()
-        assert report["status"] == "aborted_brake"
-        # alice, bob and admin lose access (the owner is protected): 3 people, 6 rows
+        assert report["status"] == "error" and report["error"] == "managed scopes but zero grants"
+        # alice, bob and admin would lose access (the owner is protected): 3 people, 6 rows
         assert report["counts"]["users_losing_access"] == 3
-        assert report["counts"]["deactivations"] == 6
+        assert state(world) == before
+
+    def test_zero_grants_needs_the_explicit_override(self, world):
+        world["fake"].grants.clear()
+        report = run_full_sync(max_removals=3)
+        assert report["status"] == "applied", report
+        assert ws_row(world["workspace"], world["users"]["alice"]).is_active is False
+
+    def test_absolute_brake(self, world, monkeypatch):
+        monkeypatch.setenv("DUMONT_ACCESS_MAX_REMOVALS", "0")
+        before = state(world)
+        report = run_full_sync()  # bob only: 1 of 4 workspace members, 1 of 3 in MO
+        assert report["status"] == "aborted_brake" and report.get("relative_brake") in (None, [])
         assert state(world) == before
 
     def test_brake_counts_people_not_rows(self, world, monkeypatch):
@@ -251,7 +263,11 @@ class TestFullSync:
                 grant["roleKeys"] = ["hangar.workspace.member", "hangar.project.mo.admin"]
             if grant["userId"] == "sub-admin":
                 grant["roleKeys"] = ["hangar.workspace.admin"]
-        report = run_full_sync()
+        # MO loses 2 of its 3 members (bob and admin): the relative brake stops the beat, so this is
+        # the explicit one-run override an operator gives after the dry-run
+        assert run_full_sync()["status"] == "aborted_brake"
+        report = run_full_sync(max_removals=5)
+        assert report["status"] == "applied", report
         assert report["stale"] == [], report["stale"]
         assert pr_row(world["mo"], world["users"]["alice"]).role == 20
         assert pr_row(world["mo"], world["users"]["admin"]).is_active is False
@@ -281,7 +297,13 @@ class TestFullSync:
     def test_brake_not_applied_to_dry_run(self, world):
         world["set_mode"]("dry-run")
         world["fake"].grants.clear()
-        assert run_full_sync()["status"] == "dry_run"
+        report = run_full_sync()
+        assert report["status"] == "dry_run"
+        assert report["would_refuse"] == [
+            "managed scopes but zero grants",
+            "relative brake: more than half of a managed scope would lose access",
+        ]
+        assert {item["scope"] for item in report["relative_brake"]} == {"workspace", "MO"}
 
     def test_enforce_override_requires_env_enforce(self, world):
         world["set_mode"]("dry-run")
@@ -611,3 +633,120 @@ class TestPerUserSyncAndHooks:
         calls = len(world["fake"].calls)
         assert dumont_access_full_sync.run() == {"status": "off"}
         assert len(world["fake"].calls) == calls
+
+    @pytest.mark.parametrize("variable,value", [("DUMONT_ACCESS_SYNC", "enfroce"), ("DUMONT_ACCESS_MAX_REMOVALS", "x")])
+    def test_celery_task_config_typo_is_loud(self, world, monkeypatch, caplog, variable, value):
+        from plane.dumont.access.tasks import dumont_access_full_sync
+
+        monkeypatch.setenv(variable, value)
+        caplog.set_level(logging.ERROR, logger="plane.dumont.access")
+        before = state(world)
+        result = dumont_access_full_sync.run()
+        assert result["status"] == "error" and variable in result["error"]
+        assert any("configuration error" in r.getMessage() and r.levelno == logging.ERROR for r in caplog.records)
+        assert world["fake"].calls == [] and state(world) == before
+
+
+@pytest.fixture
+def small_world(db, workspace, create_user, fake_zitadel, access_env):
+    """Second-round reviewer world: an admin plus four members, all granted; OPS is unmanaged."""
+    fake = fake_zitadel
+    fake.roles = WS_ROLES + MO_ROLES
+    mo = make_project(workspace, "MO", create_user)
+    ops = make_project(workspace, "OPS", create_user)
+    admin = make_user("admin@example.test", sub="sub-admin")
+    ws_member(workspace, admin, 20)
+    pr_member(mo, admin, 20)
+    fake.grant("sub-admin", "hangar.workspace.admin", "hangar.project.mo.admin")
+    people = []
+    for i in range(4):
+        person = make_user(f"u{i}@example.test", sub=f"sub-u{i}")
+        ws_member(workspace, person, 15)
+        pr_member(mo, person, 15)
+        pr_member(ops, person, 15)  # unmanaged project: reached only by the cascade
+        fake.grant(f"sub-u{i}", "hangar.workspace.member", "hangar.project.mo.member")
+        people.append(person)
+    return {"fake": fake, "ws": workspace, "mo": mo, "ops": ops, "people": people, "admin": admin}
+
+
+def _small_state(w):
+    return [
+        (ws_row(w["ws"], p).is_active, pr_row(w["mo"], p).is_active, pr_row(w["ops"], p).is_active) for p in w["people"]
+    ]
+
+
+@pytest.mark.unit
+@pytest.mark.django_db
+class TestNoSilentWipe:
+    """Second-round review: answers that used to wipe a small workspace now write nothing."""
+
+    def test_grants_answer_without_result_and_total_is_an_error(self, small_world):
+        # reviewer probe: grants/_search answers 200 {"details": {"viewTimestamp": ...}}
+        small_world["fake"].raw_body_on = ("grants", {"details": {"viewTimestamp": "2026-09-28T00:00:00Z"}})
+        report = run_full_sync()
+        assert report["status"] == "error" and "no 'result'" in report["error"]
+        assert _small_state(small_world) == [(True, True, True)] * 4
+
+    def test_second_page_without_result_and_total_is_an_error(self, small_world, monkeypatch):
+        # reviewer probe: PAGE_SIZE=2, page 1 says totalResult=5, page 2 omits result and totalResult
+        from plane.dumont.access import zitadel as Z
+        from plane.tests.unit.dumont.access.conftest import _response
+
+        monkeypatch.setattr(Z, "PAGE_SIZE", 2)
+        real_page = small_world["fake"]._page
+
+        def page(request, parsed, rows):
+            if "grants" in request.url and int(parsed.get("query", {}).get("offset", "0")) > 0:
+                return _response(request, 200, {"details": {"viewTimestamp": "x"}})
+            return real_page(request, parsed, rows)
+
+        monkeypatch.setattr(small_world["fake"], "_page", page)
+        for mode in ("dry-run", None):
+            report = run_full_sync(mode=mode)
+            assert report["status"] == "error", report
+        assert _small_state(small_world) == [(True, True, True)] * 4
+
+    def test_second_page_empty_before_total_is_an_error(self, small_world, monkeypatch):
+        from plane.dumont.access import zitadel as Z
+
+        monkeypatch.setattr(Z, "PAGE_SIZE", 2)
+        small_world["fake"].truncate_after = 2  # 5 grants announced, only 2 ever served
+        report = run_full_sync()
+        assert report["status"] == "error" and "empty page at offset 2 of totalResult" in report["error"]
+        assert _small_state(small_world) == [(True, True, True)] * 4
+
+    def test_four_member_wipe_is_refused_under_the_absolute_limit(self, small_world):
+        # all four members lose their grants: 4 people <= DUMONT_ACCESS_MAX_REMOVALS=5, but it is
+        # 4 of 6 workspace members and 4 of 5 MO members: the relative brake stops it
+        fake = small_world["fake"]
+        fake.grants = [g for g in fake.grants if not g["userId"].startswith("sub-u")]
+        report = run_full_sync()
+        assert report["status"] == "aborted_brake", report
+        assert {(i["scope"], i["losing"], i["members"]) for i in report["relative_brake"]} == {
+            ("workspace", 4, 6),
+            ("MO", 4, 5),
+        }
+        assert _small_state(small_world) == [(True, True, True)] * 4
+
+    def test_relative_brake_counts_demotions(self, small_world):
+        fake = small_world["fake"]
+        for grant in fake.grants:
+            if grant["userId"] in ("sub-u0", "sub-u1", "sub-u2"):
+                grant["roleKeys"] = ["hangar.workspace.member", "hangar.project.mo.guest"]
+        report = run_full_sync()  # MO: 3 of 5 downgraded
+        assert report["status"] == "aborted_brake"
+        assert [(i["scope"], i["losing"]) for i in report["relative_brake"]] == [("MO", 3)]
+
+    def test_half_is_not_more_than_half(self, small_world):
+        fake = small_world["fake"]
+        for grant in fake.grants:
+            if grant["userId"] in ("sub-u0", "sub-u1"):
+                grant["roleKeys"] = ["hangar.workspace.member"]  # lose MO only: 2 of 5
+        assert run_full_sync()["status"] == "applied"
+
+    def test_explicit_override_lifts_the_relative_brake(self, small_world):
+        fake = small_world["fake"]
+        fake.grants = [g for g in fake.grants if not g["userId"].startswith("sub-u")]
+        report = run_full_sync(max_removals=4)
+        assert report["status"] == "applied", report
+        assert _small_state(small_world) == [(False, False, False)] * 4

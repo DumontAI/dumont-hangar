@@ -328,6 +328,8 @@ class TestBootstrapScript:
             ("truncate_after", 0, "empty page"),
             ("raw_body_on", ("roles", {"details": {"totalResult": "3"}}), "no 'result'"),
             ("raw_body_on", ("roles", {}), "no 'result'"),
+            ("raw_body_on", ("roles", {"details": {"viewTimestamp": "x"}}), "no 'result'"),
+            ("raw_body_on", ("roles", {"details": {"totalResult": "x"}, "result": []}), "unreadable"),
         ],
     )
     def test_incomplete_answers_are_errors(self, plane_world, fake_zitadel, bootstrap, tmp_path, attr, value, message):
@@ -339,15 +341,36 @@ class TestBootstrapScript:
         assert code == 1 and message in text
         assert fake_zitadel.writes == []
 
-    @pytest.mark.parametrize("details", [{}, {"totalResult": "0"}, {"totalResult": 0}])
+    @pytest.mark.parametrize("details", [{"totalResult": "0"}, {"totalResult": 0}])
     def test_omitted_result_with_zero_total_is_empty(self, plane_world, fake_zitadel, bootstrap, tmp_path, details):
-        # proto3 JSON omits an empty `result`: no roles yet means "create them all"
+        # proto3 JSON omits an empty `result`; an explicit zero total says it is empty: create every role
         fake_zitadel.issued.add(PAT)
         fake_zitadel.raw_body_on = ("roles", {"details": details})
         export_path, _ = _export(tmp_path)
         code, text = _run_script(bootstrap, fake_zitadel, export_path, "--json")
         assert code == 0, text
         assert "hangar.workspace.member" in {r["key"] for r in json.loads(text)["roles_to_create"]}
+
+    def test_total_is_remembered_across_pages(self, plane_world, fake_zitadel, bootstrap, tmp_path, monkeypatch):
+        # page 1 of the grants search announces 5 rows; page 2 is empty without a total
+        fake_zitadel.issued.add(PAT)
+        monkeypatch.setattr(bootstrap, "PAGE_SIZE", 2)
+        for i in range(5):
+            fake_zitadel.grant(f"g{i}", "hangar_reader")
+        real_page = fake_zitadel._page
+
+        def page(request, parsed, rows):
+            if "grants" in request.url and int(parsed["query"]["offset"]) > 0:
+                from plane.tests.unit.dumont.access.conftest import _response
+
+                return _response(request, 200, {"result": []})
+            return real_page(request, parsed, rows)
+
+        monkeypatch.setattr(fake_zitadel, "_page", page)
+        export_path, _ = _export(tmp_path)
+        code, text = _run_script(bootstrap, fake_zitadel, export_path)
+        assert code == 1 and "empty page at offset 2 of totalResult 5" in text
+        assert fake_zitadel.writes == []
 
     @pytest.mark.parametrize("org", ["2000:1", "2000 1"])
     def test_org_id_must_be_bare(self, plane_world, fake_zitadel, bootstrap, tmp_path, org):
@@ -377,3 +400,58 @@ class TestBootstrapScript:
         fake_zitadel.fail = 403
         code, text = _run_script(bootstrap, fake_zitadel, export_path)
         assert code == 1 and "HTTP 403" in text and PAT not in text
+
+
+@pytest.mark.unit
+@pytest.mark.django_db
+class TestLoginOrgAudit:
+    """manage.py dumont_login_org_audit: read-only inventory before DUMONT_WEB_LOGIN_ORG_CHECK=1."""
+
+    def test_no_outsider(self, plane_world, fake_zitadel):
+        out = io.StringIO()
+        call_command("dumont_login_org_audit", stdout=out)
+        assert "Dumont logins checked: 2; outside the organisation: 0" in out.getvalue()
+        # only the token and the org-scoped user search: nothing is written
+        assert {c[1] for c in fake_zitadel.calls} == {"/oauth/v2/token", "/management/v1/users/_search"}
+        assert fake_zitadel.writes == []
+
+    def test_outsider_is_listed_with_sessions_and_tokens(self, plane_world, fake_zitadel):
+        from plane.db.models import APIToken, Session
+
+        linked = plane_world["linked"]
+        fake_zitadel.org_users["sub-linked"] = "999999999999999999"
+        Session.objects.create(
+            session_key="k" * 40, session_data="x", expire_date="2099-01-01T00:00:00Z", user_id=str(linked.id)
+        )
+        APIToken.objects.create(user=linked, label="t")
+        out = io.StringIO()
+        with pytest.raises(CommandError) as exc:
+            call_command("dumont_login_org_audit", "--json", stdout=out)
+        assert exc.value.returncode == 3
+        result = json.loads(out.getvalue())
+        assert result["linked_accounts"] == 2
+        assert result["outsiders"] == [
+            {
+                "plane_user_id": str(linked.id),
+                "email": "linked@example.test",
+                "zitadel_user_id": "sub-linked",
+                "user_active": True,
+                "has_login_in_org": False,
+                "sessions": 1,
+                "active_api_tokens": 1,
+            }
+        ]
+        assert "fake-access-token" not in out.getvalue() and "PRIVATE" not in out.getvalue()
+
+    def test_filtered_user_search_is_an_error(self, plane_world, fake_zitadel):
+        fake_zitadel.filter_users = True  # would otherwise list everybody as an outsider
+        with pytest.raises(CommandError) as exc:
+            call_command("dumont_login_org_audit", stdout=io.StringIO())
+        assert exc.value.returncode == 1 and "permission too narrow" in str(exc.value)
+
+    def test_missing_configuration(self, plane_world, fake_zitadel, monkeypatch):
+        monkeypatch.delenv("DUMONT_ACCESS_ZITADEL_KEY_JSON")
+        with pytest.raises(CommandError) as exc:
+            call_command("dumont_login_org_audit", stdout=io.StringIO())
+        assert exc.value.returncode == 1 and "DUMONT_ACCESS_ZITADEL_KEY_JSON" in str(exc.value)
+        assert fake_zitadel.calls == []

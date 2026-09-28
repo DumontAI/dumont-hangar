@@ -93,43 +93,54 @@ class Zitadel:
             raise BootstrapError(f"{method} {path}: response is not JSON") from None
 
     def search(self, path, queries=None):
-        rows, offset = [], 0
+        rows, offset, expected = [], 0, None
         for _ in range(MAX_PAGES):
             body = {"query": {"offset": str(offset), "limit": PAGE_SIZE, "asc": True}}
             if queries:
                 body["queries"] = queries
             data = self.request("POST", path, body)
-            # Same rules as plane/dumont/access/zitadel.py: a missing `result` is an empty list only when
-            # `details` is an object with totalResult absent or 0 (proto3 JSON omits empty/zero fields);
-            # an empty page before totalResult is reached is a truncated answer.
+            # Same rules as plane/dumont/access/zitadel.py:
+            # - a missing `result` is an empty list only when details.totalResult is present and 0;
+            # - the largest totalResult any page announced must be reached; an empty page before it is a
+            #   truncated answer; only when no page ever carried a total does a short page end the list.
             if not isinstance(data, dict):
                 raise BootstrapError(f"POST {path}: response is not a JSON object")
+            total = _total_result(data, path)
             if "result" not in data:
-                details = data.get("details")
-                if not isinstance(details, dict) or details.get("totalResult", 0) not in (0, "0"):
+                if total != 0:
                     raise BootstrapError(f"POST {path}: response has no 'result' (API shape changed?)")
                 page = []
             else:
                 page = data["result"]
             if not isinstance(page, list):
                 raise BootstrapError(f"POST {path}: 'result' is not a list")
+            if total is not None:
+                expected = total if expected is None else max(expected, total)
             rows.extend(page)
             offset += len(page)
-            total = (data.get("details") or {}).get("totalResult")
-            try:
-                total = int(total) if total not in (None, "") else None
-            except (TypeError, ValueError):
-                total = None
-            if not page:
-                if total is not None and offset < total:
-                    raise BootstrapError(f"POST {path}: empty page at offset {offset} of totalResult {total}")
-                return rows
-            if total is not None:
-                if offset >= total:
+            if expected is not None:
+                if offset >= expected:
                     return rows
+                if not page:
+                    raise BootstrapError(f"POST {path}: empty page at offset {offset} of totalResult {expected}")
             elif len(page) < PAGE_SIZE:
                 return rows
         raise BootstrapError(f"POST {path}: too many pages")
+
+
+def _total_result(data, path):
+    """details.totalResult as an int, None when absent; a present but unreadable value is an error."""
+    details = data.get("details")
+    if not isinstance(details, dict) or "totalResult" not in details:
+        return None
+    value = details["totalResult"]
+    try:
+        total = int(value) if not isinstance(value, bool) else -1
+    except (TypeError, ValueError):
+        total = -1
+    if total < 0:
+        raise BootstrapError(f"POST {path}: unreadable details.totalResult")
+    return total
 
 
 def load_export(path):

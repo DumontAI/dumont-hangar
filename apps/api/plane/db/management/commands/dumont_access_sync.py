@@ -4,7 +4,8 @@
 #   python manage.py dumont_access_sync --mode dry-run          # preview, writes nothing
 #   python manage.py dumont_access_sync --mode dry-run --json   # machine-readable report
 #   python manage.py dumont_access_sync                         # uses DUMONT_ACCESS_SYNC
-#   python manage.py dumont_access_sync --max-removals 12       # brake limit for this run only
+#   python manage.py dumont_access_sync --max-removals 12       # brake limit for this run only; also
+#                                                               # lifts the relative/zero-grants guards
 #
 # Exit status: 0 ok (including dry-run and mode off), 1 error (nothing written), 2 safety brake.
 
@@ -31,7 +32,9 @@ class Command(BaseCommand):
             default=None,
             metavar="N",
             help="Safety brake for THIS run only: how many distinct users may lose or reduce access "
-            "(overrides DUMONT_ACCESS_MAX_REMOVALS; review with --mode dry-run first)",
+            "(overrides DUMONT_ACCESS_MAX_REMOVALS). Giving it also lifts, for this run, the relative "
+            "brake (more than half of a managed scope) and the 'managed scopes but zero grants' refusal. "
+            "Review with --mode dry-run first",
         )
 
     def handle(self, *args, **options):
@@ -87,6 +90,10 @@ class Command(BaseCommand):
                 out(f"  {change['action']:<11} {change['scope']:<12} {change['user_id']}  {change['from_role']}")
         if report.get("identifier_collisions"):
             out(f"identifier collisions (left unmanaged): {report['identifier_collisions']}")
+        for item in report.get("relative_brake") or []:
+            out(f"relative brake: {item['scope']} would lose {item['losing']} of {item['members']} members")
+        for reason in report.get("would_refuse") or []:
+            out(f"enforce would refuse: {reason} (explicit --max-removals overrides)")
         if report["status"] == "aborted_brake":
             out(
                 f"SAFETY BRAKE: {report['counts']['users_losing_access']} users would lose or reduce access "

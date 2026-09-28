@@ -31,9 +31,9 @@
 #
 # The client never writes to ZITADEL, never logs tokens or the private key, and raises
 # ZitadelError for every failure so callers can fail safe (change nothing). Answers that look like
-# success but are incomplete are failures too: a search answer without `result` (unless `details` says
-# there are no rows: totalResult absent or 0, how proto3 JSON renders an empty list), an empty page while
-# `totalResult` says more rows exist, and grants whose users the org-scoped users/_search does not
+# success but are incomplete are failures too: a search answer without `result` (unless
+# `details.totalResult` is present and 0), an empty page while any page's `totalResult` says more rows
+# exist, and grants whose users the org-scoped users/_search does not
 # return at all (a silently filtered HTTP 200).
 
 import logging
@@ -182,37 +182,39 @@ class ZitadelClient:
         """Run a paginated _search and return all `result` rows."""
         rows = []
         offset = 0
+        expected = None  # the largest totalResult any page announced
         for _ in range(MAX_PAGES):
             body = {"query": {"offset": str(offset), "limit": PAGE_SIZE, "asc": True}}
             if queries:
                 body["queries"] = queries
             data = self._request("POST", path, json_body=body)
+            total = _total_result(data, path)
             if "result" not in data:
                 # ZITADEL's gateway may omit empty repeated fields and zero numbers (proto3 JSON without
-                # EmitUnpopulated), so an empty list can arrive as {"details": {...}} with no `result` and
-                # no (or zero) totalResult. Anything else without `result` is a changed or partial answer,
-                # and reading it as empty would look exactly like a mass revocation.
-                if not _omitted_result_means_empty(data):
+                # EmitUnpopulated). An omitted `result` is an empty list ONLY when the answer says so
+                # explicitly: `details.totalResult` present and 0. Anything else without `result` is a
+                # changed or partial answer, and reading it as empty would look like a mass revocation.
+                if total != 0:
                     raise ZitadelError(f"POST {path}: response has no 'result' (API shape changed?)")
                 page = []
             else:
                 page = data["result"]
             if not isinstance(page, list):
                 raise ZitadelError(f"POST {path}: 'result' is not a list")
-            rows.extend(page)
-            total = _total_result(data)
-            offset += len(page)
-            if not page:
-                if total is not None and offset < total:
-                    # The server says there is more but hands out nothing: a truncated answer.
-                    raise ZitadelError(f"POST {path}: empty page at offset {offset} of totalResult {total}")
-                return rows
-            # Trust totalResult when the server sends it (a server-side limit below PAGE_SIZE must not
-            # truncate the list, which would look like mass revocation); otherwise a short page ends it.
             if total is not None:
-                if offset >= total:
+                expected = total if expected is None else max(expected, total)
+            rows.extend(page)
+            offset += len(page)
+            if expected is not None:
+                # Once any page announced a total, it is the only way to end: a page that brings
+                # nothing new while rows are still owed is a truncated answer. A short but non-empty
+                # page (a server-side limit below PAGE_SIZE) keeps paging.
+                if offset >= expected:
                     return rows
+                if not page:
+                    raise ZitadelError(f"POST {path}: empty page at offset {offset} of totalResult {expected}")
             elif len(page) < PAGE_SIZE:
+                # No page ever carried a total: a short page ends the list.
                 return rows
         raise ZitadelError(f"POST {path}: more than {MAX_PAGES} pages, refusing to continue")
 
@@ -318,23 +320,21 @@ def _grant_outside_org(row, org_id):
     return None
 
 
-def _omitted_result_means_empty(data):
-    """A response without `result` is an empty list only when `details` is an object whose
-    totalResult is absent or zero ("0" or 0)."""
+def _total_result(data, path=""):
+    """details.totalResult as an int, None when absent. A present but unreadable value is an error."""
     details = data.get("details")
-    if not isinstance(details, dict):
-        return False
-    return details.get("totalResult", 0) in (0, "0")
-
-
-def _total_result(data):
-    details = data.get("details")
-    if not isinstance(details, dict) or details.get("totalResult") in (None, ""):
+    if not isinstance(details, dict) or "totalResult" not in details:
         return None
+    value = details["totalResult"]
+    if isinstance(value, bool):
+        raise ZitadelError(f"POST {path}: unreadable details.totalResult")
     try:
-        return int(details["totalResult"])
+        total = int(value)
     except (TypeError, ValueError):
-        return None
+        raise ZitadelError(f"POST {path}: unreadable details.totalResult") from None
+    if total < 0:
+        raise ZitadelError(f"POST {path}: unreadable details.totalResult")
+    return total
 
 
 def _error_message(response):

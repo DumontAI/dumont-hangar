@@ -159,6 +159,35 @@ def reduces_access(change):
     return change.action == UPDATE_ROLE and (change.to_role or 0) < (change.from_role or 0)
 
 
+def scopes_losing_most_members(plan, snapshot):
+    """Managed scopes where the plan removes or downgrades MORE THAN HALF of the active, non-bot members.
+
+    The relative safety brake: a small workspace can be wiped without ever crossing the absolute
+    limit (DUMONT_ACCESS_MAX_REMOVALS), and that pattern is a ZITADEL-side mistake far more often
+    than a decision. Returns [{"scope", "scope_id", "members", "losing"}], empty when none.
+    """
+    scopes = []
+    if plan.managed_workspace:
+        scopes.append((WORKSPACE, snapshot.workspace_id, "workspace", snapshot.workspace_members))
+    for project_id, identifier in sorted(plan.managed_projects.items()):
+        scopes.append((PROJECT, project_id, identifier, snapshot.project_members.get(project_id, {})))
+    flagged = []
+    for scope, scope_id, label, members in scopes:
+        active = {
+            user_id
+            for user_id, membership in members.items()
+            if membership.is_active and not getattr(snapshot.users.get(user_id), "is_bot", False)
+        }
+        losing = {
+            change.user_id
+            for change in plan.changes
+            if change.scope == scope and change.scope_id == scope_id and reduces_access(change)
+        } & active
+        if active and len(losing) * 2 > len(active):
+            flagged.append({"scope": label, "scope_id": scope_id, "members": len(active), "losing": len(losing)})
+    return flagged
+
+
 def managed_scopes(role_keys, project_identifiers):
     """Which scopes are managed, from the role keys alone.
 
