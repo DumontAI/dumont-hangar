@@ -26,14 +26,16 @@ export interface UserinfoDependencies {
   readonly log?: (line: string) => void;
 }
 
+/**
+ * Only an email the issuer marks as verified (`email_verified === true`) is
+ * used. `preferred_username` is never used: a user can often choose it, so an
+ * email-shaped username could impersonate someone else in the footer or "me".
+ */
 function emailFrom(claims: Record<string, unknown>): string | null {
-  const verified = claims.email_verified;
   const email = claims.email;
-  if (typeof email === "string" && EMAIL.test(email) && verified !== false && verified !== "false") {
+  if (claims.email_verified === true && typeof email === "string" && EMAIL.test(email)) {
     return email.toLowerCase();
   }
-  const username = claims.preferred_username;
-  if (typeof username === "string" && EMAIL.test(username)) return username.toLowerCase();
   return null;
 }
 

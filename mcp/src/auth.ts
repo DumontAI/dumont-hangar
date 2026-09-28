@@ -80,6 +80,21 @@ function containsString(value: unknown, wanted: string): boolean {
   return false;
 }
 
+/**
+ * Role sources, all on a token already bound to our issuer and audience:
+ * - `urn:zitadel:iam:org:project:<audience>:roles`: ZITADEL's project-scoped
+ *   claim; only roles of the audience project can appear under it.
+ * - `urn:zitadel:iam:org:project:roles`: ZITADEL puts the roles of the
+ *   project of the requesting application here. Our clients (the pinned
+ *   public client and DCR apps) live in the audience project, so these are
+ *   audience-project roles. A client of ANOTHER project that also requests
+ *   our audience would carry its own project's roles here; same-named roles
+ *   there would be accepted, so role names must stay unique per instance and
+ *   no other project may define `hangar_reader`/`hangar_writer`.
+ * - `roles`: legacy flat claim, same caveat.
+ * - `my:zitadel:grants`: custom Action claim, only the exact
+ *   `<audience>:<role>` entry.
+ */
 function hasRole(payload: JWTPayload, config: HangarConfig, role: string): boolean {
   const roleClaims = new Set([
     "roles",
@@ -94,11 +109,12 @@ function hasRole(payload: JWTPayload, config: HangarConfig, role: string): boole
     }
   }
 
+  // Custom claim from a ZITADEL Action (`<projectId>:<role>` strings). A bare
+  // role, or a role of another project, is never enough: only the exact
+  // `<configured audience project>:<role>` entry counts.
   const grants = payload["my:zitadel:grants"];
-  return (
-    Array.isArray(grants) &&
-    grants.some((grant) => typeof grant === "string" && (grant === role || grant.endsWith(`:${role}`)))
-  );
+  const scoped = `${config.oidcAudience}:${role}`;
+  return Boolean(config.oidcAudience) && Array.isArray(grants) && grants.some((grant) => grant === scoped);
 }
 
 /** The configured Hangar roles (reader, writer) this token carries, in that order. */
@@ -120,8 +136,9 @@ function usesZitadelRoleScope(config: HangarConfig): boolean {
 
 function principalEmail(payload: JWTPayload): string | null {
   const email = payload.email;
-  // An explicitly unverified email is not trusted for attribution or "me".
-  if (payload.email_verified === false || payload.email_verified === "false") return null;
+  // Only an email the issuer marks verified (strictly `true`) is trusted for
+  // attribution or "me"; anything else falls through to the userinfo lookup.
+  if (payload.email_verified !== true) return null;
   return typeof email === "string" && EMAIL_CLAIM.test(email) ? email.toLowerCase() : null;
 }
 

@@ -3,7 +3,8 @@
 // tool. Prints only outcome codes and counts, never the token.
 const endpoint = process.env.MCP_URL?.trim() || `http://127.0.0.1:${process.env.MCP_HTTP_PORT || "3014"}/mcp`;
 const token = process.env.MCP_AUTH_TOKEN?.trim() || "";
-const EXPECTED_TOOLS = 12;
+// 9 read tools, plus 3 write tools when HANGAR_WRITE_PROJECTS is set.
+const EXPECTED_TOOL_COUNTS = new Set([9, 12]);
 const REQUEST_TIMEOUT_MS = 10000;
 
 function fail(code) {
@@ -80,7 +81,7 @@ const listed = await rpc({ jsonrpc: "2.0", id: 2, method: "tools/list", params: 
 const tools = listed?.body?.result?.tools;
 if (
   !Array.isArray(tools) ||
-  tools.length !== EXPECTED_TOOLS ||
+  !EXPECTED_TOOL_COUNTS.has(tools.length) ||
   tools.some((tool) => typeof tool?.name !== "string" || !tool.name.startsWith("hangar_"))
 ) {
   fail("MCP_TOOLS_LIST_FAILED");

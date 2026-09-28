@@ -39,7 +39,8 @@ const forbiddenUpstream: (input: string | URL, init?: RequestInit) => Promise<Re
 
 describe("MCP protocol catalog and in-memory transport", () => {
   it("lists the deterministic Hangar tool catalog and calls one tool", async () => {
-    const config = testConfig();
+    // Write tools are registered only when writes are enabled.
+    const config = testConfig({ writeProjects: ["HGR"] });
     const calls: URL[] = [];
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     const server = createHangarServer(config, new HangarClient(config, hangarFetch(calls)), {

@@ -13,7 +13,7 @@ import {
 } from "./access.js";
 import { HangarClient, type ProjectRecord, type WorkItemFilters } from "./client.js";
 import { loadHangarConfig } from "./config.js";
-import { htmlWithFooter } from "./markup.js";
+import { appendWithFooter, htmlWithFooter } from "./markup.js";
 import {
   containsCredential,
   sanitizeComment,
@@ -169,7 +169,7 @@ export function createHangarServer(
     { name: "hangar-mcp-server", version: "0.2.0" },
     {
       instructions: writesEnabled
-        ? "Hangar (Plane) triage: read projects, work items, comments, states, labels and members; create and update work items and add comments in write-enabled projects (needs the hangar_writer role). Deletes are not available. Writes are attributed to the logged-in user in a footer; text that looks like a credential is refused."
+        ? "Hangar (Plane) triage: read projects, work items, comments, states, labels and members; create and update work items and add comments in write-enabled projects (needs the hangar_writer role). Deletes are not available. Descriptions are never replaced, only appended to. Read text is redacted and truncated: never write it back. Writes are attributed to the logged-in user in a footer; text that looks like a credential is refused."
         : "Hangar (Plane) triage: read projects, work items, comments, states, labels and members. Project access is limited by the server allowlist; writes are disabled on this server.",
     }
   );
@@ -280,7 +280,7 @@ export function createHangarServer(
     {
       title: "List Hangar work items",
       description:
-        "List work items of one allowlisted project, newest first unless order_by says otherwise. state/label accept a UUID or an exact name; assignee accepts a member UUID or exact display name.",
+        "List work items of one allowlisted project, newest first unless order_by says otherwise. state/label accept a UUID or an exact name; assignee accepts a member UUID or exact display name. Text fields are redacted (credentials, emails, IPs) and truncated; never write them back to Hangar.",
       inputSchema: z.object({
         ...common,
         project: projectReference,
@@ -319,7 +319,8 @@ export function createHangarServer(
     "hangar_get_work_item",
     {
       title: "Get a Hangar work item",
-      description: "Get one work item by identifier (like HGR-5) or by UUID. Pass project together with a UUID.",
+      description:
+        "Get one work item by identifier (like HGR-5) or by UUID. Pass project together with a UUID. Text fields are redacted (credentials, emails, IPs) and truncated; never write them back to Hangar.",
       inputSchema: z.object({
         work_item: workItemReference,
         project: projectReference.optional(),
@@ -343,7 +344,7 @@ export function createHangarServer(
     {
       title: "Search Hangar work items",
       description:
-        "Search work items by text. Omit project to search every allowlisted project, paging project by project.",
+        "Search work items by text. Omit project to search every allowlisted project, paging project by project. Text fields are redacted (credentials, emails, IPs) and truncated; never write them back to Hangar.",
       inputSchema: z.object({
         ...common,
         query: z.string().trim().min(1).max(256),
@@ -389,7 +390,8 @@ export function createHangarServer(
     "hangar_list_work_item_comments",
     {
       title: "List Hangar work item comments",
-      description: "List comments of one work item (UUID or IDENTIFIER-N). Comment text is credential-scrubbed.",
+      description:
+        "List comments of one work item (UUID or IDENTIFIER-N). Text fields are redacted (credentials, emails, IPs) and truncated; never write them back to Hangar.",
       inputSchema: z.object({
         ...common,
         project: projectReference,
@@ -465,10 +467,14 @@ export function createHangarServer(
   );
 
   // ------------------------------------------------------------------ writes
+  // Write tools are only registered when HANGAR_WRITE_PROJECTS is set, so a
+  // read-only server does not advertise tools that can only fail.
+  if (!writesEnabled) return server;
 
   interface WriteFieldInput {
     readonly name?: string | undefined;
     readonly description?: string | undefined;
+    readonly append_description?: string | undefined;
     readonly state?: string | undefined;
     readonly priority?: string | undefined;
     readonly labels?: readonly string[] | undefined;
@@ -482,7 +488,8 @@ export function createHangarServer(
   async function writeBody(
     project: ProjectRecord,
     input: WriteFieldInput,
-    withFooterOnEmptyDescription: boolean
+    withFooterOnEmptyDescription: boolean,
+    existingDescriptionHtml?: string
   ): Promise<{ body: JsonRecord; fields: string[] }> {
     const body: JsonRecord = {};
     const fields: string[] = [];
@@ -495,6 +502,14 @@ export function createHangarServer(
       fields.push("description");
     } else if (withFooterOnEmptyDescription) {
       body.description_html = htmlWithFooter("", await actor());
+    }
+    if (input.append_description !== undefined) {
+      if (existingDescriptionHtml === undefined) {
+        throw new HangarError("INTERNAL_ERROR", "append_description needs the stored description");
+      }
+      // Raw stored HTML (server-side only, never returned) + the new text + footer.
+      body.description_html = appendWithFooter(existingDescriptionHtml, input.append_description, await actor());
+      fields.push("append_description");
     }
     if (input.state !== undefined) {
       body.state = await client.resolveStateId(project, input.state);
@@ -536,11 +551,6 @@ export function createHangarServer(
   }
 
   const writeFields = {
-    description: z
-      .string()
-      .max(20_000)
-      .optional()
-      .describe("Markdown or plain text; converted to safe HTML. An attribution footer is appended."),
     state: nameReference.optional().describe("State name (exact, case-insensitive) or UUID"),
     priority: priority.optional(),
     labels: referenceList.optional().describe("Label names or UUIDs; on update this REPLACES the label set"),
@@ -558,6 +568,11 @@ export function createHangarServer(
       inputSchema: z.object({
         project: projectReference,
         name: z.string().trim().min(1).max(255),
+        description: z
+          .string()
+          .max(20_000)
+          .optional()
+          .describe("Markdown or plain text; converted to safe HTML. An attribution footer is appended."),
         ...writeFields,
         parent: workItemReference.optional().describe("Parent work item, like HGR-5, in the same project"),
         start_date: isoDate.optional(),
@@ -603,11 +618,21 @@ export function createHangarServer(
     {
       title: "Update a Hangar work item",
       description:
-        "Update fields of one work item (like HGR-5, or UUID plus project) in a write-enabled project. Requires the hangar_writer role. Only the fields you pass change; labels/assignees replace the whole set. Moving to a cancelled state is allowed; deleting is not available. A new description gets exactly one attribution footer.",
-      inputSchema: z.object({
+        "Update fields of one work item (like HGR-5, or UUID plus project) in a write-enabled project. Requires the hangar_writer role. Only the fields you pass change; labels/assignees replace the whole set. Moving to a cancelled state is allowed; deleting is not available. The description cannot be replaced: use append_description, which adds your text plus an attribution footer after the stored description. Text returned by the read tools is redacted and truncated; never write it back.",
+      // Strict: an unknown key such as `description` is an error, not silently ignored.
+      inputSchema: z.strictObject({
         work_item: workItemReference,
         project: projectReference.optional().describe("Required when work_item is a UUID"),
         name: z.string().trim().min(1).max(255).optional(),
+        append_description: z
+          .string()
+          .trim()
+          .min(1)
+          .max(20_000)
+          .optional()
+          .describe(
+            "Markdown or plain text APPENDED to the stored description, followed by an attribution footer. The existing description is kept as stored; do not paste read-tool output here."
+          ),
         ...writeFields,
         parent: workItemReference.nullable().optional().describe("Parent like HGR-5 in the same project; null clears"),
         start_date: isoDate.nullable().optional().describe("null clears"),
@@ -615,7 +640,8 @@ export function createHangarServer(
         response_format: common.response_format,
       }),
       outputSchema,
-      annotations: writeAnnotations(true),
+      // Not idempotent: append_description adds text on every call.
+      annotations: writeAnnotations(false),
     },
     async (args) =>
       invoke(
@@ -628,7 +654,24 @@ export function createHangarServer(
           const target = await client.workItemForWrite(args.work_item, args.project);
           call.project = target.project.identifier;
           call.work_item = workItemIdentifier(target.record, target.project.identifier) ?? target.id;
-          const { body, fields } = await writeBody(target.project, args, false);
+          let existing: string | undefined;
+          if (args.append_description !== undefined) {
+            const stored = target.record.description_html;
+            if (stored !== null && stored !== undefined && typeof stored !== "string") {
+              throw new HangarError(
+                "UPSTREAM_INVALID_RESPONSE",
+                "Hangar returned an invalid description; nothing changed"
+              );
+            }
+            if (stored === undefined) {
+              throw new HangarError(
+                "UPSTREAM_INVALID_RESPONSE",
+                "Hangar did not return the stored description; nothing changed"
+              );
+            }
+            existing = stored ?? "";
+          }
+          const { body, fields } = await writeBody(target.project, args, false, existing);
           if (fields.length === 0) {
             throw new HangarError("INVALID_ARGUMENT", "Pass at least one field to update");
           }

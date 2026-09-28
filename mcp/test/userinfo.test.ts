@@ -28,9 +28,12 @@ function resolverWith(respond: (call: number) => Response | Promise<Response>, o
 describe("userinfo email resolution", () => {
   it("sends the caller bearer to the userinfo URL without following redirects and caches by sub", async () => {
     let now = 1_000_000;
-    const { resolver, seen } = resolverWith(() => jsonResponse({ sub: "u1", email: "Camila@Example.test" }), {
-      now: () => now,
-    });
+    const { resolver, seen } = resolverWith(
+      () => jsonResponse({ sub: "u1", email: "Camila@Example.test", email_verified: true }),
+      {
+        now: () => now,
+      }
+    );
     expect(await resolver.emailFor("u1", TOKEN)).toBe("camila@example.test");
     expect(seen).toHaveLength(1);
     expect(seen[0]!.url).toBe(USERINFO.href);
@@ -45,10 +48,20 @@ describe("userinfo email resolution", () => {
     expect(seen).toHaveLength(2);
   });
 
-  it("skips an unverified email and falls back to an email-shaped preferred_username", async () => {
-    const { resolver } = resolverWith(() =>
-      jsonResponse({ sub: "u1", email: "x@example.test", email_verified: false, preferred_username: "c@dumont.au" })
-    );
+  it("uses only an email with email_verified === true and never preferred_username", async () => {
+    const cases: Array<Record<string, unknown>> = [
+      // Spoof: unverified email plus an email-shaped username of someone else.
+      { sub: "u1", email: "x@example.test", email_verified: false, preferred_username: "boss@dumont.au" },
+      { sub: "u1", preferred_username: "boss@dumont.au" },
+      { sub: "u1", email: "boss@dumont.au" },
+      { sub: "u1", email: "boss@dumont.au", email_verified: "true" },
+    ];
+    for (const claims of cases) {
+      const { resolver } = resolverWith(() => jsonResponse(claims));
+      // oxlint-disable-next-line no-await-in-loop
+      expect(await resolver.emailFor("u1", TOKEN)).toBeNull();
+    }
+    const { resolver } = resolverWith(() => jsonResponse({ sub: "u1", email: "c@dumont.au", email_verified: true }));
     expect(await resolver.emailFor("u1", TOKEN)).toBe("c@dumont.au");
   });
 
@@ -115,7 +128,7 @@ describe("userinfo email resolution", () => {
 
   it("shares one in-flight lookup per subject and bounds the cache to 1000 entries", async () => {
     const { resolver, seen } = resolverWith((call) =>
-      jsonResponse({ sub: `s${call}`, email: `u${call}@example.test` })
+      jsonResponse({ sub: `s${call}`, email: `u${call}@example.test`, email_verified: true })
     );
     // Subjects are named after the call number so each lookup matches its own sub.
     await Promise.all([resolver.emailFor("s1", TOKEN), resolver.emailFor("s1", TOKEN)]);

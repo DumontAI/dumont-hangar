@@ -520,6 +520,7 @@ export class HangarClient {
     const response = await this.write("POST", `/projects/${project.id}/issues/${encodeURIComponent(id)}/comments/`, {
       comment_html: commentHtml,
     });
+    this.assertRecordProject(response.json, project);
     return response.json;
   }
 

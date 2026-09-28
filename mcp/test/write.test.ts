@@ -5,7 +5,12 @@ import { HangarClient } from "../src/client.js";
 import { HangarConfigError, loadHangarConfig } from "../src/config.js";
 import { htmlWithFooter, textToHtml } from "../src/markup.js";
 import { containsCredential } from "../src/redaction.js";
-import { createHangarServer, IDEMPOTENCY_EXTERNAL_SOURCE } from "../src/tools.js";
+import {
+  createHangarServer,
+  HANGAR_READ_TOOL_NAMES,
+  HANGAR_TOOL_NAMES,
+  IDEMPOTENCY_EXTERNAL_SOURCE,
+} from "../src/tools.js";
 import type { HangarConfig, Principal } from "../src/types.js";
 import {
   HGR_WORK_ITEM,
@@ -31,7 +36,10 @@ interface WriteCall {
   readonly body: Record<string, unknown>;
 }
 
-function writeFetch(writes: WriteCall[], options: { conflict?: boolean } = {}) {
+function writeFetch(
+  writes: WriteCall[],
+  options: { conflict?: boolean; workItem?: Record<string, unknown>; commentProject?: string } = {}
+) {
   const reads = hangarFetch([]);
   return async (input: string | URL, init?: RequestInit): Promise<Response> => {
     const url = new URL(String(input));
@@ -46,6 +54,9 @@ function writeFetch(writes: WriteCall[], options: { conflict?: boolean } = {}) {
       if (url.pathname.endsWith(`/issues/${EXISTING_ID}/`)) {
         return jsonResponse({ ...HGR_WORK_ITEM, id: EXISTING_ID, sequence_id: 7, name: "Existing" });
       }
+      if (options.workItem && /\/(?:work-items\/HGR-5|issues\/[0-9a-f-]{36})\/$/.test(url.pathname)) {
+        return jsonResponse(options.workItem);
+      }
       if (/\/projects\/[0-9a-f-]+\/$/.test(url.pathname) && url.pathname.includes(PROJECT_SEC)) {
         return jsonResponse({ id: PROJECT_SEC, identifier: "SEC", name: "Dumont Secrets" });
       }
@@ -55,7 +66,13 @@ function writeFetch(writes: WriteCall[], options: { conflict?: boolean } = {}) {
     writes.push({ method, path: url.pathname, body });
     if (method === "POST" && url.pathname.endsWith("/comments/")) {
       return jsonResponse(
-        { id: COMMENT_ID, comment_html: body.comment_html, created_by: "bot", created_at: "2026-09-28T00:00:00Z" },
+        {
+          id: COMMENT_ID,
+          comment_html: body.comment_html,
+          created_by: "bot",
+          created_at: "2026-09-28T00:00:00Z",
+          ...(options.commentProject ? { project: options.commentProject } : {}),
+        },
         201
       );
     }
@@ -89,6 +106,8 @@ afterEach(async () => {
 
 interface Harness {
   call(name: string, args: Record<string, unknown>): Promise<Record<string, unknown>>;
+  callRaw(name: string, args: Record<string, unknown>): Promise<Record<string, unknown>>;
+  toolNames(): Promise<string[]>;
   readonly writes: WriteCall[];
   readonly audit: AuditRecord[];
 }
@@ -98,6 +117,8 @@ async function harness(
   configOverrides: Partial<HangarConfig> = { writeProjects: ["HGR"] },
   options: {
     conflict?: boolean;
+    workItem?: Record<string, unknown>;
+    commentProject?: string;
     rateLimiter?: WriteRateLimiter;
     resolveEmail?: () => Promise<string | null>;
   } = {}
@@ -142,6 +163,18 @@ async function harness(
   return {
     writes,
     audit,
+    async callRaw(name, args) {
+      return rpc({
+        jsonrpc: "2.0",
+        id: nextId++,
+        method: "tools/call",
+        params: { name, arguments: { response_format: "json", ...args } },
+      });
+    },
+    async toolNames() {
+      const listed = await rpc({ jsonrpc: "2.0", id: nextId++, method: "tools/list", params: {} });
+      return (listed.result as { tools: Array<{ name: string }> }).tools.map((tool) => tool.name);
+    },
     async call(name, args) {
       const response = await rpc({
         jsonrpc: "2.0",
@@ -190,8 +223,10 @@ describe("Hangar write tools: authorization and gates", () => {
     expect(errorCode(await h.call("hangar_list_projects", { limit: 5 }))).toBe("FORBIDDEN");
   });
 
-  it("returns WRITES_DISABLED when HANGAR_WRITE_PROJECTS is empty", async () => {
+  it("does not register write tools when HANGAR_WRITE_PROJECTS is empty", async () => {
     const h = await harness(WRITER, { writeProjects: [] });
+    const names = await h.toolNames();
+    expect(names).toEqual([...HANGAR_READ_TOOL_NAMES]);
     for (const [tool, args] of [
       ["hangar_create_work_item", { project: "HGR", name: "x" }],
       ["hangar_update_work_item", { work_item: "HGR-5", name: "x" }],
@@ -199,9 +234,14 @@ describe("Hangar write tools: authorization and gates", () => {
     ] as const) {
       // The harness routes one response at a time, so calls stay sequential.
       // oxlint-disable-next-line no-await-in-loop
-      expect(errorCode(await h.call(tool, args))).toBe("WRITES_DISABLED");
+      const response = await h.callRaw(tool, args);
+      const result = response.result as { isError?: boolean } | undefined;
+      expect(response.error !== undefined || result?.isError === true).toBe(true);
     }
     expect(h.writes).toHaveLength(0);
+    await expect((await harness(WRITER, { writeProjects: ["HGR"] })).toolNames()).resolves.toEqual([
+      ...HANGAR_TOOL_NAMES,
+    ]);
   });
 
   it("refuses a writer in a readable but non-writable project with PROJECT_NOT_WRITABLE", async () => {
@@ -346,12 +386,18 @@ describe("Hangar write tools: behavior", () => {
     expect(String(h.writes[0]!.body.external_id)).toMatch(/^[0-9a-f]{16}:run-42$/);
   });
 
-  it("updates only the given fields and never stacks the footer", async () => {
-    const h = await harness(WRITER);
-    const copied = "Updated text\n\n— via MCP por someone@example.test\n";
+  it("appends to the raw stored description, keeping content reads would redact or truncate", async () => {
+    const stored =
+      '<p>Contato ana@example.test em 10.0.0.1</p><img src="https://cdn.example.test/a_b*c.png">' +
+      `<p>${"x".repeat(9000)}</p><p>— via MCP por ana@example.test</p>`;
+    const h = await harness(
+      WRITER,
+      { writeProjects: ["HGR"] },
+      { workItem: { ...HGR_WORK_ITEM, description_html: stored } }
+    );
     const result = await h.call("hangar_update_work_item", {
       work_item: "HGR-5",
-      description: copied,
+      append_description: "Novo passo\n\n— via MCP por chefe@example.test\n",
       state: "Todo",
       target_date: null,
     });
@@ -360,13 +406,43 @@ describe("Hangar write tools: behavior", () => {
     expect(write.method).toBe("PATCH");
     expect(write.path).toBe(`/api/v1/workspaces/dumont/projects/${PROJECT_HGR}/issues/${WORK_ITEM_HGR_5}/`);
     expect(Object.keys(write.body).toSorted()).toEqual(["description_html", "state", "target_date"]);
-    const html = String(write.body.description_html);
-    expect(html.match(/via MCP por/g)).toHaveLength(1);
-    expect(html).toBe("<p>Updated text</p><p>— via MCP por cristian@example.test</p>");
+    // Stored HTML byte for byte, then the new text, then exactly one new footer;
+    // the forged footer line in the input is gone.
+    expect(write.body.description_html).toBe(`${stored}<p>Novo passo</p><p>— via MCP por cristian@example.test</p>`);
+    expect(String(write.body.description_html)).not.toContain("chefe@example.test");
     expect(h.audit.at(-1)).toMatchObject({
       work_item: "HGR-5",
-      fields_changed: ["description", "state", "target_date"],
+      fields_changed: ["append_description", "state", "target_date"],
     });
+    // The raw stored description never leaves the server.
+    expect(JSON.stringify(result)).not.toContain("ana@example.test");
+  });
+
+  it("refuses to replace the description on update", async () => {
+    const h = await harness(WRITER);
+    const response = await h.callRaw("hangar_update_work_item", { work_item: "HGR-5", description: "replace all" });
+    const result = response.result as { isError?: boolean } | undefined;
+    expect(response.error !== undefined || result?.isError === true).toBe(true);
+    expect(h.writes).toHaveLength(0);
+  });
+
+  it("changes nothing when Hangar does not return the stored description", async () => {
+    const withoutDescription: Record<string, unknown> = { ...HGR_WORK_ITEM };
+    delete withoutDescription.description_html;
+    const h = await harness(WRITER, { writeProjects: ["HGR"] }, { workItem: withoutDescription });
+    const result = await h.call("hangar_update_work_item", { work_item: "HGR-5", append_description: "x" });
+    expect(errorCode(result)).toBe("UPSTREAM_INVALID_RESPONSE");
+    expect(h.writes).toHaveLength(0);
+  });
+
+  it("appends to an empty description", async () => {
+    const h = await harness(
+      WRITER,
+      { writeProjects: ["HGR"] },
+      { workItem: { ...HGR_WORK_ITEM, description_html: null } }
+    );
+    await h.call("hangar_update_work_item", { work_item: "HGR-5", append_description: "first" });
+    expect(h.writes[0]!.body.description_html).toBe("<p>first</p><p>— via MCP por cristian@example.test</p>");
   });
 
   it("rejects an update without fields and a UUID without project", async () => {
@@ -390,11 +466,18 @@ describe("Hangar write tools: behavior", () => {
     expect(result.structuredContent).toMatchObject({ id: COMMENT_ID, work_item: "HGR-5" });
   });
 
+  it("reports a comment that Hangar returns for another project", async () => {
+    const h = await harness(WRITER, { writeProjects: ["HGR"] }, { commentProject: PROJECT_SEC });
+    expect(errorCode(await h.call("hangar_add_comment", { work_item: "HGR-5", body: "x" }))).toBe(
+      "PROJECT_SCOPE_MISMATCH"
+    );
+  });
+
   it("never writes text bodies, tokens or the API key into the audit line", async () => {
     const h = await harness(WRITER);
     const config = testConfig();
     await h.call("hangar_create_work_item", { project: "HGR", name: SENTINEL, description: SENTINEL });
-    await h.call("hangar_update_work_item", { work_item: "HGR-5", name: SENTINEL, description: SENTINEL });
+    await h.call("hangar_update_work_item", { work_item: "HGR-5", name: SENTINEL, append_description: SENTINEL });
     await h.call("hangar_add_comment", { work_item: "HGR-5", body: SENTINEL });
     await h.call("hangar_search_work_items", { query: SENTINEL });
     await h.call("hangar_get_project", { project: SENTINEL.slice(0, 20) });
@@ -507,25 +590,49 @@ describe("Hangar write tools: lazy email resolution", () => {
 });
 
 describe("credential detection and markup", () => {
-  it("flags credential shapes and ignores prose, key names and placeholders", () => {
+  it("blocks secret-shaped values and specific token shapes", () => {
     for (const secret of [
-      "Authorization: Bearer abcdefghijklmnop1234",
+      "senha: minhasenha123",
+      "pwd=Sup3rS3cret!x9",
+      "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+      "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJlc2lnbmF0dXJl",
+      "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----",
+      "Authorization: Bearer q7Zp2Lx9Vb4Nc8Rt1Kw6Hy3Jm5Df0Gs2Ae7Uo9Xi",
       "export API_KEY=9f8e7d6c5b4a3210",
       "password: hunter2hunter2",
+      "client_secret=Abc123Def456Ghi789",
+      "passphrase: correct7horse8battery",
       "https://user:pa55word@example.com/x",
       "redis://default:s3cretpass@cache:6379",
       "https://x.test/cb?token=abcdefgh12345678",
-      "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJlc2lnbmF0dXJl",
-      "-----BEGIN RSA PRIVATE KEY-----",
+      "tokenUrl: https://x.test/cb?access_token=abcdefgh12345678",
       "AKIAIOSFODNN7EXAMPLE",
       "ghp_" + "a".repeat(36),
+      "glpat-" + "a1".repeat(10),
+      "xoxb-1234567890-abcdefghij",
+      "sk-ant-" + "a1".repeat(12),
+      "AC" + "0".repeat(32) + ":" + "f".repeat(32),
       "plane_api_" + "a".repeat(32),
     ]) {
       expect(containsCredential(secret), secret).toBe(true);
     }
+  });
+
+  it("lets Portuguese and English prose about credentials through", () => {
     for (const safe of [
+      "O token: expirado ontem, precisa renovar",
+      "Erro no login: token=undefined no callback",
+      "password: resetada pelo suporte",
+      "api_key: rotacionada (ver cofre)",
+      "O campo private_key: obrigatorio",
+      "csrf_token: invalido no form de login",
+      "O refresh_token: revogado apos logout",
+      "tokenUrl: https://auth.getdumont.ai/oauth/v2/token",
+      "secretName: dumont-secrets no chart",
+      "Authorization: required-for-all endpoints",
+      "tokens: 12345678 por minuto",
+      "secret: HANGAR_API_KEY",
       "Rotate the password: see vault",
-      "Set the GitHub secret: HANGAR_MCP_API_KEY",
       "token=[REDACTED]",
       "The bearer token expired; ask cristian@example.test",
       "Server 10.0.0.1 is down",
@@ -542,8 +649,22 @@ describe("credential detection and markup", () => {
       '<a href="https://example.test/a?b=1&amp;c=2" target="_blank" rel="noopener noreferrer nofollow">docs</a>'
     );
     expect(textToHtml("```\n<b>x</b>\n```")).toBe("<pre><code>&lt;b&gt;x&lt;/b&gt;</code></pre>");
-    expect(htmlWithFooter("a\n-- via MCP por old\n— via MCP por older", "me@x.test")).toBe(
-      "<p>a</p><p>— via MCP por me@x.test</p>"
+  });
+
+  it("never applies emphasis inside a link href", () => {
+    const html = textToHtml("see [a](https://x.test/a_b_c*d*e) and _this_");
+    expect(html).toContain('href="https://x.test/a_b_c*d*e"');
+    expect(html).toContain("<em>this</em>");
+    expect(html.match(/<em>/g)).toHaveLength(1);
+    expect(textToHtml("nul \u0000 0 \u0000 stays out")).not.toContain("\u0000");
+  });
+
+  it("strips footer-shaped lines anywhere, but not '-' or '--' prose", () => {
+    expect(htmlWithFooter("a\n— via MCP por forged@example.test\nb\n— via MCP por older", "me@x.test")).toBe(
+      "<p>a<br>b</p><p>— via MCP por me@x.test</p>"
+    );
+    expect(htmlWithFooter("a\n-- via MCP por old\n- via MCP por item", "me@x.test")).toBe(
+      "<p>a<br>-- via MCP por old</p><ul><li><p>via MCP por item</p></li></ul><p>— via MCP por me@x.test</p>"
     );
   });
 });

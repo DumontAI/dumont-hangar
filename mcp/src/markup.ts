@@ -13,9 +13,11 @@
 
 export const FOOTER_PREFIX = "— via MCP por";
 
-// Footer lines a caller may have copied back from an existing item; they are
-// dropped before a fresh footer is appended so updates never stack footers.
-const FOOTER_LINE = /^\s*(?:—|--|-)\s*via MCP por\s+\S.*$/i;
+// A line shaped like the generated footer (em dash, "via MCP por", a name).
+// Removed from caller text wherever it appears, so a caller can neither stack
+// footers nor forge another person's attribution line. Lines starting with
+// "-" or "--" are ordinary list items/prose and are left alone.
+const FOOTER_LINE = /^[ \t]*—[ \t]*via[ \t]+MCP[ \t]+por[ \t]+\S.*$/i;
 
 export function escapeHtml(value: string): string {
   return value
@@ -34,17 +36,24 @@ function inline(raw: string): string {
   return parts
     .map((part) => {
       if (/^`[^`\n]+`$/.test(part)) return `<code>${escapeHtml(part.slice(1, -1))}</code>`;
-      let text = escapeHtml(part);
+      // NUL never survives into text we emit, so it is a safe placeholder mark.
+      let text = escapeHtml(part.replaceAll("\u0000", ""));
+      // Links become placeholders first, so the emphasis rules below can never
+      // rewrite characters inside an href (e.g. "_" or "*" in a URL).
+      const links: string[] = [];
       text = text.replace(/\[([^\]\n]{1,500})\]\(([^)\s]{1,2000})\)/g, (match, label: string, href: string) => {
         // href was escaped with the rest; undo only &amp; to validate the URL shape.
         const url = href.replaceAll("&amp;", "&");
         if (!SAFE_LINK.test(url)) return match;
-        return `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer nofollow">${label}</a>`;
+        links.push(`<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer nofollow">${label}</a>`);
+        return `\u0000${links.length - 1}\u0000`;
       });
       text = text.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
       text = text.replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s).,;:!?]|$)/g, "$1<em>$2</em>");
       text = text.replace(/(^|[\s(])_([^_\n]+)_(?=[\s).,;:!?]|$)/g, "$1<em>$2</em>");
-      return text;
+      // Intentional NUL placeholder mark (stripped from input above).
+      // oxlint-disable-next-line no-control-regex
+      return text.replace(/\u0000(\d+)\u0000/g, (_match, index: string) => links[Number(index)] ?? "");
     })
     .join("");
 }
@@ -142,12 +151,13 @@ export function textToHtml(text: string): string {
   return parseBlocks(text).map(renderBlock).join("");
 }
 
-/** Removes trailing attribution footers (and trailing blank lines) from caller text. */
+/** Removes every footer-shaped line, then trailing blank lines, from caller text. */
 export function stripFooter(text: string): string {
-  const lines = text.replace(/\r\n?/g, "\n").split("\n");
-  while (lines.length > 0 && (!lines[lines.length - 1]!.trim() || FOOTER_LINE.test(lines[lines.length - 1]!))) {
-    lines.pop();
-  }
+  const lines = text
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .filter((line) => !FOOTER_LINE.test(line));
+  while (lines.length > 0 && !lines[lines.length - 1]!.trim()) lines.pop();
   return lines.join("\n");
 }
 
@@ -159,4 +169,13 @@ export function footerHtml(actor: string): string {
 export function htmlWithFooter(text: string, actor: string): string {
   const body = textToHtml(stripFooter(text));
   return `${body}${footerHtml(actor)}`;
+}
+
+/**
+ * Appends caller text (as safe HTML) and one footer after the stored
+ * description HTML. The stored HTML is kept byte for byte; it was already
+ * sanitized by Plane when it was saved.
+ */
+export function appendWithFooter(existingHtml: string, text: string, actor: string): string {
+  return `${existingHtml}${textToHtml(stripFooter(text))}${footerHtml(actor)}`;
 }

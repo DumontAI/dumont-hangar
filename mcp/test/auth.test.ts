@@ -156,9 +156,19 @@ describe("OIDC authorization", () => {
     expect(
       await request({
         email: "Cristian@Example.test",
+        email_verified: true,
         "urn:zitadel:iam:org:project:roles": { hangar_writer: { "dumont-org": "dumont.example.test" } },
       })
     ).toMatchObject({ failure: null, principal: { email: "cristian@example.test", roles: ["hangar_writer"] } });
+    // An email without email_verified === true is not trusted (spoofing).
+    for (const verified of [undefined, "true", 1]) {
+      // oxlint-disable-next-line no-await-in-loop
+      const outcome = await request({
+        email: "boss@example.test",
+        ...(verified === undefined ? {} : { email_verified: verified }),
+      });
+      expect(outcome.principal?.email).toBeNull();
+    }
     expect(
       await request({
         email: "x@example.test",
@@ -171,6 +181,44 @@ describe("OIDC authorization", () => {
     ).toMatchObject({ failure: null, principal: { email: null, roles: ["hangar_reader", "hangar_writer"] } });
     expect(
       (await request({ "urn:zitadel:iam:org:project:roles": { some_other_role: { "dumont-org": "d" } } })).failure
+    ).toBe("insufficient_scope");
+  });
+
+  it("accepts my:zitadel:grants only as <audience project>:<role>", async () => {
+    const { config, token } = await setupOidc();
+    const authorize = createAuthorizer(config);
+    const rolesOf = async (grants: unknown) => {
+      const outcome = await authorize({
+        headers: {
+          host: "127.0.0.1",
+          authorization: `Bearer ${await token({ "urn:zitadel:iam:org:project:roles": {}, "urn:zitadel:iam:user:resourceowner:id": "dumont-org", "my:zitadel:grants": grants })}`,
+        },
+      } as never);
+      return outcome.failure ?? outcome.principal?.roles;
+    };
+    expect(await rolesOf(["hangar-mcp-project:hangar_writer"])).toEqual(["hangar_writer"]);
+    expect(await rolesOf(["hangar_writer"])).toBe("insufficient_scope");
+    expect(await rolesOf(["other-project:hangar_writer"])).toBe("insufficient_scope");
+    expect(await rolesOf(["x:hangar-mcp-project:hangar_writer"])).toBe("insufficient_scope");
+    expect(await rolesOf("hangar-mcp-project:hangar_writer")).toBe("insufficient_scope");
+  });
+
+  it("accepts the project-scoped ZITADEL role claim only for the audience project", async () => {
+    const { config, token } = await setupOidc();
+    const authorize = createAuthorizer(config);
+    const outcome = async (claims: Record<string, unknown>) =>
+      authorize({
+        headers: {
+          host: "127.0.0.1",
+          authorization: `Bearer ${await token({ "urn:zitadel:iam:org:project:roles": {}, "urn:zitadel:iam:user:resourceowner:id": "dumont-org", ...claims })}`,
+        },
+      } as never);
+    expect(
+      (await outcome({ "urn:zitadel:iam:org:project:hangar-mcp-project:roles": { hangar_writer: { o: "d" } } }))
+        .principal?.roles
+    ).toEqual(["hangar_writer"]);
+    expect(
+      (await outcome({ "urn:zitadel:iam:org:project:other-project:roles": { hangar_writer: { o: "d" } } })).failure
     ).toBe("insufficient_scope");
   });
 
@@ -330,7 +378,8 @@ describe("OIDC authorization", () => {
       return (await response.json()) as Record<string, unknown>;
     };
     const listed = await call(3, "tools/list", {});
-    expect((listed.result as { tools: unknown[] }).tools).toHaveLength(12);
+    // Writes are disabled in this config, so only the nine read tools are listed.
+    expect((listed.result as { tools: unknown[] }).tools).toHaveLength(9);
     const result = await call(4, "tools/call", {
       name: "hangar_list_projects",
       arguments: { limit: 10, response_format: "json" },
