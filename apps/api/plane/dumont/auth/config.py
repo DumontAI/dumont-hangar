@@ -15,6 +15,11 @@ DEFAULT_AUTH_HOST = "https://auth.getdumont.ai"
 DEFAULT_READER_ROLE = "hangar_reader"
 DEFAULT_WRITER_ROLE = "hangar_writer"
 LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+# Sent on every request to Dumont Auth (ZITADEL): JWKS, introspection, the access sync client.
+# auth.getdumont.ai sits behind Cloudflare, which answers 403 to the default `Python-urllib/3.x`
+# User-Agent, so no client may rely on its library's default. scripts/dumont/zitadel_access_bootstrap.py
+# (standalone, cannot import this) carries the same string.
+USER_AGENT = "dumont-hangar-api (+https://hangar.getdumont.ai)"
 # A bare ZITADEL id: no ':' (that would make `<aud>:<role>` grants ambiguous) and no whitespace of any kind.
 _NOT_BARE_ID = re.compile(r"[:\s]")
 

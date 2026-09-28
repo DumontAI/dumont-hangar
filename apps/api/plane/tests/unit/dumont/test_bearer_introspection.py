@@ -192,6 +192,7 @@ class TestIntrospectionAccepted:
         assert call["form"] == {"token": [token], "token_type_hint": ["access_token"]}
         assert call["timeout"] == 5
         assert call["headers"]["Content-Type"] == "application/x-www-form-urlencoded"
+        assert call["headers"]["User-Agent"] == "dumont-hangar-api (+https://hangar.getdumont.ai)"
         scheme, _, encoded = call["headers"]["Authorization"].partition(" ")
         assert scheme == "Basic"
         # client_id and secret are form-encoded, then joined with ':' (as the MCP does).

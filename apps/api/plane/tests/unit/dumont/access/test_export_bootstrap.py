@@ -196,6 +196,16 @@ class TestBootstrapScript:
         assert "legacy@example.test: hangar.project.mo.guest, hangar.workspace.guest  [by e-mail]" in text
         assert PAT not in text
 
+    def test_explicit_user_agent(self, plane_world, fake_zitadel, bootstrap, tmp_path):
+        from plane.dumont.auth.config import USER_AGENT
+
+        fake_zitadel.issued.add(PAT)
+        export_path, _ = _export(tmp_path)
+        code, _ = _run_script(bootstrap, fake_zitadel, export_path)
+        assert code == 0
+        assert fake_zitadel.user_agents and set(fake_zitadel.user_agents) == {USER_AGENT}
+        assert bootstrap.USER_AGENT == USER_AGENT
+
     def test_apply_requires_yes(self, plane_world, fake_zitadel, bootstrap, tmp_path):
         export_path, _ = _export(tmp_path)
         with pytest.raises(SystemExit):

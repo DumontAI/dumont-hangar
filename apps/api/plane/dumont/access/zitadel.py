@@ -43,6 +43,8 @@ import time
 import jwt
 import requests
 
+from plane.dumont.auth.config import USER_AGENT
+
 logger = logging.getLogger("plane.dumont.access")
 
 TIMEOUT_SECONDS = 5
@@ -153,7 +155,8 @@ class ZitadelClient:
     # --- transport ---------------------------------------------------------------------------
 
     def _request(self, method, path, json_body=None, form=None, authenticated=True):
-        headers = {"Accept": "application/json"}
+        # Explicit User-Agent: Cloudflare in front of Dumont Auth blocks some library defaults.
+        headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
         if authenticated:
             headers["Authorization"] = f"Bearer {self.access_token()}"
             headers[ORG_HEADER] = self.org_id

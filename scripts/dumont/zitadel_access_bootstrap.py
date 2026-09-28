@@ -48,6 +48,9 @@ import sys
 import requests
 
 EXPORT_FORMAT = "hangar-zitadel-access-export/v1"
+# Same string as plane.dumont.auth.config.USER_AGENT (this script cannot import it). Explicit because
+# Cloudflare in front of Dumont Auth answers 403 to some library-default User-Agents.
+USER_AGENT = "dumont-hangar-api (+https://hangar.getdumont.ai)"
 TIMEOUT = 10
 PAGE_SIZE = 100
 MAX_PAGES = 500
@@ -72,6 +75,7 @@ class Zitadel:
             "Authorization": f"Bearer {self._pat}",
             "x-zitadel-orgid": self.org_id,
             "Accept": "application/json",
+            "User-Agent": USER_AGENT,
         }
         try:
             response = self.session.request(

@@ -21,6 +21,16 @@ class TestZitadelClient:
         assert fake_zitadel.token_requests == 1  # the fake verified signature, kid, iss/sub and aud
         assert set(fake_zitadel.timeouts) == {5}
 
+    def test_explicit_user_agent_on_every_request(self, client, fake_zitadel):
+        # Cloudflare in front of Dumont Auth blocks some library-default User-Agents.
+        from plane.dumont.auth.config import USER_AGENT
+
+        fake_zitadel.roles = ["hangar.workspace.member"]
+        client.list_project_role_keys(PROJECT_ID)
+        assert fake_zitadel.token_requests == 1 and len(fake_zitadel.user_agents) == 2
+        assert set(fake_zitadel.user_agents) == {USER_AGENT}
+        assert USER_AGENT == "dumont-hangar-api (+https://hangar.getdumont.ai)"
+
     def test_token_refreshed_when_near_expiry(self, client, fake_zitadel):
         fake_zitadel.expires_in = 30  # below the refresh margin: never reused
         client.list_project_role_keys(PROJECT_ID)

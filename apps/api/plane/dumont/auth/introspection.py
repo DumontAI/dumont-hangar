@@ -22,6 +22,8 @@ import urllib.request
 
 from django.core.cache import cache
 
+from plane.dumont.auth.config import USER_AGENT
+
 logger = logging.getLogger("plane.authentication.dumont_bearer")
 
 INTROSPECTION_TIMEOUT_SECONDS = 5
@@ -115,6 +117,8 @@ def _call_issuer(token, config):
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/x-www-form-urlencoded",
+        # Explicit: Cloudflare in front of Dumont Auth answers 403 to urllib's default User-Agent.
+        "User-Agent": USER_AGENT,
         "Authorization": _basic_auth(config.introspection_client_id, config.introspection_client_secret),
     }
     try:

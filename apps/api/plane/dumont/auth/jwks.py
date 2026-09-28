@@ -16,6 +16,8 @@ import urllib.request
 from jwt import PyJWKSet
 from jwt.exceptions import PyJWKClientConnectionError, PyJWKClientError
 
+from plane.dumont.auth.config import USER_AGENT
+
 JWKS_TIMEOUT_SECONDS = 5
 # How long a fetched key set is used before it is fetched again.
 JWKS_LIFESPAN_SECONDS = 300
@@ -50,7 +52,8 @@ def _now():
 
 def _fetch_jwks(uri, timeout):
     """Fetch and parse the key set. Tests replace this function; production calls the issuer."""
-    request = urllib.request.Request(url=uri, headers={"Accept": "application/json"})
+    # Explicit User-Agent: Cloudflare in front of Dumont Auth answers 403 to urllib's default one.
+    request = urllib.request.Request(url=uri, headers={"Accept": "application/json", "User-Agent": USER_AGENT})
     with _opener.open(request, timeout=timeout) as response:
         body = response.read(MAX_JWKS_BYTES + 1)
     if len(body) > MAX_JWKS_BYTES:
