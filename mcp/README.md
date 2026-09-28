@@ -106,14 +106,20 @@ Behavior common to all writes:
 
 ### Acting as the user
 
-- **Which token is forwarded**: only a JWS access token this server verified
-  locally (RS256, issuer, audience, lifetime, role) is sent to Hangar, and
-  only to `HANGAR_BASE_URL` (HTTPS, no redirects followed). It is never logged
-  or stored; it lives in the per-request Hangar client only. An opaque (JWE)
-  token that passed introspection is accepted by this server but is **not
-  forwarded** (Hangar accepts only JWTs): its tool calls answer
-  `TOKEN_NOT_FORWARDABLE`, asking the user to connect with the pinned public
-  client (which issues JWTs).
+- **Which token is forwarded**: only an access token that passed this
+  server's own validation is sent to Hangar, verbatim, as
+  `Authorization: Bearer`, and only to `HANGAR_BASE_URL` (HTTPS, no redirects
+  followed). That is either a JWS verified locally (RS256, issuer, audience,
+  lifetime, org-bound role, not an ID token) or an opaque (JWE) token that
+  ZITADEL introspection reported `active` and that then passed the same
+  checks (issuer, audience, `exp`, org-bound role, access-token type).
+  Dynamically registered clients (Codex, OpenCode, ...) get opaque tokens;
+  Hangar introspects them again with the same checks
+  (`DUMONT_API_INTROSPECTION_*` on the Hangar side). ID tokens, tokens for
+  another audience or issuer, inactive tokens, tokens whose introspection
+  failed, and tokens without an org-bound Hangar role are rejected by this
+  server (HTTP 401/403) and never reach Hangar. The token is never logged or
+  stored; it lives in the per-request Hangar client only.
 - **Per-request isolation**: the HTTP layer builds a new McpServer and a new
   Hangar client bound to the verified caller for every request; there is no
   global "current user".
@@ -133,9 +139,10 @@ Behavior common to all writes:
   user is `INVALID_CURSOR` for anyone else.
 - **Hangar 401 is not an MCP 401**: a 401 from Hangar becomes a tool error
   (HTTP 200), so the client does not restart its login for a problem a new
-  login cannot fix. Expiry is handled before forwarding: a JWS with 30 s or
-  less left (`MIN_TOKEN_LIFETIME_SECONDS`) already gets this server's regular
-  HTTP 401 challenge, so the client refreshes before the token reaches Hangar.
+  login cannot fix. The same mapping applies to JWS and opaque tokens.
+  Expiry is handled before forwarding: a token with 30 s or less left
+  (`MIN_TOKEN_LIFETIME_SECONDS`; the JWT `exp`, or for an opaque token the
+  introspection `exp`) already gets this server's regular HTTP 401 challenge, so the client refreshes before the token reaches Hangar.
   Only if a call outlives that margin (or the clocks disagree) and Hangar
   answers 401 within 30 s of `exp` does the tool answer `TOKEN_EXPIRED`, not
   retryable with the same token; the client's next request gets the 401
@@ -151,7 +158,7 @@ Behavior common to all writes:
 | --------------------------- | ------------------------------------------------------------------------------------------------------------- |
 | `FORBIDDEN`                 | Token lacks the role for this tool (write tools need `hangar_writer`)                                         |
 | `ACCOUNT_NOT_LINKED`        | Hangar has no account linked to this Dumont login: sign in once at https://hangar.getdumont.ai (Dumont login) |
-| `TOKEN_NOT_FORWARDABLE`     | Opaque token; connect with the pinned public client (JWT) and log in again                                    |
+| `TOKEN_NOT_FORWARDABLE`     | Defensive: no validated token to forward (should not happen); nothing sent; log in again                      |
 | `TOKEN_EXPIRED`             | Token expired during the call; nothing changed; the next request gets a 401 and the client refreshes          |
 | `WRITER_ROLE_REQUIRED`      | Hangar requires `hangar_writer` for this change                                                               |
 | `USER_NOT_ALLOWED`          | The linked Hangar user is deactivated, a bot or linked twice; not retryable, a new login will not help        |
@@ -214,7 +221,7 @@ Two separate layers:
   - There is no separate organization check: a token whose Hangar roles are
     not bound to our org has no Hangar role and gets `403 insufficient_scope`.
     Opaque (introspected) tokens go through the same function. Hangar applies
-    the same rules to the forwarded token.
+    the same rules to the forwarded token, JWS or opaque.
 
 ## Audit log
 
@@ -240,7 +247,7 @@ One JSON line per tool call (read and write) on stderr, i.e. in journald for
 
 `plane_user_id` is the Hangar user behind the token (from
 `GET /api/v1/users/me/`, cached per user); it can be `null` when Hangar was
-not or could not be asked (unlinked account, opaque token, a role denial
+not or could not be asked (unlinked account, a role denial
 before any call with nothing cached yet).
 `outcome` is `success`, `denied` (policy: role, ceiling, secret, rate, or a
 Hangar denial such as `PROJECT_ACCESS_DENIED`/`ACCOUNT_NOT_LINKED`) or
@@ -269,7 +276,7 @@ See [.env.example](.env.example). The important ones:
 | `MCP_OIDC_ALLOWED_ORG_ID`      | **Required**: ZITADEL org id whose role grants count (see "Roles and access")       |
 | `MCP_OIDC_READER_ROLE`         | `hangar_reader` (legacy name: `MCP_OIDC_REQUIRED_ROLE`)                             |
 | `MCP_OIDC_WRITER_ROLE`         | `hangar_writer`                                                                     |
-| `MCP_OIDC_INTROSPECTION_*`     | Optional RFC 7662 introspection for opaque tokens (never forwarded to Hangar)       |
+| `MCP_OIDC_INTROSPECTION_*`     | RFC 7662 introspection for opaque tokens; accepted ones are forwarded to Hangar     |
 
 Retired keys:
 
@@ -281,7 +288,8 @@ Retired keys:
 
 Hangar side (fork module `apps/api/plane/dumont/`): API v1 must accept the
 bearer, i.e. `DUMONT_API_BEARER_ENABLED=1` with `MCP_OIDC_AUDIENCE` listed in
-`DUMONT_API_AUDIENCES`.
+`DUMONT_API_AUDIENCES`, and, for opaque tokens, RFC 7662 introspection
+configured (`DUMONT_API_INTROSPECTION_*`).
 
 ## Team access with login
 
@@ -303,9 +311,13 @@ For a new teammate, in this order:
    then every tool answers `ACCOUNT_NOT_LINKED`.
 3. **MCP client**: connect with the pinned client above and log in.
 
-Do not let the client self-register through ZITADEL DCR: those applications
-receive opaque (JWE) access tokens, which Hangar cannot accept; the tools then
-answer `TOKEN_NOT_FORWARDABLE`.
+Clients that self-register through ZITADEL DCR (Codex, OpenCode, ...) receive
+opaque (JWE) access tokens. They work when this server has
+`MCP_OIDC_INTROSPECTION_*` and Hangar has `DUMONT_API_INTROSPECTION_*`
+configured: this server introspects the token, and once it passes, forwards
+it to Hangar, which introspects it again. If Hangar lacks introspection, those
+users get a tool error from Hangar's answer (typically
+`UPSTREAM_UNAUTHORIZED`) on every call.
 
 After `hangar_writer` is granted, a client must **log in again** so the new
 token requests and carries the role (Claude Code: `/mcp`, pick the Hangar
@@ -359,7 +371,11 @@ must accept it first, and this release refuses to start while
 0. **Prerequisite (Hangar side, deployed and verified first)**: Hangar runs
    the fork release with the Dumont bearer (`apps/api/plane/dumont/`), with
    `DUMONT_API_BEARER_ENABLED=1` and `DUMONT_API_AUDIENCES` containing the
-   value of `MCP_OIDC_AUDIENCE`. Every MCP user has signed in once to Hangar
+   value of `MCP_OIDC_AUDIENCE`, **and with `DUMONT_API_INTROSPECTION_*`
+   configured and verified** (this release forwards introspected opaque
+   tokens; without Hangar-side introspection, every user of a dynamically
+   registered client, e.g. Codex or OpenCode, gets an error from Hangar on
+   every tool call). Every MCP user has signed in once to Hangar
    web with Dumont login (otherwise `ACCOUNT_NOT_LINKED`) and is a member of
    the projects they use. **Do not remove `HANGAR_API_KEY` /
    `HANGAR_WRITE_PROJECTS` before this is live**: the old MCP release (still

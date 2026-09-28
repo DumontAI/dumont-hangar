@@ -5,7 +5,10 @@
 Needs the Hangar (Plane fork) side first: API v1 accepting
 `Authorization: Bearer <ZITADEL JWT>` (`apps/api/plane/dumont/`,
 `DUMONT_API_BEARER_ENABLED=1`, `DUMONT_API_AUDIENCES` containing
-`MCP_OIDC_AUDIENCE`).
+`MCP_OIDC_AUDIENCE`) and RFC 7662 introspection of opaque tokens
+(`DUMONT_API_INTROSPECTION_*` configured). Without the Hangar introspection,
+users of dynamically registered clients (opaque tokens: Codex, OpenCode) get
+an error from Hangar on every tool call.
 
 ### Changes
 
@@ -13,9 +16,13 @@ Needs the Hangar (Plane fork) side first: API v1 accepting
   (`Authorization: Bearer`), never an `x-api-key`. Hangar applies the user's
   own workspace/project permissions and records the user as the author. The
   bot account `hangar-mcp@dumont.au` is no longer used.
-- Only a locally verified JWS is forwarded. Opaque (JWE) tokens accepted
-  through introspection are not forwarded; their tool calls answer
-  `TOKEN_NOT_FORWARDABLE` (use the pinned public client).
+- Only a token that passed this server's validation is forwarded, verbatim:
+  a locally verified RS256 JWS, or an opaque (JWE) token that introspection
+  reported active and that passed the same claims policy (issuer, audience,
+  org-bound role, access-token type). ID tokens, other audiences, inactive or
+  failed introspection are rejected by this server and never reach Hangar.
+  `TOKEN_NOT_FORWARDABLE` remains only as a defensive guard (no validated
+  token on the request).
 - Per request, the HTTP layer builds a new McpServer and a Hangar client bound
   to the verified caller; no global mutable caller state.
 - Caches (project list, workspace members, Hangar user id) are keyed per token
@@ -33,7 +40,8 @@ Needs the Hangar (Plane fork) side first: API v1 accepting
   `PROJECT_ACCESS_DENIED` (names the `hangar.project.<id>.member` role),
   `TOKEN_EXPIRED` (not retryable with the same token), `UPSTREAM_UNAUTHORIZED`.
   A Hangar 401 never becomes an MCP HTTP 401.
-- A JWS access token with 30 s or less left is refused by the authorizer with
+- An access token with 30 s or less left (JWT `exp`, or the introspection
+  `exp` for an opaque token) is refused by the authorizer with
   the regular HTTP 401 challenge, so clients refresh before the token is
   forwarded; `TOKEN_EXPIRED` only remains for calls that outlive that margin.
 - Footer anti-forgery compares a folded form of each line: zero-width
@@ -72,12 +80,14 @@ Needs the Hangar (Plane fork) side first: API v1 accepting
   (retryable, also for writes since Hangar refused before running the view;
   never a new login). Hangar's 401 challenge now carries
   `error="invalid_token"`; it is still mapped by `error_code` and never
-  becomes an MCP 401.
+  becomes an MCP 401. The mapping is the same for JWS and opaque tokens.
 
 ### Owner steps
 
 Follow README → "Manual deploy (0.3.0: acting as the user)". In short: deploy
-and verify the Hangar side first; then prepare `/etc/dumont-hangar-mcp.env.new`
+and verify the Hangar side first, including `DUMONT_API_INTROSPECTION_*`
+(opaque tokens are now forwarded; without it, opaque-token users get an error
+from Hangar); then prepare `/etc/dumont-hangar-mcp.env.new`
 as a copy without `HANGAR_API_KEY` and `HANGAR_WRITE_PROJECTS` and with
 `MCP_CURSOR_SECRET` (compare the two project lists first: writes now reach
 every project in `HANGAR_ALLOWED_PROJECTS` where the user is a Hangar Member),
