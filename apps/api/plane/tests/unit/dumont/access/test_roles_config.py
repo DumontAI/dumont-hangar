@@ -45,6 +45,9 @@ class TestRoleKeys:
             "hangar.project..member",
             "hangar.project.abcdefghijklm.member",  # 13 chars, Plane allows 12
             "Hangar.workspace.member",
+            "hangar.project.mo\n.member",  # `$` would have accepted the trailing newline
+            "hangar.workspace.member\n",
+            "hangar.project.Kmo.member",  # KELVIN SIGN, not ASCII
             "",
             None,
             42,
@@ -59,6 +62,12 @@ class TestRoleKeys:
         assert R.identifier_to_key_part("A B") is None
         assert R.identifier_to_key_part("ÉCO") is None
         assert R.identifier_to_key_part("") is None
+        # Non-ASCII is refused BEFORE lowercasing: "K".lower() == "k" would otherwise map a
+        # look-alike identifier onto the role keys of project "KMO".
+        assert "KMO".lower() == "kmo"
+        assert R.identifier_to_key_part("KMO") is None
+        assert R.identifier_to_key_part("MO\n") == "mo"  # surrounding whitespace is stripped first
+        assert R.identifier_to_key_part("M\nO") is None
 
     def test_role_key_roundtrip(self):
         assert R.role_key("project", "mo", R.MEMBER) == "hangar.project.mo.member"
@@ -91,6 +100,27 @@ class TestConfig:
             cfg.require_complete()
         message = str(exc.value)
         assert "DUMONT_ACCESS_WORKSPACE_SLUG" in message and "secret" not in message
+
+    def test_repr_has_no_key(self, key_json):
+        cfg = load_access_config({"DUMONT_ACCESS_SYNC": "enforce", "DUMONT_ACCESS_ZITADEL_KEY_JSON": key_json})
+        assert cfg.key_source == key_json
+        text = repr(cfg) + str(cfg)
+        assert "PRIVATE KEY" not in text and "key_source" not in text and "key-0001" not in text
+
+    def test_org_id_is_the_shared_variable(self):
+        cfg = load_access_config({"DUMONT_ZITADEL_ORG_ID": " 200000000000000001 "})
+        assert cfg.org_id == "200000000000000001"
+        # the old per-feature name is gone: one value governs bearer auth, sync and web login
+        assert load_access_config({"DUMONT_ACCESS_ZITADEL_ORG_ID": "1"}).org_id is None
+
+    @pytest.mark.parametrize("value", ["2000:1", "2000 1", "2000\t1"])
+    def test_org_id_same_rules_as_bearer_auth(self, value):
+        cfg = load_access_config({"DUMONT_ACCESS_SYNC": "enforce", "DUMONT_ZITADEL_ORG_ID": value})
+        # The mode survives (so the lock fails closed with 503), and every sync refuses to run.
+        assert cfg.mode == "enforce" and cfg.org_id is None
+        with pytest.raises(AccessConfigError) as exc:
+            cfg.require_complete()
+        assert "DUMONT_ZITADEL_ORG_ID" in str(exc.value) and "bare" in str(exc.value)
 
     def test_service_key_from_json_and_file(self, key_json, tmp_path):
         key = parse_service_key(key_json)

@@ -333,10 +333,10 @@ class TestLock:
         assert setup["fake"].calls == []
 
     def test_enforce_without_org_id_fails_closed(self, setup, monkeypatch):
-        # DUMONT_ACCESS_ZITADEL_ORG_ID is required: without it the lock cannot learn the managed scopes
+        # DUMONT_ZITADEL_ORG_ID is required: without it the lock cannot learn the managed scopes
         # and answers 503 instead of letting a change through; ZITADEL is never called.
         cache.delete(MANAGED_STATE_KEY)
-        monkeypatch.delenv("DUMONT_ACCESS_ZITADEL_ORG_ID")
+        monkeypatch.delenv("DUMONT_ZITADEL_ORG_ID")
         response = _call(setup, *LOCKED_CASES[1][1:])
         assert response.status_code == 503
         assert setup["fake"].calls == []

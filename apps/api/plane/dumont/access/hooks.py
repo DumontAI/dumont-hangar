@@ -1,9 +1,11 @@
 # Dumont addition: hook points between Dumont Auth (ZITADEL) and Hangar memberships.
 # Not upstream Plane. Owned by the membership sync (Part 2); Part 1 calls on_bearer_authenticated.
 #
-# Both hooks run a per-user sync (sync.run_user_sync) and NEVER raise into the request path:
+# Both hooks run a per-user sync (sync.run_user_sync) inline and NEVER raise into the request path:
 # every error is logged and ignored, so a ZITADEL or sync problem can never block a login or an
-# API call. In mode `off` they do nothing.
+# API call. The per-user sync only adds access (removals wait for the full sync). In mode `off`
+# they do nothing, and for 60 s after a ZITADEL error (flag `dumont_access:zitadel_backoff`) they
+# skip ZITADEL entirely.
 
 import logging
 
@@ -29,14 +31,19 @@ def _sync_user(user, sub, force, source):
     try:
         if current_mode() == MODE_OFF or user is None or not sub:
             return None
+        from plane.dumont.access.sync import run_user_sync, zitadel_backoff_active
+
         try:
+            if zitadel_backoff_active():
+                # ZITADEL failed less than a minute ago: do not add a slow failing call to this
+                # request. Nothing is lost, the per-user sync only adds access and the full sync runs.
+                return None
             if not _claim(sub, force):
                 return None
         except Exception:
             # Without the cache we cannot rate-limit; skip rather than hit ZITADEL on every request.
             logger.warning("dumont access: cache unavailable, per-user sync skipped (%s)", source)
             return None
-        from plane.dumont.access.sync import run_user_sync
 
         return run_user_sync(user, sub)
     except Exception:

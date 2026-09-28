@@ -23,14 +23,17 @@
 #       email, preferredLoginName, displayName. User fields used: id, details.resourceOwner.
 #
 # Organisation boundary: the ZITADEL instance is shared with other products' production, so only
-# grants AND users of the configured Dumont organisation (DUMONT_ACCESS_ZITADEL_ORG_ID) count. A
+# grants AND users of the configured Dumont organisation (DUMONT_ZITADEL_ORG_ID) count. A
 # grant is ignored when it came through a project grant (projectGrantId set), when its orgId or
 # details.resourceOwner names another org, or when its user is not a user of the Dumont org (checked
 # with an org-scoped users/_search). Absent fields are not treated as foreign (older/newer versions
 # may omit them); the org-scoped user check still applies.
 #
 # The client never writes to ZITADEL, never logs tokens or the private key, and raises
-# ZitadelError for every failure so callers can fail safe (change nothing).
+# ZitadelError for every failure so callers can fail safe (change nothing). Answers that look like
+# success but are incomplete are failures too: a search answer without `result`, an empty page while
+# `totalResult` says more rows exist, and grants whose users the org-scoped users/_search does not
+# return at all (a silently filtered HTTP 200).
 
 import logging
 import threading
@@ -183,13 +186,20 @@ class ZitadelClient:
             if queries:
                 body["queries"] = queries
             data = self._request("POST", path, json_body=body)
-            page = data.get("result") or []
+            # Only an explicit `"result": []` means "nothing". A missing key is a changed or partial
+            # answer, and reading it as empty would look exactly like a mass revocation.
+            if "result" not in data:
+                raise ZitadelError(f"POST {path}: response has no 'result' (API shape changed?)")
+            page = data["result"]
             if not isinstance(page, list):
                 raise ZitadelError(f"POST {path}: 'result' is not a list")
             rows.extend(page)
             total = _total_result(data)
             offset += len(page)
             if not page:
+                if total is not None and offset < total:
+                    # The server says there is more but hands out nothing: a truncated answer.
+                    raise ZitadelError(f"POST {path}: empty page at offset {offset} of totalResult {total}")
                 return rows
             # Trust totalResult when the server sends it (a server-side limit below PAGE_SIZE must not
             # truncate the list, which would look like mass revocation); otherwise a short page ends it.
@@ -268,6 +278,14 @@ class ZitadelClient:
         if not grants:
             return grants
         in_org = self.user_ids_in_org(grant.user_id for grant in grants)
+        if not in_org:
+            # Grants exist but the org-scoped user search knows none of their users. That is what a
+            # permission that silently filters users/_search (HTTP 200, empty result) looks like;
+            # dropping every grant would read as "everyone lost access". Fail safe instead.
+            raise ZitadelError(
+                f"POST {USERS_SEARCH_PATH}: none of the {len({g.user_id for g in grants})} grantee(s) was found "
+                "in the organisation (service user permission too narrow?)"
+            )
         kept = []
         for grant in grants:
             if grant.user_id in in_org:

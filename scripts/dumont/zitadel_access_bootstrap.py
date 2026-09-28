@@ -12,7 +12,9 @@
 #
 # Additive and idempotent: roles are created when missing; a user's grant gets the missing
 # hangar.* keys added (existing keys such as hangar_reader are kept); nothing is ever removed.
-# Users without a Dumont login are looked up by e-mail (exactly one match or they are skipped).
+# Users without a Dumont login are looked up by e-mail: exactly one match, owned by --org-id
+# (details.resourceOwner) with a verified e-mail, or they are skipped and listed. `--apply` prints the
+# plan before writing, and every grant update re-reads the grant's current keys right before the PUT.
 #
 # Run it while DUMONT_ACCESS_SYNC is off or dry-run: creating `hangar.workspace.member` or a
 # `hangar.project.<id>.*` role makes that scope managed immediately.
@@ -40,6 +42,7 @@
 import argparse
 import json
 import os
+import re
 import sys
 
 import requests
@@ -96,14 +99,26 @@ class Zitadel:
             if queries:
                 body["queries"] = queries
             data = self.request("POST", path, body)
-            page = data.get("result") or []
+            # Same rules as plane/dumont/access/zitadel.py: only an explicit "result": [] is empty,
+            # and an empty page before totalResult is reached is a truncated answer.
+            if not isinstance(data, dict) or "result" not in data:
+                raise BootstrapError(f"POST {path}: response has no 'result' (API shape changed?)")
+            page = data["result"]
+            if not isinstance(page, list):
+                raise BootstrapError(f"POST {path}: 'result' is not a list")
             rows.extend(page)
             offset += len(page)
             total = (data.get("details") or {}).get("totalResult")
+            try:
+                total = int(total) if total not in (None, "") else None
+            except (TypeError, ValueError):
+                total = None
             if not page:
+                if total is not None and offset < total:
+                    raise BootstrapError(f"POST {path}: empty page at offset {offset} of totalResult {total}")
                 return rows
-            if total not in (None, ""):
-                if offset >= int(total):
+            if total is not None:
+                if offset >= total:
                     return rows
             elif len(page) < PAGE_SIZE:
                 return rows
@@ -132,6 +147,18 @@ def _grant_outside_org(row, org_id):
     if row.get("projectGrantId"):
         return True
     return row.get("orgId") not in (None, "", org_id) or details.get("resourceOwner") not in (None, "", org_id)
+
+
+def _resource_owner(row):
+    details = row.get("details") if isinstance(row.get("details"), dict) else {}
+    return details.get("resourceOwner") or None
+
+
+def _email_verified(row):
+    """ZITADEL v1 User: human.email.isEmailVerified (absent means not verified)."""
+    human = row.get("human") if isinstance(row.get("human"), dict) else {}
+    email = human.get("email") if isinstance(human.get("email"), dict) else {}
+    return email.get("isEmailVerified") is True
 
 
 def users_in_org(zitadel, user_ids):
@@ -180,13 +207,29 @@ def build_plan(export, zitadel, project_id, projects=None, skip_workspace=False)
                 "/management/v1/users/_search",
                 [{"emailQuery": {"emailAddress": user["email"], "method": "TEXT_QUERY_METHOD_EQUALS_IGNORE_CASE"}}],
             )
-            ids = sorted({m.get("id") for m in matches if m.get("id")})
-            if len(ids) != 1:
-                plan["skipped"].append(
-                    {"user": who, "reason": "not found in ZITADEL" if not ids else "several ZITADEL users match"}
-                )
+            # An e-mail match grants access, so it must be unambiguous and trustworthy: the user must be
+            # owned by --org-id (explicitly, not just by the org header) and the address verified.
+            ids = sorted({m.get("id") for m in matches if isinstance(m, dict) and m.get("id")})
+            eligible = sorted(
+                {
+                    m["id"]
+                    for m in matches
+                    if isinstance(m, dict)
+                    and m.get("id")
+                    and _resource_owner(m) == zitadel.org_id
+                    and _email_verified(m)
+                }
+            )
+            if len(ids) > 1:
+                plan["skipped"].append({"user": who, "reason": "several ZITADEL users match"})
                 continue
-            user_id, resolved_by = ids[0], "e-mail"
+            if not eligible:
+                reason = "not found in ZITADEL"
+                if ids:
+                    reason = "e-mail match is outside the Dumont organisation or not verified"
+                plan["skipped"].append({"user": who, "reason": reason})
+                continue
+            user_id, resolved_by = eligible[0], "e-mail"
         grants = grants_by_user.get(user_id, [])
         if len(grants) > 1:
             plan["skipped"].append({"user": who, "reason": "several grants for this project; fix by hand"})
@@ -210,11 +253,29 @@ def build_plan(export, zitadel, project_id, projects=None, skip_workspace=False)
                 "user_id": user_id,
                 "grant_id": grants[0].get("id"),
                 "add": missing,
+                "wanted": keys,
                 "role_keys": sorted(current | set(keys)),
                 "resolved_by": resolved_by,
             }
         )
     return plan
+
+
+def current_role_keys(zitadel, project_id, user_id, grant_id):
+    """Re-read one grant's role keys right before a PUT (the PUT replaces the whole list)."""
+    rows = zitadel.search(
+        "/management/v1/users/grants/_search",
+        [{"projectIdQuery": {"projectId": project_id}}, {"userIdQuery": {"userId": user_id}}],
+    )
+    for row in rows:
+        if isinstance(row, dict) and row.get("id") == grant_id and row.get("userId") == user_id:
+            if _grant_outside_org(row, zitadel.org_id):
+                raise BootstrapError("grant is now owned by another organisation; not touched")
+            keys = row.get("roleKeys") or []
+            if not isinstance(keys, list):
+                raise BootstrapError("grant has no roleKeys list")
+            return [key for key in keys if isinstance(key, str)]
+    raise BootstrapError("grant not found anymore; run the plan again")
 
 
 def apply_plan(plan, zitadel, project_id):
@@ -244,10 +305,17 @@ def apply_plan(plan, zitadel, project_id):
             failures.append(f"grant {grant['user']}: {exc}")
     for grant in plan["grants_to_update"]:
         try:
+            # The PUT replaces the grant's whole key list: union with what is there NOW, not with what
+            # the plan read, so a key added by someone else in the meantime is never dropped.
+            current = current_role_keys(zitadel, project_id, grant["user_id"], grant["grant_id"])
+            role_keys = sorted(set(current) | set(grant["wanted"]))
+            if role_keys == sorted(set(current)):
+                done.append(f"grant update {grant['user']} (already in place)")
+                continue
             zitadel.request(
                 "PUT",
                 f"/management/v1/users/{grant['user_id']}/grants/{grant['grant_id']}",
-                {"roleKeys": grant["role_keys"]},
+                {"roleKeys": role_keys},
             )
             done.append(f"grant update {grant['user']}")
         except BootstrapError as exc:
@@ -280,7 +348,7 @@ def main(argv=None, session=None, out=None, env=None):
     parser.add_argument("export", help="JSON from manage.py dumont_access_export")
     parser.add_argument("--zitadel-url", default=env.get("ZITADEL_URL"), help="e.g. https://auth.getdumont.ai")
     parser.add_argument("--project-id", default=env.get("DUMONT_ACCESS_ZITADEL_PROJECT_ID"))
-    parser.add_argument("--org-id", default=env.get("DUMONT_ACCESS_ZITADEL_ORG_ID"))
+    parser.add_argument("--org-id", default=env.get("DUMONT_ZITADEL_ORG_ID"))
     parser.add_argument("--projects", help="Only these project identifiers (comma separated, e.g. mo,hgr)")
     parser.add_argument("--skip-workspace", action="store_true", help="Leave the hangar.workspace.* roles alone")
     mode = parser.add_mutually_exclusive_group()
@@ -297,6 +365,10 @@ def main(argv=None, session=None, out=None, env=None):
     ]
     if missing:
         parser.error("missing " + ", ".join(missing))
+    args.org_id = args.org_id.strip()
+    # Same rule as DUMONT_ZITADEL_ORG_ID in Hangar (plane/dumont/auth/config.py): a bare id.
+    if not args.org_id or re.search(r"[:\s]", args.org_id):
+        parser.error("--org-id must be a bare ZITADEL organization id (no ':' or whitespace)")
     pat = env.get("ZITADEL_ADMIN_PAT")
     if not pat:
         parser.error("set ZITADEL_ADMIN_PAT in the environment (it is never printed)")
@@ -318,10 +390,17 @@ def main(argv=None, session=None, out=None, env=None):
             out.write("PLAN (nothing written; use --apply --yes to write)\n")
             print_plan(plan, out)
         return 0
+    if not args.json:
+        # Show exactly what is about to be written, so the operator's terminal holds the record.
+        out.write("APPLYING this plan:\n")
+        print_plan(plan, out)
     done, failures = apply_plan(plan, zitadel, args.project_id)
     if args.json:
         out.write(
-            json.dumps({"mode": "apply", "done": done, "failures": failures, "skipped": plan["skipped"]}, indent=2)
+            json.dumps(
+                {"mode": "apply", "plan": plan, "done": done, "failures": failures, "skipped": plan["skipped"]},
+                indent=2,
+            )
             + "\n"
         )
     else:

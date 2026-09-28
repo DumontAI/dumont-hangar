@@ -70,6 +70,21 @@ def _enabled(raw):
     raise BearerConfigError('DUMONT_API_BEARER_ENABLED must be "1" (on) or "0"/unset (off)')
 
 
+ORG_ID_ENV = "DUMONT_ZITADEL_ORG_ID"
+
+
+def parse_zitadel_org_id(environ):
+    """DUMONT_ZITADEL_ORG_ID as a bare id, or "" when unset. Raises BearerConfigError when malformed.
+
+    One value, one set of rules for every consumer: the bearer role gate (this module), the
+    membership sync (plane/dumont/access) and the web login org check (provider/oauth/dumont.py).
+    """
+    value = (environ.get(ORG_ID_ENV) or "").strip()
+    if value and _NOT_BARE_ID.search(value):
+        raise BearerConfigError(f"{ORG_ID_ENV} must be a bare ZITADEL organization id (no ':' or whitespace)")
+    return value
+
+
 def load_bearer_config(environ, default_rate="60/minute"):
     """Parse the DUMONT_API_BEARER_* / DUMONT_AUTH_* variables. Raises BearerConfigError when enabled but invalid."""
     enabled = _enabled(environ.get("DUMONT_API_BEARER_ENABLED"))
@@ -99,14 +114,12 @@ def load_bearer_config(environ, default_rate="60/minute"):
     if any(_NOT_BARE_ID.search(a) for a in audiences):
         raise BearerConfigError("DUMONT_API_AUDIENCES entries must be bare ZITADEL project ids (no ':' or whitespace)")
 
-    allowed_org_id = (environ.get("DUMONT_ZITADEL_ORG_ID") or "").strip()
+    allowed_org_id = parse_zitadel_org_id(environ)
     if not allowed_org_id:
         raise BearerConfigError(
             "DUMONT_ZITADEL_ORG_ID is required when DUMONT_API_BEARER_ENABLED=1 "
             "(the ZITADEL organization id whose role grants Hangar accepts)"
         )
-    if _NOT_BARE_ID.search(allowed_org_id):
-        raise BearerConfigError("DUMONT_ZITADEL_ORG_ID must be a bare ZITADEL organization id (no ':' or whitespace)")
 
     reader_role = (environ.get("DUMONT_API_READER_ROLE") or "").strip() or DEFAULT_READER_ROLE
     writer_role = (environ.get("DUMONT_API_WRITER_ROLE") or "").strip() or DEFAULT_WRITER_ROLE

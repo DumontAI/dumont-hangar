@@ -4,7 +4,9 @@
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+from plane.dumont.auth.config import ORG_ID_ENV, BearerConfigError, parse_zitadel_org_id
 
 MODE_OFF = "off"
 MODE_DRY_RUN = "dry-run"
@@ -39,8 +41,13 @@ class AccessConfig:
     base_url: str
     project_id: str | None
     org_id: str | None
-    key_source: str | None
+    # The key JSON (or a path to it): never part of repr, so it cannot leak through a log or traceback.
+    key_source: str | None = field(repr=False)
     max_removals: int
+    # A malformed DUMONT_ZITADEL_ORG_ID is reported by require_complete(), not at load time: loading
+    # must keep the mode, so that in enforce the endpoint lock fails closed (503) instead of the whole
+    # feature reading as `off`.
+    org_id_error: str | None = None
 
     @property
     def enabled(self):
@@ -52,12 +59,14 @@ class AccessConfig:
 
     def require_complete(self):
         """Raise AccessConfigError (names only, no values) when something needed for a sync is missing."""
+        if self.org_id_error:
+            raise AccessConfigError(self.org_id_error)
         missing = [
             name
             for name, value in (
                 ("DUMONT_ACCESS_WORKSPACE_SLUG", self.workspace_slug),
                 ("DUMONT_ACCESS_ZITADEL_PROJECT_ID", self.project_id),
-                ("DUMONT_ACCESS_ZITADEL_ORG_ID", self.org_id),
+                (ORG_ID_ENV, self.org_id),
                 ("DUMONT_ACCESS_ZITADEL_KEY_JSON", self.key_source),
             )
             if not value
@@ -116,12 +125,19 @@ def load_access_config(env=None):
             raise AccessConfigError("DUMONT_ACCESS_MAX_REMOVALS must be >= 0")
     else:
         max_removals = DEFAULT_MAX_REMOVALS
+    org_id_error = None
+    try:
+        # Shared with the bearer auth and the web login check: one value, one set of rules.
+        org_id = parse_zitadel_org_id(env) or None
+    except BearerConfigError as exc:
+        org_id, org_id_error = None, str(exc)
     return AccessConfig(
+        org_id_error=org_id_error,
         mode=mode,
         workspace_slug=(env.get("DUMONT_ACCESS_WORKSPACE_SLUG") or "").strip() or None,
         base_url=(env.get("DUMONT_AUTH_HOST") or DEFAULT_AUTH_HOST).strip().rstrip("/"),
         project_id=(env.get("DUMONT_ACCESS_ZITADEL_PROJECT_ID") or "").strip() or None,
-        org_id=(env.get("DUMONT_ACCESS_ZITADEL_ORG_ID") or "").strip() or None,
+        org_id=org_id,
         key_source=env.get("DUMONT_ACCESS_ZITADEL_KEY_JSON") or None,
         max_removals=max_removals,
     )

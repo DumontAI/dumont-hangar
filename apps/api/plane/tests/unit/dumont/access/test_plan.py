@@ -493,6 +493,122 @@ class TestPerUser:
 
 
 @pytest.mark.unit
+class TestAdditiveOnly:
+    """The per-user sync (login / bearer hooks) never removes or reduces access."""
+
+    def test_removals_and_demotions_are_deferred(self):
+        plan = compute_plan(
+            snap(
+                role_keys=ALL_WS_ROLES | MO_ROLES,
+                grants=[g("a", "hangar.workspace.guest")],
+                users=[user("a"), user("b")],
+                ws={"a": active(15), "b": active(20)},
+                projects_members={"p-mo": {"a": active(15), "b": active(20)}},
+                only={"a"},
+            ),
+            additive_only=True,
+        )
+        assert plan.changes == []
+        assert sorted((c.label, c.action, c.to_role) for c in plan.deferred) == [
+            ("MO", DEACTIVATE, None),
+            ("workspace", UPDATE_ROLE, 5),
+        ]
+
+    def test_additions_are_kept(self):
+        plan = compute_plan(
+            snap(
+                role_keys=ALL_WS_ROLES | MO_ROLES,
+                grants=[g("a", "hangar.workspace.admin", "hangar.project.mo.member")],
+                users=[user("a")],
+                ws={"a": active(15)},
+                projects_members={"p-mo": {"a": inactive(5)}},
+                only={"a"},
+            ),
+            additive_only=True,
+        )
+        assert summary(plan) == [("MO", "a", REACTIVATE, 15), ("workspace", "a", UPDATE_ROLE, 20)]
+        assert plan.deferred == []
+
+    def test_never_cascades(self):
+        plan = compute_plan(
+            snap(
+                role_keys=ALL_WS_ROLES,
+                grants=[g("x", "hangar.workspace.admin")],
+                users=[user("a"), user("x")],
+                ws={"a": active(15), "x": active(20)},
+                projects_members={"p-ops": {"a": active(15)}},
+                only={"a"},
+            ),
+            additive_only=True,
+        )
+        assert plan.changes == [] and plan.cascaded == []
+        assert [(c.label, c.action) for c in plan.deferred] == [("workspace", DEACTIVATE)]
+
+    def test_no_project_role_on_a_workspace_membership_about_to_go(self):
+        # a has an MO grant but no workspace grant any more: the full sync removes the workspace row,
+        # so the per-user sync must not create the MO row on top of it.
+        plan = compute_plan(
+            snap(
+                role_keys=ALL_WS_ROLES | MO_ROLES,
+                grants=[g("a", "hangar.project.mo.member"), g("x", "hangar.workspace.admin")],
+                users=[user("a"), user("x")],
+                ws={"a": active(15), "x": active(20)},
+                only={"a"},
+            ),
+            additive_only=True,
+        )
+        assert plan.changes == []
+        assert [(c.label, c.action) for c in plan.deferred] == [("workspace", DEACTIVATE)]
+
+
+@pytest.mark.unit
+class TestUsersLosingAccess:
+    def test_counts_people_not_rows(self):
+        plan = compute_plan(
+            snap(
+                role_keys=ALL_WS_ROLES | MO_ROLES,
+                grants=[g("x", "hangar.workspace.admin", "hangar.project.mo.admin"), g("b", "hangar.workspace.guest")],
+                users=[user("a"), user("b"), user("x")],
+                ws={"a": active(15), "b": active(15), "x": active(20)},
+                projects_members={
+                    "p-mo": {"a": active(15), "x": active(20)},
+                    "p-ops": {"a": active(15), "b": active(15)},
+                    "p-hgr": {"a": active(15)},
+                },
+            )
+        )
+        # a: workspace + MO + OPS + HGR rows (cascade included); b: demoted to guest (+ OPS capped)
+        assert len(plan.deactivations) == 4
+        assert plan.users_losing_access == ["a", "b"]
+        assert {c.label for c in plan.cascaded} == {"OPS", "HGR"}
+
+
+@pytest.mark.unit
+class TestIdentifiers:
+    def test_collision_leaves_both_projects_unmanaged(self):
+        mo_upper = ProjectRef(id="p-mo-1", identifier="MO")
+        mo_space = ProjectRef(id="p-mo-2", identifier="MO ")
+        plan = compute_plan(
+            snap(
+                role_keys=MO_ROLES,
+                grants=[g("a", "hangar.project.mo.admin")],
+                users=[user("a")],
+                projects=(mo_upper, mo_space, OPS),
+                projects_members={"p-mo-1": {"b": active(15)}},
+            )
+        )
+        assert plan.managed_projects == {} and plan.changes == []
+        assert plan.identifier_collisions == [{"key_part": "mo", "identifiers": ["MO", "MO "]}]
+        assert ("identifier_collision", None, "mo") in kinds(plan)
+        assert plan.unknown_project_roles == []  # the part has projects; it is just ambiguous
+
+    def test_look_alike_identifier_is_not_managed(self):
+        kelvin = ProjectRef(id="p-k", identifier="KMO")  # KELVIN SIGN lowercases to ASCII "k"
+        plan = compute_plan(snap(role_keys={"hangar.project.kmo.admin"}, projects=(kelvin,), users=[user("a")]))
+        assert plan.managed_projects == {} and plan.unknown_project_roles == ["kmo"]
+
+
+@pytest.mark.unit
 def test_change_as_dict_is_readable():
     plan = compute_plan(snap(role_keys=ALL_WS_ROLES, grants=[g("a", "hangar.workspace.admin")], users=[user("a")]))
     as_dict = plan.changes[0].as_dict({"a": user("a")})

@@ -109,8 +109,51 @@ class TestZitadelClient:
         assert chunks == [Z.USER_IDS_PER_QUERY, 5]
 
     def test_no_grants_no_user_lookup(self, client, fake_zitadel):
+        # an explicit "result": [] is the only way to say "nothing"
         assert client.list_user_grants(PROJECT_ID) == []
         assert fake_zitadel.api_calls("users/_search") == []
+
+    @pytest.mark.parametrize("path", ["roles", "grants", "users/_search"])
+    def test_answer_without_result_is_an_error(self, client, fake_zitadel, path):
+        fake_zitadel.roles = ["hangar.workspace.member"]
+        fake_zitadel.grant("a", "hangar.workspace.member")
+        fake_zitadel.drop_result_on = path
+        with pytest.raises(Z.ZitadelError) as exc:
+            client.list_project_role_keys(PROJECT_ID)
+            client.list_user_grants(PROJECT_ID)
+        assert "no 'result'" in str(exc.value)
+
+    def test_short_page_with_total_keeps_paging(self, client, fake_zitadel):
+        # the server hands out 30 rows per page although we asked for 100; totalResult says 75
+        fake_zitadel.page_cap = 30
+        fake_zitadel.roles = [f"hangar.project.p{i}.member" for i in range(75)]
+        assert len(client.list_project_role_keys(PROJECT_ID)) == 75
+        offsets = [call[2]["query"]["offset"] for call in fake_zitadel.api_calls("roles")]
+        assert offsets == ["0", "30", "60"]
+
+    def test_empty_page_before_total_is_an_error(self, client, fake_zitadel):
+        # 150 grants exist (totalResult 150) but the server stops handing rows out after 100
+        for i in range(150):
+            fake_zitadel.grant(f"u{i:03d}", "hangar.workspace.member")
+        fake_zitadel.truncate_after = 100
+        with pytest.raises(Z.ZitadelError) as exc:
+            client.list_user_grants(PROJECT_ID)
+        assert "empty page at offset 100 of totalResult 150" in str(exc.value)
+
+    def test_filtered_200_on_users_search_is_an_error(self, client, fake_zitadel):
+        # a permission that filters users/_search answers 200 with no rows: every grant would look
+        # like it belongs to another org, i.e. "everyone lost access". Fail safe instead.
+        fake_zitadel.grant("a", "hangar.workspace.member")
+        fake_zitadel.grant("b", "hangar.workspace.admin")
+        fake_zitadel.filter_users = True
+        with pytest.raises(Z.ZitadelError) as exc:
+            client.list_user_grants(PROJECT_ID)
+        assert "permission too narrow" in str(exc.value)
+
+    def test_user_ids_in_org_itself_does_not_fail_on_empty(self, client, fake_zitadel):
+        # the per-user sync asks "is this login sub in the org?"; "no" is an answer, not an error
+        fake_zitadel.org_users["x"] = "999"
+        assert client.user_ids_in_org(["x"]) == set()
 
     @pytest.mark.parametrize("failure", [500, 403, 404, "timeout", "badjson"])
     def test_failures_raise_zitadel_error(self, client, fake_zitadel, failure):

@@ -16,7 +16,13 @@
 #   guest in projects (Plane invariant).
 # - Deactivating a workspace membership also deactivates the user's project memberships in that
 #   workspace, like Plane's own "remove member" does, so a removed user keeps no project access.
+#   This cascade reaches unmanaged projects, so it only ever happens in a full sync (never per user).
 # - Never leave a scope without an admin: removals/demotions that would do so are dropped.
+# - Two Plane projects whose identifiers map to the same role-key part are both left unmanaged and
+#   reported (`identifier_collision`); the endpoint lock still covers them when that part has roles.
+# - `additive_only` (the per-user sync on login / bearer calls) keeps only changes that add access
+#   (create, reactivate, role upgrade). Removals and demotions are reported as deferred and left to
+#   the full sync, which has the safety brake.
 
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -115,14 +121,26 @@ class Plan:
     unknown_project_roles: list = field(default_factory=list)  # identifiers with roles but no project
     invalid_role_keys: list = field(default_factory=list)
     changes: list = field(default_factory=list)
+    # additive_only: removals/demotions left for the full sync (never written by this plan)
+    deferred: list = field(default_factory=list)
     pending: list = field(default_factory=list)
     notes: list = field(default_factory=list)
+    identifier_collisions: list = field(default_factory=list)
     # grants dropped at the ZITADEL organisation boundary (set by the sync, not by compute_plan)
     ignored_grants: list = field(default_factory=list)
 
     @property
     def deactivations(self):
         return [change for change in self.changes if change.action == DEACTIVATE]
+
+    @property
+    def cascaded(self):
+        return [change for change in self.changes if change.cascade]
+
+    @property
+    def users_losing_access(self):
+        """Distinct Plane users this plan deactivates or demotes anywhere (what the safety brake counts)."""
+        return sorted({change.user_id for change in self.changes if reduces_access(change)})
 
     def note(self, kind, user_id=None, scope=None, **detail):
         entry = {"kind": kind}
@@ -132,6 +150,13 @@ class Plan:
             entry["scope"] = scope
         entry.update(detail)
         self.notes.append(entry)
+
+
+def reduces_access(change):
+    """A deactivation or a role downgrade. Creates, reactivations and upgrades only add access."""
+    if change.action == DEACTIVATE:
+        return True
+    return change.action == UPDATE_ROLE and (change.to_role or 0) < (change.from_role or 0)
 
 
 def managed_scopes(role_keys, project_identifiers):
@@ -154,14 +179,25 @@ def managed_scopes(role_keys, project_identifiers):
     return workspace_managed, sorted(with_roles & known), sorted(with_roles - known), invalid
 
 
-def compute_plan(snapshot):
+def compute_plan(snapshot, additive_only=False):
     plan = Plan()
-    projects_by_part = {}
+    projects_with_part = defaultdict(list)
     for project in snapshot.projects:
         part = project.key_part
         if part:
-            projects_by_part[part] = project
-    workspace_managed, managed_parts, unknown, invalid = managed_scopes(snapshot.role_keys, projects_by_part)
+            projects_with_part[part].append(project)
+    collisions = {
+        part: sorted(project.identifier for project in projects)
+        for part, projects in projects_with_part.items()
+        if len(projects) > 1
+    }
+    for part, identifiers in sorted(collisions.items()):
+        plan.identifier_collisions.append({"key_part": part, "identifiers": identifiers})
+        plan.note("identifier_collision", scope=part, identifiers=identifiers)
+    projects_by_part = {part: projects[0] for part, projects in projects_with_part.items() if part not in collisions}
+    workspace_managed, managed_parts, unknown, invalid = managed_scopes(snapshot.role_keys, set(projects_with_part))
+    # A part shared by two projects cannot say which one a role means: neither is managed.
+    managed_parts = [part for part in managed_parts if part not in collisions]
     plan.managed_workspace = workspace_managed
     plan.managed_identifiers = managed_parts
     plan.unknown_project_roles = unknown
@@ -223,8 +259,15 @@ def compute_plan(snapshot):
         plan.changes.extend(_keep_an_admin(plan, PROJECT, project.identifier, actual, changes))
 
     # --- cascade of workspace removals / demotions into unmanaged projects --------------------
-    if workspace_managed:
+    # Full sync only: it reaches projects ZITADEL does not manage, so it stays behind the brake.
+    if workspace_managed and not additive_only:
         plan.changes.extend(_cascade(plan, snapshot, ws_changes, managed_project_ids, project_by_id))
+
+    if additive_only:
+        # Everything above was planned as if the whole plan applied (so a project role is never granted
+        # on a workspace membership that the full sync is about to remove); only the additions are kept.
+        plan.deferred = [change for change in plan.changes if reduces_access(change)]
+        plan.changes = [change for change in plan.changes if not reduces_access(change)]
     return plan
 
 

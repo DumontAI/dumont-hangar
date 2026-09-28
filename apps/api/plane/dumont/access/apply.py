@@ -5,6 +5,9 @@
 # SELECT ... FOR UPDATE and must still be in the state the plan saw; otherwise that change is
 # skipped as "stale" (someone changed it meanwhile; the next sync re-plans). Rows are never
 # hard-deleted: removal is is_active=False, exactly like Plane's own "remove member".
+# Within a scope, additions run before removals, and removing/demoting an admin locks the scope's
+# other active admin rows and is skipped as stale when none is left (the plan's last-admin rule,
+# re-checked at write time).
 
 import logging
 from collections import OrderedDict
@@ -13,7 +16,16 @@ from django.db import DatabaseError, transaction
 from django.db.models import Min
 
 from plane.db.models import Project, ProjectMember, ProjectUserProperty, WorkspaceMember
-from plane.dumont.access.plan import CREATE, DEACTIVATE, PROJECT, REACTIVATE, UPDATE_ROLE, WORKSPACE
+from plane.dumont.access.plan import (
+    CREATE,
+    DEACTIVATE,
+    PROJECT,
+    REACTIVATE,
+    UPDATE_ROLE,
+    WORKSPACE,
+    reduces_access,
+)
+from plane.dumont.access.roles import ADMIN
 
 logger = logging.getLogger("plane.dumont.access")
 
@@ -28,6 +40,10 @@ def apply_plan(plan, workspace):
     groups = OrderedDict()
     for change in plan.changes:
         groups.setdefault((change.scope, change.scope_id), []).append(change)
+    for key, changes in groups.items():
+        # Additions first, so a new admin exists before an old one is removed (the last-admin check
+        # below looks at the rows as they are at that moment). sorted() is stable.
+        groups[key] = sorted(changes, key=lambda change: 1 if reduces_access(change) else 0)
     ordered = sorted(groups.items(), key=lambda item: 0 if item[0][0] == WORKSPACE else 1)
 
     workspace_failed = False
@@ -73,11 +89,27 @@ def _check(row, change):
         raise _Stale("row changed since the plan was made")
 
 
+def _keeps_an_admin(change, other_admins):
+    """Last-admin rule, re-checked under row locks: the plan saw another admin, but it may have been
+    removed since (by hand or by a concurrent run). `other_admins` is a queryset of the scope's
+    active admin rows except this user's; they are locked, so none can disappear before commit."""
+    if change.from_role != ADMIN or not (change.action == DEACTIVATE or (change.to_role or 0) < ADMIN):
+        return
+    if not list(other_admins.select_for_update().values_list("id", flat=True)):
+        raise _Stale("would leave the scope without an active admin")
+
+
 def _apply_workspace_change(change, workspace):
     row = (
         WorkspaceMember.objects.select_for_update().filter(workspace_id=workspace.id, member_id=change.user_id).first()
     )
     _check(row, change)
+    _keeps_an_admin(
+        change,
+        WorkspaceMember.objects.filter(workspace_id=workspace.id, role=ADMIN, is_active=True).exclude(
+            member_id=change.user_id
+        ),
+    )
     if change.action == CREATE:
         WorkspaceMember(workspace_id=workspace.id, member_id=change.user_id, role=change.to_role).save(
             disable_auto_set_user=True
@@ -97,6 +129,12 @@ def _apply_workspace_change(change, workspace):
 def _apply_project_change(change):
     row = ProjectMember.objects.select_for_update().filter(project_id=change.scope_id, member_id=change.user_id).first()
     _check(row, change)
+    _keeps_an_admin(
+        change,
+        ProjectMember.objects.filter(
+            project_id=change.scope_id, role=ADMIN, is_active=True, member__isnull=False
+        ).exclude(member_id=change.user_id),
+    )
     if change.action == CREATE:
         _create_project_member(change.scope_id, change.user_id, change.to_role)
     elif change.action == REACTIVATE:

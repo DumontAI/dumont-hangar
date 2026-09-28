@@ -25,7 +25,8 @@ WORKSPACE_MANAGED_MARKER = "hangar.workspace.member"
 
 # Plane uppercases identifiers and forbids ".", so a lowercase identifier can never contain the
 # separator. We only accept plain ASCII identifiers in role keys, to keep the keys unambiguous.
-_IDENTIFIER_RE = re.compile(r"^[a-z0-9_]{1,12}$")
+# Always used with fullmatch: `$` would also accept a trailing newline.
+_IDENTIFIER_RE = re.compile(r"[a-z0-9_]{1,12}")
 
 
 @dataclass(frozen=True)
@@ -48,10 +49,14 @@ def role_key(scope, identifier, role):
 
 def identifier_to_key_part(identifier):
     """Plane project identifier -> the part used in role keys, or None when it cannot be expressed."""
-    if not identifier:
+    if not identifier or not isinstance(identifier, str):
+        return None
+    # ASCII check BEFORE lowercasing: str.lower() maps some non-ASCII letters onto ASCII ones
+    # (the Kelvin sign "K" -> "k"), which would let a look-alike identifier take over a role key.
+    if not identifier.isascii():
         return None
     part = identifier.strip().lower()
-    return part if _IDENTIFIER_RE.match(part) else None
+    return part if _IDENTIFIER_RE.fullmatch(part) else None
 
 
 def parse_role_key(key):
@@ -66,7 +71,7 @@ def parse_role_key(key):
     if len(parts) == 3 and parts[1] == WORKSPACE_SCOPE and parts[2] in ROLE_BY_NAME:
         return RoleKey(WORKSPACE_SCOPE, None, ROLE_BY_NAME[parts[2]])
     if len(parts) == 4 and parts[1] == PROJECT_SCOPE and parts[3] in ROLE_BY_NAME:
-        if _IDENTIFIER_RE.match(parts[2]):
+        if _IDENTIFIER_RE.fullmatch(parts[2]):
             return RoleKey(PROJECT_SCOPE, parts[2], ROLE_BY_NAME[parts[3]])
     return None
 

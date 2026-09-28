@@ -141,6 +141,21 @@ class TestSyncCommand:
             call_command("dumont_access_sync", stdout=io.StringIO())
         assert exc.value.returncode == 2
 
+    def test_max_removals_flag_overrides_the_brake_once(self, plane_world, fake_zitadel, monkeypatch):
+        plane_world["set_mode"]("enforce")
+        monkeypatch.setenv("DUMONT_ACCESS_MAX_REMOVALS", "0")
+        fake_zitadel.roles = ["hangar.workspace.member", "hangar.workspace.admin"]
+        fake_zitadel.grant("sub-owner", "hangar.workspace.admin")
+        out = io.StringIO()
+        call_command("dumont_access_sync", "--mode", "dry-run", stdout=out)
+        losing = int(out.getvalue().count("deactivate"))
+        assert losing >= 1
+        call_command("dumont_access_sync", "--max-removals", "50", "--json", stdout=(out := io.StringIO()))
+        assert json.loads(out.getvalue())["status"] == "applied"
+        with pytest.raises(CommandError) as exc:
+            call_command("dumont_access_sync", "--max-removals", "-1", stdout=io.StringIO())
+        assert exc.value.returncode == 1
+
     def test_enforce_refused_when_env_not_enforce(self, plane_world, fake_zitadel):
         with pytest.raises(CommandError):
             call_command("dumont_access_sync", "--mode", "enforce", stdout=io.StringIO())
@@ -254,6 +269,92 @@ class TestBootstrapScript:
         assert "sub-owner" in [g["user_id"] for g in plan["grants_to_create"]]
         user_searches = [c for c in fake_zitadel.api_calls("users/_search") if "inUserIdsQuery" in str(c[2])]
         assert user_searches, "linked users must be checked against the org"
+
+    @pytest.mark.parametrize(
+        "kwargs,reason",
+        [
+            ({"verified": False}, "e-mail match is outside the Dumont organisation or not verified"),
+            (
+                {"org": "999999999999999999", "leak": True},
+                "e-mail match is outside the Dumont organisation or not verified",
+            ),
+        ],
+    )
+    def test_email_match_needs_verified_email_in_the_org(
+        self, plane_world, fake_zitadel, bootstrap, tmp_path, kwargs, reason
+    ):
+        fake_zitadel.issued.add(PAT)
+        fake_zitadel.add_user("zitadel-legacy", "legacy@example.test", **kwargs)
+        export_path, _ = _export(tmp_path)
+        code, text = _run_script(bootstrap, fake_zitadel, export_path, "--json")
+        plan = json.loads(text)
+        assert {"user": "legacy@example.test", "reason": reason} in plan["skipped"]
+        assert all(g["user_id"] != "zitadel-legacy" for g in plan["grants_to_create"])
+
+    def test_apply_prints_the_plan_first(self, plane_world, fake_zitadel, bootstrap, tmp_path):
+        fake_zitadel.issued.add(PAT)
+        export_path, _ = _export(tmp_path)
+        code, text = _run_script(bootstrap, fake_zitadel, export_path, "--apply", "--yes")
+        assert code == 0, text
+        assert text.index("APPLYING this plan:") < text.index("roles to create") < text.index("APPLIED")
+
+    def test_update_rereads_the_grant_right_before_writing(
+        self, plane_world, fake_zitadel, bootstrap, tmp_path, monkeypatch
+    ):
+        fake_zitadel.issued.add(PAT)
+        fake_zitadel.roles = ["hangar_reader", "hangar_writer"]
+        row = fake_zitadel.grant("sub-linked", "hangar_reader")
+        export_path, _ = _export(tmp_path)
+        real_apply = bootstrap.apply_plan
+
+        def racing_apply(plan, zitadel, project_id):
+            row["roleKeys"].append("hangar_writer")  # someone adds a key after the plan was read
+            return real_apply(plan, zitadel, project_id)
+
+        monkeypatch.setattr(bootstrap, "apply_plan", racing_apply)
+        code, text = _run_script(bootstrap, fake_zitadel, export_path, "--apply", "--yes")
+        assert code == 0, text
+        assert set(row["roleKeys"]) == {
+            "hangar_reader",
+            "hangar_writer",
+            "hangar.workspace.member",
+            "hangar.project.mo.member",
+        }
+
+    @pytest.mark.parametrize(
+        "attr,value,message", [("drop_result_on", "roles", "no 'result'"), ("truncate_after", 0, "empty page")]
+    )
+    def test_incomplete_answers_are_errors(self, plane_world, fake_zitadel, bootstrap, tmp_path, attr, value, message):
+        fake_zitadel.issued.add(PAT)
+        fake_zitadel.roles = ["hangar_reader"]
+        setattr(fake_zitadel, attr, value)
+        export_path, _ = _export(tmp_path)
+        code, text = _run_script(bootstrap, fake_zitadel, export_path)
+        assert code == 1 and message in text
+        assert fake_zitadel.writes == []
+
+    @pytest.mark.parametrize("org", ["2000:1", "2000 1"])
+    def test_org_id_must_be_bare(self, plane_world, fake_zitadel, bootstrap, tmp_path, org):
+        export_path, _ = _export(tmp_path)
+        with pytest.raises(SystemExit):
+            bootstrap.main(
+                [str(export_path), "--zitadel-url", BASE_URL, "--project-id", PROJECT_ID, "--org-id", org],
+                session=_session_for(fake_zitadel),
+                out=io.StringIO(),
+                env={"ZITADEL_ADMIN_PAT": PAT},
+            )
+        assert fake_zitadel.calls == []
+
+    def test_org_id_defaults_to_the_shared_variable(self, plane_world, fake_zitadel, bootstrap, tmp_path):
+        fake_zitadel.issued.add(PAT)
+        export_path, _ = _export(tmp_path)
+        code = bootstrap.main(
+            [str(export_path), "--zitadel-url", BASE_URL, "--project-id", PROJECT_ID],
+            session=_session_for(fake_zitadel),
+            out=io.StringIO(),
+            env={"ZITADEL_ADMIN_PAT": PAT, "DUMONT_ZITADEL_ORG_ID": ORG_ID},
+        )
+        assert code == 0
 
     def test_zitadel_error_is_reported_without_pat(self, plane_world, fake_zitadel, bootstrap, tmp_path):
         export_path, _ = _export(tmp_path)

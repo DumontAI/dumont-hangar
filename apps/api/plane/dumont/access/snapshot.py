@@ -19,6 +19,19 @@ def load_workspace(slug):
     return workspace
 
 
+def dumont_subs_of(user):
+    """Every ZITADEL user id linked to this Plane user (a user can have several Dumont accounts)."""
+    return sorted(
+        {
+            sub
+            for sub in Account.objects.filter(provider=DUMONT_PROVIDER, user_id=user.id).values_list(
+                "provider_account_id", flat=True
+            )
+            if sub
+        }
+    )
+
+
 def build_snapshot(workspace, role_keys, zitadel_grants, only_user_ids=None):
     """Assemble the Snapshot for `workspace`.
 

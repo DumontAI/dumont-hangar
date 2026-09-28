@@ -3,10 +3,16 @@
 #
 # Fail safe everywhere: if the configuration is incomplete, ZITADEL is unreachable or answers an
 # error, nothing is written and the previous state stays. The full sync in enforce mode also has a
-# safety brake: when it would deactivate more than DUMONT_ACCESS_MAX_REMOVALS memberships it writes
-# nothing and logs loudly, because that pattern is far more likely a ZITADEL-side mistake (wrong
-# project id, a lost permission, an empty answer) than a real mass revocation.
+# safety brake: when more than DUMONT_ACCESS_MAX_REMOVALS distinct users would lose or reduce access
+# it writes nothing and logs loudly, because that pattern is far more likely a ZITADEL-side mistake
+# (wrong project id, a lost permission, an empty answer) than a real mass revocation.
+#
+# The per-user sync (login and bearer hooks) only ADDS access: create, reactivate, role upgrade.
+# Removals and demotions are reported as `deferred_to_full_sync` and left to the full sync, so no
+# single request can take access away without passing the brake. After any ZITADEL error the hooks
+# back off for ZITADEL_BACKOFF_TTL seconds, so an outage does not add a slow call to every request.
 
+import dataclasses
 import hashlib
 import logging
 import time
@@ -17,7 +23,7 @@ from plane.dumont.access import roles as R
 from plane.dumont.access.apply import apply_plan
 from plane.dumont.access.config import MODE_DRY_RUN, MODE_ENFORCE, MODE_OFF, AccessConfigError, load_access_config
 from plane.dumont.access.plan import compute_plan, managed_scopes
-from plane.dumont.access.snapshot import WorkspaceNotFound, build_snapshot, load_workspace
+from plane.dumont.access.snapshot import WorkspaceNotFound, build_snapshot, dumont_subs_of, load_workspace
 from plane.dumont.access.zitadel import ZitadelClient, ZitadelError
 
 logger = logging.getLogger("plane.dumont.access")
@@ -28,6 +34,8 @@ MANAGED_STATE_TTL = 60 * 60
 FULL_SYNC_LOCK_KEY = CACHE_PREFIX + "full_sync_lock"
 FULL_SYNC_LOCK_TTL = 4 * 60
 USER_SYNC_TTL = 60
+ZITADEL_BACKOFF_KEY = CACHE_PREFIX + "zitadel_backoff"
+ZITADEL_BACKOFF_TTL = 60
 
 STATUS_OFF = "off"
 STATUS_DRY_RUN = "dry_run"
@@ -35,6 +43,7 @@ STATUS_APPLIED = "applied"
 STATUS_BRAKE = "aborted_brake"
 STATUS_ERROR = "error"
 STATUS_BUSY = "busy"
+STATUS_SKIPPED = "skipped"
 
 
 def make_client(cfg):
@@ -43,6 +52,19 @@ def make_client(cfg):
 
 def user_sync_cache_key(sub):
     return CACHE_PREFIX + "user_sync:" + hashlib.sha256(sub.encode("utf-8")).hexdigest()[:32]
+
+
+def start_zitadel_backoff():
+    """After a ZitadelError: the per-user hooks skip ZITADEL for ZITADEL_BACKOFF_TTL seconds."""
+    try:
+        cache.set(ZITADEL_BACKOFF_KEY, 1, ZITADEL_BACKOFF_TTL)
+    except Exception:
+        logger.warning("dumont access: could not store the ZITADEL backoff flag in the cache")
+
+
+def zitadel_backoff_active():
+    """True while the backoff flag is set. Raises when the cache is unreachable (callers skip then)."""
+    return bool(cache.get(ZITADEL_BACKOFF_KEY))
 
 
 # --- managed state (used by the endpoint lock) ------------------------------------------------
@@ -104,14 +126,22 @@ def _report(status, mode, scope, plan=None, snapshot=None, result=None, error=No
                     "projects": sorted(plan.managed_projects.values()),
                 },
                 "changes": [change.as_dict(users) for change in plan.changes],
+                # Cascaded rows (unmanaged projects included) are also in `changes`; listed apart
+                # because they are not reverted automatically if the removal was a mistake.
+                "cascaded": [change.as_dict(users) for change in plan.cascaded],
+                "deferred_to_full_sync": [change.as_dict(users) for change in plan.deferred],
                 "pending": plan.pending,
                 "notes": plan.notes,
                 "unknown_project_roles": plan.unknown_project_roles,
                 "invalid_role_keys": plan.invalid_role_keys,
+                "identifier_collisions": plan.identifier_collisions,
                 "ignored_grants": plan.ignored_grants,
                 "counts": {
                     "changes": len(plan.changes),
                     "deactivations": len(plan.deactivations),
+                    "users_losing_access": len(plan.users_losing_access),
+                    "cascaded": len(plan.cascaded),
+                    "deferred_to_full_sync": len(plan.deferred),
                     "pending": len(plan.pending),
                     "ignored_grants": len(plan.ignored_grants),
                 },
@@ -125,12 +155,12 @@ def _report(status, mode, scope, plan=None, snapshot=None, result=None, error=No
     return report
 
 
-def _ignored_grants(client):
-    """Grants the client dropped at the ZITADEL organisation boundary; logged as a warning (ids only)."""
-    ignored = list(getattr(client, "ignored_grants", None) or [])
+def _ignored_grants(client=None, ignored=None):
+    """Grants dropped at the ZITADEL organisation boundary; logged as a warning (ids only)."""
+    ignored = list(ignored if ignored is not None else (getattr(client, "ignored_grants", None) or []))
     if ignored:
         logger.warning(
-            "dumont access: ignored %d grant(s) outside the Dumont organisation (DUMONT_ACCESS_ZITADEL_ORG_ID): %s",
+            "dumont access: ignored %d grant(s) outside the Dumont organisation (DUMONT_ZITADEL_ORG_ID): %s",
             len(ignored),
             ignored[:50],
         )
@@ -151,6 +181,23 @@ def _log_plan(report):
         len(report.get("pending", [])),
         changes[:200],
     )
+
+
+def _log_cascade(changes, outcome):
+    """One WARNING per cascaded row (project identifier + user id), so a mistaken removal can be undone
+    by hand from the log: the cascade into unmanaged projects is not reverted automatically."""
+    for change in changes:
+        if change.cascade:
+            logger.warning(
+                "dumont access: cascade %s: %s project=%s project_id=%s user_id=%s role %s->%s",
+                outcome,
+                change.action,
+                change.label,
+                change.scope_id,
+                change.user_id,
+                R.role_name(change.from_role) if change.from_role is not None else "-",
+                R.role_name(change.to_role) if change.to_role is not None else "-",
+            )
 
 
 def _invalidate_plane_caches(slug):
@@ -178,11 +225,19 @@ def _resolve_mode(cfg, mode):
     return mode
 
 
-def run_full_sync(mode=None):
-    """Full reconciliation of the configured workspace. Never raises; returns a report dict."""
+def run_full_sync(mode=None, max_removals=None):
+    """Full reconciliation of the configured workspace. Never raises; returns a report dict.
+
+    `max_removals` overrides DUMONT_ACCESS_MAX_REMOVALS for this run only (the manual command's
+    --max-removals, after a dry-run confirmed the removals are real).
+    """
     try:
         cfg = load_access_config()
         mode = _resolve_mode(cfg, mode)
+        if max_removals is not None:
+            if isinstance(max_removals, bool) or not isinstance(max_removals, int) or max_removals < 0:
+                raise AccessConfigError("max_removals must be an integer >= 0")
+            cfg = dataclasses.replace(cfg, max_removals=max_removals)
     except AccessConfigError as exc:
         logger.error("dumont access: configuration error: %s", exc)
         return _report(STATUS_ERROR, mode or "?", "full", error=str(exc))
@@ -215,6 +270,8 @@ def _full_sync(cfg, mode):
         role_keys = client.list_project_role_keys(cfg.project_id)
         grants = client.list_user_grants(cfg.project_id)
     except (AccessConfigError, WorkspaceNotFound, ZitadelError) as exc:
+        if isinstance(exc, ZitadelError):
+            start_zitadel_backoff()
         logger.error("dumont access: full sync changed nothing: %s", exc)
         return _report(STATUS_ERROR, mode, "full", error=str(exc))
 
@@ -224,19 +281,24 @@ def _full_sync(cfg, mode):
     plan.ignored_grants = _ignored_grants(client)
 
     if mode == MODE_DRY_RUN:
+        _log_cascade(plan.changes, "planned (dry-run, not written)")
         report = _report(STATUS_DRY_RUN, mode, "full", plan, snapshot)
         _log_plan(report)
         return report
 
-    removals = len(plan.deactivations)
-    if removals > cfg.max_removals:
+    # The brake counts PEOPLE losing or reducing access (deactivation or downgrade, cascades
+    # included), not rows: one removed user with ten project rows is one decision.
+    losing = plan.users_losing_access
+    if len(losing) > cfg.max_removals:
         logger.critical(
-            "dumont access: SAFETY BRAKE - full sync would deactivate %d memberships (limit %d, "
+            "dumont access: SAFETY BRAKE - full sync would remove or reduce the access of %d users (limit %d, "
             "DUMONT_ACCESS_MAX_REMOVALS); nothing was written. Check the ZITADEL project/grants, then run "
-            "`manage.py dumont_access_sync --mode dry-run` to review.",
-            removals,
+            "`manage.py dumont_access_sync --mode dry-run` to review; if the removals are real, run once with "
+            "`--max-removals N`.",
+            len(losing),
             cfg.max_removals,
         )
+        _log_cascade(plan.changes, "planned (brake, not written)")
         report = _report(STATUS_BRAKE, mode, "full", plan, snapshot, max_removals=cfg.max_removals)
         _log_plan(report)
         return report
@@ -244,6 +306,7 @@ def _full_sync(cfg, mode):
     result = apply_plan(plan, workspace)
     if result["applied"]:
         _invalidate_plane_caches(workspace.slug)
+    _log_cascade(result["applied"], "applied")
     report = _report(STATUS_APPLIED, mode, "full", plan, snapshot, result)
     _log_plan(report)
     return report
@@ -272,22 +335,44 @@ def _user_sync(cfg, mode, user, sub):
     try:
         cfg.require_complete()
         workspace = load_workspace(cfg.workspace_slug)
+        # A Plane user can have several Dumont accounts (one per ZITADEL user that signed in with the
+        # same verified e-mail). Grants of all of them count, like in the full sync; looking only at
+        # the login sub would read "no grants" and plan the removal of everything the others grant.
+        subs = dumont_subs_of(user)
+        if sub not in subs:
+            logger.error("dumont access: the login sub is not linked to this Plane user; per-user sync skipped")
+            return _report(STATUS_ERROR, mode, "user", error="sub not linked to this user")
         client = make_client(cfg)
         role_keys = client.list_project_role_keys(cfg.project_id)
-        grants = client.list_user_grants(cfg.project_id, user_id=sub)
+        in_org = client.user_ids_in_org(subs)
+        if sub not in in_org:
+            # Signed in with a ZITADEL user of another organisation: that login proves nothing about
+            # Dumont access, so it changes nothing (the web login refuses such users when
+            # DUMONT_ZITADEL_ORG_ID is set; this also covers the bearer path and older sessions).
+            logger.warning("dumont access: login sub is not a user of the Dumont organisation; per-user sync skipped")
+            return _report(STATUS_SKIPPED, mode, "user", error="login sub outside the Dumont organisation")
+        grants = []
+        ignored = [{"user_id": other, "reason": "user_outside_org"} for other in subs if other not in in_org]
+        for linked_sub in sorted(in_org):
+            # Only grants of this ZITADEL user (the client filters too).
+            grants.extend(
+                g for g in client.list_user_grants(cfg.project_id, user_id=linked_sub) if g.user_id == linked_sub
+            )
+            ignored.extend(item for item in client.ignored_grants if item["user_id"] == linked_sub)
     except (AccessConfigError, WorkspaceNotFound, ZitadelError) as exc:
+        if isinstance(exc, ZitadelError):
+            start_zitadel_backoff()
         logger.error("dumont access: per-user sync changed nothing: %s", exc)
         return _report(STATUS_ERROR, mode, "user", error=str(exc))
 
     _store_managed_state(cfg, role_keys, workspace)
-    # Only grants of this ZITADEL user (the client filters too); map sub -> this Plane user only.
-    grants = [grant for grant in grants if grant.user_id == sub]
     snapshot = build_snapshot(workspace, role_keys, grants, only_user_ids={user.id})
-    if snapshot.accounts.get(sub) not in (None, str(user.id)):
-        logger.error("dumont access: sub is linked to another Plane user; per-user sync skipped")
+    if any(snapshot.accounts.get(g.user_id) not in (None, str(user.id)) for g in grants):
+        logger.error("dumont access: a sub is linked to another Plane user; per-user sync skipped")
         return _report(STATUS_ERROR, mode, "user", error="sub linked to another user")
-    plan = compute_plan(snapshot)
-    plan.ignored_grants = [item for item in _ignored_grants(client) if item["user_id"] == sub]
+    # Additive only: removals and demotions wait for the full sync (and its brake).
+    plan = compute_plan(snapshot, additive_only=True)
+    plan.ignored_grants = _ignored_grants(ignored=ignored)
     if mode == MODE_DRY_RUN:
         report = _report(STATUS_DRY_RUN, mode, "user", plan, snapshot)
         _log_plan(report)

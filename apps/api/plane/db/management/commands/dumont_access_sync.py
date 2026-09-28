@@ -4,6 +4,7 @@
 #   python manage.py dumont_access_sync --mode dry-run          # preview, writes nothing
 #   python manage.py dumont_access_sync --mode dry-run --json   # machine-readable report
 #   python manage.py dumont_access_sync                         # uses DUMONT_ACCESS_SYNC
+#   python manage.py dumont_access_sync --max-removals 12       # brake limit for this run only
 #
 # Exit status: 0 ok (including dry-run and mode off), 1 error (nothing written), 2 safety brake.
 
@@ -24,11 +25,22 @@ class Command(BaseCommand):
             help="Override DUMONT_ACCESS_SYNC for this run (enforce still requires DUMONT_ACCESS_SYNC=enforce)",
         )
         parser.add_argument("--json", action="store_true", help="Print the full report as JSON")
+        parser.add_argument(
+            "--max-removals",
+            type=int,
+            default=None,
+            metavar="N",
+            help="Safety brake for THIS run only: how many distinct users may lose or reduce access "
+            "(overrides DUMONT_ACCESS_MAX_REMOVALS; review with --mode dry-run first)",
+        )
 
     def handle(self, *args, **options):
         from plane.dumont.access.sync import STATUS_BRAKE, STATUS_BUSY, STATUS_ERROR, run_full_sync
 
-        report = run_full_sync(mode=options.get("mode"))
+        max_removals = options.get("max_removals")
+        if max_removals is not None and max_removals < 0:
+            raise CommandError("--max-removals must be >= 0", returncode=1)
+        report = run_full_sync(mode=options.get("mode"), max_removals=max_removals)
         if options.get("json"):
             self.stdout.write(json.dumps(report, indent=2, sort_keys=True, default=str))
         else:
@@ -69,5 +81,14 @@ class Command(BaseCommand):
             out(
                 f"applied: {report['applied']}  stale: {len(report['stale'])}  failed scopes: {report['failed_scopes']}"
             )
+        if report.get("cascaded"):
+            out(f"cascaded into other projects ({len(report['cascaded'])}; not reverted automatically):")
+            for change in report["cascaded"]:
+                out(f"  {change['action']:<11} {change['scope']:<12} {change['user_id']}  {change['from_role']}")
+        if report.get("identifier_collisions"):
+            out(f"identifier collisions (left unmanaged): {report['identifier_collisions']}")
         if report["status"] == "aborted_brake":
-            out(f"SAFETY BRAKE: {report['counts']['deactivations']} deactivations > {report.get('max_removals')}")
+            out(
+                f"SAFETY BRAKE: {report['counts']['users_losing_access']} users would lose or reduce access "
+                f"> {report.get('max_removals')}"
+            )

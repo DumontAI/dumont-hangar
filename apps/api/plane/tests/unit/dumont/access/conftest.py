@@ -67,6 +67,9 @@ class FakeZitadel(requests.adapters.BaseAdapter):
         self.fail_on = None  # substring of the path that fails; None = every call
         self.page_cap = None  # simulate a server that returns fewer rows than asked
         self.omit_total = False
+        self.drop_result_on = None  # path substring: answer 200 without the `result` key
+        self.truncate_after = None  # rows served before pages come back empty (totalResult stays honest)
+        self.filter_users = False  # users/_search by id answers 200 with no rows (permission-filtered)
         self.expires_in = 43199
 
     # helpers for tests
@@ -151,7 +154,7 @@ class FakeZitadel(requests.adapters.BaseAdapter):
             rows = [
                 {"id": uid, "details": {"resourceOwner": org}, "state": "USER_STATE_ACTIVE"}
                 for uid, org in sorted(self.org_users.items())
-                if uid in wanted and org == ORG_ID
+                if uid in wanted and org == ORG_ID and not self.filter_users
             ]
             return self._page(request, parsed, rows)
         if path == "/management/v1/users/_search":
@@ -185,10 +188,19 @@ class FakeZitadel(requests.adapters.BaseAdapter):
             return _response(request, 404, {"code": 5, "message": "grant not found"})
         return _response(request, 404, {"code": 5, "message": "not found"})
 
-    def add_user(self, user_id, email, org=ORG_ID):
+    def add_user(self, user_id, email, org=ORG_ID, verified=True, leak=False):
+        """Register a ZITADEL user. The e-mail search is org-scoped like ZITADEL's, unless `leak`
+        (a server that ignores the org header) lists a user of another org too."""
         self.org_users[user_id] = org
-        if org == ORG_ID:  # e-mail search is org-scoped too
-            self.users.append({"id": user_id, "state": "USER_STATE_ACTIVE", "human": {"email": {"email": email}}})
+        if org == ORG_ID or leak:
+            self.users.append(
+                {
+                    "id": user_id,
+                    "state": "USER_STATE_ACTIVE",
+                    "details": {"resourceOwner": org},
+                    "human": {"email": {"email": email, "isEmailVerified": verified}},
+                }
+            )
 
     def _token(self, request, form):
         assert form.get("grant_type") == "urn:ietf:params:oauth:grant-type:jwt-bearer"
@@ -208,9 +220,12 @@ class FakeZitadel(requests.adapters.BaseAdapter):
         limit = int(query.get("limit", 1000))
         if self.page_cap:
             limit = min(limit, self.page_cap)
-        body = {"result": rows[offset : offset + limit]}
+        served = rows if self.truncate_after is None else rows[: self.truncate_after]
+        body = {"result": served[offset : offset + limit]}
         if not self.omit_total:
             body["details"] = {"totalResult": str(len(rows))}
+        if self.drop_result_on and self.drop_result_on in urlparse(request.url).path:
+            body.pop("result")
         return _response(request, 200, body)
 
     def close(self):
@@ -248,7 +263,7 @@ def access_env(monkeypatch, key_json, fake_zitadel):
     monkeypatch.setenv("DUMONT_AUTH_HOST", BASE_URL)
     monkeypatch.setenv("DUMONT_ACCESS_WORKSPACE_SLUG", "test-workspace")
     monkeypatch.setenv("DUMONT_ACCESS_ZITADEL_PROJECT_ID", PROJECT_ID)
-    monkeypatch.setenv("DUMONT_ACCESS_ZITADEL_ORG_ID", ORG_ID)
+    monkeypatch.setenv("DUMONT_ZITADEL_ORG_ID", ORG_ID)
     monkeypatch.setenv("DUMONT_ACCESS_ZITADEL_KEY_JSON", key_json)
     monkeypatch.delenv("DUMONT_ACCESS_MAX_REMOVALS", raising=False)
     monkeypatch.setenv("DUMONT_ACCESS_SYNC", "enforce")

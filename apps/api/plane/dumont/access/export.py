@@ -3,6 +3,7 @@
 
 import csv
 import io
+from collections import Counter
 from datetime import datetime, timezone
 
 from plane.db.models import Account, Project, ProjectMember, WorkspaceMember
@@ -56,9 +57,20 @@ def build_export(workspace_slug):
         entry(row.member)["roles"].add(R.role_key(R.WORKSPACE_SCOPE, None, row.role))
 
     roles = [_role_entry(R.WORKSPACE_SCOPE, None, role) for role in (R.ADMIN, R.MEMBER, R.GUEST)]
-    projects = Project.objects.filter(workspace_id=workspace.id).order_by("identifier")
+    projects = list(Project.objects.filter(workspace_id=workspace.id).order_by("identifier"))
+    part_counts = Counter(R.identifier_to_key_part(project.identifier) for project in projects)
     for project in projects:
         part = R.identifier_to_key_part(project.identifier)
+        if part is not None and part_counts[part] > 1:
+            # Same rule as the sync (plan.compute_plan): a shared key part is never managed.
+            skipped.append(
+                {
+                    "kind": "project",
+                    "identifier": project.identifier,
+                    "reason": f"identifier collision: another project also maps to role key part '{part}'",
+                }
+            )
+            continue
         members = ProjectMember.objects.filter(
             project_id=project.id, is_active=True, member__isnull=False
         ).select_related("member")
