@@ -17,11 +17,14 @@ export type OidcIntrospectionAuth =
 
 export interface HangarConfig {
   readonly baseUrl: URL;
-  readonly apiKey: string;
   readonly workspaceSlug: string;
+  /**
+   * Optional ceiling (identifiers like HGR or project UUIDs). Empty = no
+   * ceiling: whatever Hangar lets the calling user see.
+   */
   readonly allowedProjects: readonly string[];
-  /** Subset of allowedProjects where write tools may act. Empty = writes disabled. */
-  readonly writeProjects: readonly string[];
+  /** HMAC key for pagination cursors (MCP_CURSOR_SECRET, >= 32 bytes). Never logged. */
+  readonly cursorSecret: string;
   /** Per-subject write tool calls allowed per fixed 60 s window. */
   readonly writeRateLimit: number;
   readonly timeoutMs: number;
@@ -47,8 +50,6 @@ export interface HangarConfig {
   readonly oidcWriterRole: string;
   /** Scopes advertised in protected-resource metadata and in the 401/403 challenge. */
   readonly oidcScopesSupported: readonly string[];
-  /** Same-origin userinfo endpoint for the lazy email lookup; null disables it. */
-  readonly oidcUserinfoUrl: URL | null;
   readonly oidcAllowedOrgId: string;
   readonly oidcAllowedSubjects: readonly string[];
   readonly resourceUrl: URL | null;
@@ -63,12 +64,23 @@ export interface HangarConfig {
 /**
  * The verified caller of one MCP HTTP request. `roles` holds only the
  * configured Hangar roles (reader and/or writer) the token actually carries.
- * `email` is null when the token has no (verified) email claim.
  */
 export interface Principal {
   readonly sub: string;
-  readonly email: string | null;
   readonly roles: readonly string[];
+}
+
+/**
+ * What the Hangar client needs to act as the caller for one MCP request.
+ * `accessToken` is the caller's own verified JWS access token, forwarded to
+ * Hangar as `Authorization: Bearer`; null when the token cannot be forwarded
+ * (an opaque/JWE token accepted through introspection: Hangar only accepts
+ * JWTs). `expiresAt` is the token `exp` (epoch seconds). Never logged.
+ */
+export interface UpstreamCaller {
+  readonly sub: string;
+  readonly accessToken: string | null;
+  readonly expiresAt: number | null;
 }
 
 export interface HangarPage<T> {

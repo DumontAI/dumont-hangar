@@ -27,11 +27,15 @@ export interface AuthorizationResult {
   readonly subject: string | null;
   /** Set only when failure is null: the verified caller handed to the tools. */
   readonly principal?: Principal | null;
+  /**
+   * Set only when failure is null: the caller's verified bearer to forward to
+   * Hangar, or null when it must not be forwarded (an opaque/JWE token that
+   * passed introspection; Hangar only accepts JWTs). Never logged.
+   */
+  readonly upstreamToken?: string | null;
+  /** Set only when failure is null: the token `exp` (epoch seconds). */
+  readonly expiresAt?: number;
 }
-
-// Loose shape check only: the value is used for attribution and to match the
-// caller's Hangar workspace member, never as a credential.
-const EMAIL_CLAIM = /^[^\s@<>"]{1,128}@[^\s@<>"]{1,253}$/;
 
 function requestHost(req: IncomingMessage): string {
   const raw = req.headers.host?.trim().toLowerCase() ?? "";
@@ -134,14 +138,6 @@ function usesZitadelRoleScope(config: HangarConfig): boolean {
   );
 }
 
-function principalEmail(payload: JWTPayload): string | null {
-  const email = payload.email;
-  // Only an email the issuer marks verified (strictly `true`) is trusted for
-  // attribution or "me"; anything else falls through to the userinfo lookup.
-  if (payload.email_verified !== true) return null;
-  return typeof email === "string" && EMAIL_CLAIM.test(email) ? email.toLowerCase() : null;
-}
-
 function hasAllowedOrganization(payload: JWTPayload, organizationId: string): boolean {
   return (
     containsString(payload["urn:zitadel:iam:user:resourceowner"], organizationId) ||
@@ -185,7 +181,8 @@ export function evaluateAccessClaims(
   return {
     failure: null,
     subject: claims.sub,
-    principal: { sub: claims.sub, email: principalEmail(claims), roles: grantedRoles(claims, config) },
+    principal: { sub: claims.sub, roles: grantedRoles(claims, config) },
+    expiresAt: claims.exp,
   };
 }
 
@@ -271,7 +268,9 @@ function createOidcVerifier(config: HangarConfig, dependencies: AuthorizerDepend
       });
       // `nonce`/`at_hash` only appear in ID tokens; never accept one as an access token.
       if (payload.nonce !== undefined || payload.at_hash !== undefined) return invalidCredentials();
-      return evaluateAccessClaims(payload, config, Math.floor(now() / 1000));
+      const result = evaluateAccessClaims(payload, config, Math.floor(now() / 1000));
+      // Only a locally verified RS256 JWS access token is ever forwarded to Hangar.
+      return result.failure ? result : { ...result, upstreamToken: token };
     } catch {
       return invalidCredentials();
     }
@@ -286,7 +285,10 @@ function createOidcVerifier(config: HangarConfig, dependencies: AuthorizerDepend
     if (outcome.status !== "active" || !isAccessTokenType(outcome.claims.token_type)) {
       return invalidCredentials();
     }
-    return evaluateAccessClaims(outcome.claims, config, Math.floor(now() / 1000));
+    const result = evaluateAccessClaims(outcome.claims, config, Math.floor(now() / 1000));
+    // Hangar accepts only JWTs: an opaque token is valid for this MCP but is
+    // never forwarded (the tools answer TOKEN_NOT_FORWARDABLE).
+    return result.failure ? result : { ...result, upstreamToken: null };
   }
 
   return async (token: string): Promise<AuthorizationResult> => {

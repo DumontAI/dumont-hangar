@@ -1,4 +1,4 @@
-import type { HangarConfig, Principal } from "../src/types.js";
+import type { HangarConfig, Principal, UpstreamCaller } from "../src/types.js";
 
 export const PROJECT_HGR = "1f4b7c4b-fe28-441d-a6ce-b3dfe87384b2";
 export const PROJECT_SEC = "ac913f1a-fa7f-4c98-848b-b0ae826f7117";
@@ -18,13 +18,14 @@ export const HGR_WORK_ITEM = {
   updated_at: "2026-09-23T23:44:48.020362Z",
 };
 
+export const TEST_CURSOR_SECRET = "test-cursor-secret-".padEnd(40, "x");
+
 export function testConfig(overrides: Partial<HangarConfig> = {}): HangarConfig {
   return {
     baseUrl: new URL("https://hangar.example.test"),
-    apiKey: "plane_api_" + "a".repeat(32),
     workspaceSlug: "dumont",
     allowedProjects: ["HGR"],
-    writeProjects: [],
+    cursorSecret: TEST_CURSOR_SECRET,
     writeRateLimit: 20,
     timeoutMs: 200,
     maxResponseBytes: 100_000,
@@ -46,7 +47,6 @@ export function testConfig(overrides: Partial<HangarConfig> = {}): HangarConfig 
       "urn:zitadel:iam:org:project:role:hangar_reader",
       "urn:zitadel:iam:org:project:role:hangar_writer",
     ],
-    oidcUserinfoUrl: null,
     oidcAllowedOrgId: "",
     oidcAllowedSubjects: [],
     resourceUrl: null,
@@ -60,12 +60,22 @@ export function testConfig(overrides: Partial<HangarConfig> = {}): HangarConfig 
   };
 }
 
-export const READER: Principal = { sub: "user-reader", email: "reader@example.test", roles: ["hangar_reader"] };
-export const WRITER: Principal = {
-  sub: "user-writer",
-  email: "cristian@example.test",
-  roles: ["hangar_reader", "hangar_writer"],
-};
+export const READER: Principal = { sub: "user-reader", roles: ["hangar_reader"] };
+export const WRITER: Principal = { sub: "user-writer", roles: ["hangar_reader", "hangar_writer"] };
+
+/** Stand-in for a verified caller JWS; tests only compare it, never verify it. */
+export const TEST_ACCESS_TOKEN = "header.payload.signature-of-test-caller";
+
+export function callerFor(
+  principal: Pick<Principal, "sub">,
+  accessToken: string | null = TEST_ACCESS_TOKEN,
+  expiresAt: number | null = Math.floor(Date.now() / 1000) + 3600
+): UpstreamCaller {
+  return { sub: principal.sub, accessToken, expiresAt };
+}
+
+/** Plane user id returned by GET /api/v1/users/me/ in hangarFetch. */
+export const ME_USER_ID = "0d2b1f7a-3c4e-4f5a-8b6c-7d8e9f0a1b2c";
 
 export function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -84,6 +94,9 @@ export function hangarFetch(calls: URL[]): (input: string | URL, init?: RequestI
     calls.push(url);
     if (init?.method !== "GET") return jsonResponse({ error: "method" }, 405);
     const path = url.pathname;
+    if (path === "/api/v1/users/me/") {
+      return jsonResponse({ id: ME_USER_ID, display_name: "Me", first_name: "Me", last_name: "" });
+    }
     if (path.endsWith("/projects/")) return page([HGR_PROJECT, SECRET_PROJECT]);
     if (/\/projects\/[0-9a-f-]+\/$/.test(path)) return jsonResponse(HGR_PROJECT);
     if (path.endsWith("/issues/")) {

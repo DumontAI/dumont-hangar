@@ -2,7 +2,6 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { NodeStreamableHTTPServerTransport } from "@modelcontextprotocol/node";
 import { assertHttpAuthConfigured, loadHangarConfig } from "./config.js";
 import {
-  bearerToken,
   authorizationChallenge,
   createAuthorizer,
   type AuthorizerDependencies,
@@ -10,11 +9,11 @@ import {
   protectedResourceMetadataPaths,
 } from "./auth.js";
 import { WriteRateLimiter } from "./access.js";
-import { HangarClient } from "./client.js";
+import { SubjectCache } from "./cache.js";
+import { HangarClient, type FetchLike } from "./client.js";
 import { isMainModule } from "./runtime.js";
 import { createHangarServer } from "./tools.js";
-import { HangarError, type HangarConfig, type Principal } from "./types.js";
-import { UserinfoEmailResolver, type UserinfoDependencies } from "./userinfo.js";
+import { HangarError, type HangarConfig, type Principal, type UpstreamCaller } from "./types.js";
 
 const MAX_REQUEST_BYTES = 1024 * 1024;
 
@@ -63,30 +62,42 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
 }
 
 /**
- * Builds the per-request McpServer. `resolveEmail` looks the caller's email up
- * lazily (userinfo with the caller's own bearer); tools call it only for
- * attribution or assignee "me".
+ * Builds the McpServer for ONE request. `caller` carries the verified token
+ * that the Hangar client forwards for this request only; nothing about the
+ * caller is stored outside the request except the per-`sub` cache.
  */
 export type HangarServerFactory = (
   principal: Principal,
-  resolveEmail: () => Promise<string | null>
+  caller: UpstreamCaller
 ) => ReturnType<typeof createHangarServer>;
+
+export interface HttpServerDependencies {
+  /** Upstream fetch for the default factory (tests). */
+  readonly fetch?: FetchLike;
+  /** Per-subject cache for the default factory (tests). */
+  readonly cache?: SubjectCache;
+}
 
 export function createHangarHttpServer(
   config: HangarConfig = loadHangarConfig(),
   serverFactory?: HangarServerFactory,
   authorizerDependencies: AuthorizerDependencies = {},
-  userinfoDependencies: UserinfoDependencies = {}
+  dependencies: HttpServerDependencies = {}
 ): Server {
   assertHttpAuthConfigured(config);
-  // One limiter and one email cache per process: each request gets its own
-  // stateless McpServer, but the per-user window and the cache span requests.
+  // One limiter and one per-subject cache per process: each request gets its
+  // own stateless McpServer and its own caller-bound HangarClient, but the
+  // per-user rate window and the per-user cache span requests.
   const rateLimiter = new WriteRateLimiter(config.writeRateLimit);
-  const userinfo = new UserinfoEmailResolver(config, userinfoDependencies);
+  const cache = dependencies.cache ?? new SubjectCache(config.projectCacheSeconds * 1000);
   const factory: HangarServerFactory =
     serverFactory ??
-    ((principal, resolveEmail) =>
-      createHangarServer(config, new HangarClient(config), { principal, rateLimiter, resolveEmail }));
+    ((principal, caller) =>
+      createHangarServer(
+        config,
+        new HangarClient(config, caller, { cache, ...(dependencies.fetch ? { fetch: dependencies.fetch } : {}) }),
+        { principal, rateLimiter }
+      ));
   const authorize = createAuthorizer(config, authorizerDependencies);
   const metadata = protectedResourceMetadata(config);
   const metadataPaths = protectedResourceMetadataPaths(config);
@@ -136,11 +147,14 @@ export function createHangarHttpServer(
     try {
       const body = req.method === "POST" ? await readJsonBody(req) : undefined;
       const principal = authorization.principal;
-      // The bearer stays in this closure; it is sent only to the same-origin
-      // userinfo endpoint and never logged.
-      const token = bearerToken(req) ?? "";
-      const resolveEmail = () => userinfo.emailFor(principal.sub, token);
-      const server = factory(principal, resolveEmail);
+      // The verified bearer lives only in this request's client and is sent
+      // only to HANGAR_BASE_URL (never logged). Opaque tokens get null.
+      const caller: UpstreamCaller = {
+        sub: principal.sub,
+        accessToken: authorization.upstreamToken ?? null,
+        expiresAt: authorization.expiresAt ?? null,
+      };
+      const server = factory(principal, caller);
       const transport = new NodeStreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
         enableJsonResponse: true,

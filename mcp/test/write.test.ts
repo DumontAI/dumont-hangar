@@ -5,20 +5,18 @@ import { HangarClient } from "../src/client.js";
 import { HangarConfigError, loadHangarConfig } from "../src/config.js";
 import { htmlWithFooter, textToHtml } from "../src/markup.js";
 import { containsCredential } from "../src/redaction.js";
-import {
-  createHangarServer,
-  HANGAR_READ_TOOL_NAMES,
-  HANGAR_TOOL_NAMES,
-  IDEMPOTENCY_EXTERNAL_SOURCE,
-} from "../src/tools.js";
+import { createHangarServer, HANGAR_TOOL_NAMES, IDEMPOTENCY_EXTERNAL_SOURCE } from "../src/tools.js";
 import type { HangarConfig, Principal } from "../src/types.js";
 import {
   HGR_WORK_ITEM,
+  ME_USER_ID,
   PROJECT_HGR,
   PROJECT_SEC,
   READER,
+  TEST_ACCESS_TOKEN,
   WORK_ITEM_HGR_5,
   WRITER,
+  callerFor,
   hangarFetch,
   jsonResponse,
   testConfig,
@@ -36,14 +34,22 @@ interface WriteCall {
   readonly body: Record<string, unknown>;
 }
 
-function writeFetch(
-  writes: WriteCall[],
-  options: { conflict?: boolean; workItem?: Record<string, unknown>; commentProject?: string } = {}
-) {
+interface WriteFetchOptions {
+  conflict?: boolean;
+  workItem?: Record<string, unknown>;
+  commentProject?: string;
+  /** Body of a 403 Hangar answers to every write. */
+  forbidWrites?: Record<string, unknown>;
+  /** Every upstream call, reads included. */
+  seen?: Array<{ method: string; path: string }>;
+}
+
+function writeFetch(writes: WriteCall[], options: WriteFetchOptions = {}) {
   const reads = hangarFetch([]);
   return async (input: string | URL, init?: RequestInit): Promise<Response> => {
     const url = new URL(String(input));
     const method = init?.method ?? "GET";
+    options.seen?.push({ method, path: url.pathname });
     if (method === "GET") {
       if (url.pathname.endsWith("/workspaces/dumont/members/")) {
         return jsonResponse([
@@ -62,6 +68,7 @@ function writeFetch(
       }
       return reads(input, init);
     }
+    if (options.forbidWrites) return jsonResponse(options.forbidWrites, 403);
     const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
     writes.push({ method, path: url.pathname, body });
     if (method === "POST" && url.pathname.endsWith("/comments/")) {
@@ -114,24 +121,21 @@ interface Harness {
 
 async function harness(
   principal: Principal | null,
-  configOverrides: Partial<HangarConfig> = { writeProjects: ["HGR"] },
-  options: {
-    conflict?: boolean;
-    workItem?: Record<string, unknown>;
-    commentProject?: string;
-    rateLimiter?: WriteRateLimiter;
-    resolveEmail?: () => Promise<string | null>;
-  } = {}
+  configOverrides: Partial<HangarConfig> = {},
+  options: WriteFetchOptions & { rateLimiter?: WriteRateLimiter; accessToken?: string | null } = {}
 ): Promise<Harness> {
   const config = testConfig({ allowedProjects: ["HGR", "SEC"], ...configOverrides });
   const writes: WriteCall[] = [];
   const audit: AuditRecord[] = [];
-  const client = new HangarClient(config, writeFetch(writes, options));
+  const caller = callerFor(
+    principal ?? { sub: "anonymous" },
+    options.accessToken === undefined ? TEST_ACCESS_TOKEN : options.accessToken
+  );
+  const client = new HangarClient(config, caller, { fetch: writeFetch(writes, options) });
   const server = createHangarServer(config, client, {
     principal,
     audit: (record) => audit.push(record),
     ...(options.rateLimiter ? { rateLimiter: options.rateLimiter } : {}),
-    ...(options.resolveEmail ? { resolveEmail: options.resolveEmail } : {}),
   });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
@@ -212,7 +216,7 @@ describe("Hangar write tools: authorization and gates", () => {
     expect(read.isError).toBeUndefined();
     expect(reader.audit.at(-1)).toMatchObject({ outcome: "success", roles_used: ["hangar_reader"] });
 
-    const writerOnly = await harness({ sub: "w", email: null, roles: ["hangar_writer"] });
+    const writerOnly = await harness({ sub: "w", roles: ["hangar_writer"] });
     const readByWriter = await writerOnly.call("hangar_list_projects", { limit: 5 });
     expect(readByWriter.isError).toBeUndefined();
     expect(writerOnly.audit.at(-1)).toMatchObject({ roles_used: ["hangar_writer"] });
@@ -223,37 +227,49 @@ describe("Hangar write tools: authorization and gates", () => {
     expect(errorCode(await h.call("hangar_list_projects", { limit: 5 }))).toBe("FORBIDDEN");
   });
 
-  it("does not register write tools when HANGAR_WRITE_PROJECTS is empty", async () => {
-    const h = await harness(WRITER, { writeProjects: [] });
-    const names = await h.toolNames();
-    expect(names).toEqual([...HANGAR_READ_TOOL_NAMES]);
+  it("always registers the write tools; the writer role gates them per call", async () => {
+    await expect((await harness(READER)).toolNames()).resolves.toEqual([...HANGAR_TOOL_NAMES]);
+  });
+
+  it("maps a Hangar 403 on a write to PROJECT_ACCESS_DENIED naming the ZITADEL role", async () => {
+    const h = await harness(WRITER, {}, { forbidWrites: { detail: "You do not have permission" } });
+    const result = await h.call("hangar_add_comment", { work_item: "HGR-5", body: "hi" });
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: "PROJECT_ACCESS_DENIED",
+        message: "No write access to project HGR in Hangar; ask for the role hangar.project.hgr.member in Dumont Auth",
+      },
+    });
+    expect(h.audit.at(-1)).toMatchObject({ outcome: "denied", error_code: "PROJECT_ACCESS_DENIED" });
+  });
+
+  it("maps Hangar's writer-role 403 to WRITER_ROLE_REQUIRED", async () => {
+    const h = await harness(WRITER, {}, { forbidWrites: { error_code: "DUMONT_WRITER_ROLE_REQUIRED" } });
+    const result = await h.call("hangar_create_work_item", { project: "HGR", name: "x" });
+    expect(errorCode(result)).toBe("WRITER_ROLE_REQUIRED");
+    expect(h.audit.at(-1)).toMatchObject({ outcome: "denied" });
+  });
+
+  it("answers a non-forwardable (opaque) token with a tool error and never calls Hangar", async () => {
+    const seen: Array<{ method: string; path: string }> = [];
+    const h = await harness(WRITER, {}, { accessToken: null, seen });
     for (const [tool, args] of [
-      ["hangar_create_work_item", { project: "HGR", name: "x" }],
-      ["hangar_update_work_item", { work_item: "HGR-5", name: "x" }],
+      ["hangar_list_projects", { limit: 1 }],
       ["hangar_add_comment", { work_item: "HGR-5", body: "hi" }],
     ] as const) {
-      // The harness routes one response at a time, so calls stay sequential.
       // oxlint-disable-next-line no-await-in-loop
-      const response = await h.callRaw(tool, args);
-      const result = response.result as { isError?: boolean } | undefined;
-      expect(response.error !== undefined || result?.isError === true).toBe(true);
+      const result = await h.call(tool, args);
+      expect(errorCode(result)).toBe("TOKEN_NOT_FORWARDABLE");
     }
-    expect(h.writes).toHaveLength(0);
-    await expect((await harness(WRITER, { writeProjects: ["HGR"] })).toolNames()).resolves.toEqual([
-      ...HANGAR_TOOL_NAMES,
+    expect(seen).toHaveLength(0);
+    expect(h.audit.map((record) => [record.outcome, record.plane_user_id])).toEqual([
+      ["denied", null],
+      ["denied", null],
     ]);
   });
 
-  it("refuses a writer in a readable but non-writable project with PROJECT_NOT_WRITABLE", async () => {
-    const h = await harness(WRITER, { writeProjects: ["HGR"] });
-    const result = await h.call("hangar_create_work_item", { project: "SEC", name: "x" });
-    expect(errorCode(result)).toBe("PROJECT_NOT_WRITABLE");
-    expect(h.writes).toHaveLength(0);
-    expect(h.audit.at(-1)).toMatchObject({ outcome: "denied", error_code: "PROJECT_NOT_WRITABLE" });
-  });
-
-  it("refuses a project outside the read allowlist with PROJECT_NOT_ALLOWED", async () => {
-    const h = await harness(WRITER, { allowedProjects: ["HGR"], writeProjects: ["HGR"] });
+  it("refuses a project outside the ceiling with PROJECT_NOT_ALLOWED", async () => {
+    const h = await harness(WRITER, { allowedProjects: ["HGR"] });
     expect(errorCode(await h.call("hangar_create_work_item", { project: "SEC", name: "x" }))).toBe(
       "PROJECT_NOT_ALLOWED"
     );
@@ -277,7 +293,7 @@ describe("Hangar write tools: authorization and gates", () => {
 
   it("rate-limits write calls per subject with a retryable RATE_LIMITED", async () => {
     const limiter = new WriteRateLimiter(2);
-    const h = await harness(WRITER, { writeProjects: ["HGR"] }, { rateLimiter: limiter });
+    const h = await harness(WRITER, {}, { rateLimiter: limiter });
     expect((await h.call("hangar_add_comment", { work_item: "HGR-5", body: "one" })).isError).toBeUndefined();
     expect((await h.call("hangar_add_comment", { work_item: "HGR-5", body: "two" })).isError).toBeUndefined();
     const third = await h.call("hangar_add_comment", { work_item: "HGR-5", body: "three" });
@@ -286,11 +302,7 @@ describe("Hangar write tools: authorization and gates", () => {
     expect(h.writes).toHaveLength(2);
     // Reads are not rate-limited, and another subject has its own window.
     expect((await h.call("hangar_list_projects", { limit: 1 })).isError).toBeUndefined();
-    const other = await harness(
-      { ...WRITER, sub: "someone-else" },
-      { writeProjects: ["HGR"] },
-      { rateLimiter: limiter }
-    );
+    const other = await harness({ ...WRITER, sub: "someone-else" }, {}, { rateLimiter: limiter });
     expect((await other.call("hangar_add_comment", { work_item: "HGR-5", body: "ok" })).isError).toBeUndefined();
   });
 
@@ -305,7 +317,7 @@ describe("Hangar write tools: authorization and gates", () => {
 });
 
 describe("Hangar write tools: behavior", () => {
-  it("creates a work item with resolved ids, safe HTML and one attribution footer", async () => {
+  it("creates a work item with resolved ids, safe HTML and one '— via MCP' footer", async () => {
     const h = await harness(WRITER);
     const result = await h.call("hangar_create_work_item", {
       project: "hgr",
@@ -330,7 +342,7 @@ describe("Hangar write tools: behavior", () => {
       state: "state-2",
       priority: "high",
       labels: ["label-1"],
-      assignees: ["user-1", "user-2"],
+      assignees: [ME_USER_ID, "user-2"],
       parent: WORK_ITEM_HGR_5,
       start_date: "2026-09-28",
       target_date: "2026-10-01",
@@ -339,12 +351,13 @@ describe("Hangar write tools: behavior", () => {
     expect(html).not.toContain("<script>");
     expect(html).toContain("&lt;script&gt;");
     expect(html).toContain("<ul><li><p>one</p></li><li><p><strong>two</strong></p></li></ul>");
-    expect(html.endsWith("<p>— via MCP por cristian@example.test</p>")).toBe(true);
+    expect(html.endsWith("<p>— via MCP</p>")).toBe(true);
+    expect(html.match(/via MCP/g)).toHaveLength(1);
     expect(write.body.external_id).toBeUndefined();
     expect(h.audit.at(-1)).toMatchObject({
       tool: "hangar_create_work_item",
       sub: WRITER.sub,
-      email: WRITER.email,
+      plane_user_id: ME_USER_ID,
       roles_used: ["hangar_writer"],
       project: "HGR",
       work_item: "HGR-12",
@@ -364,21 +377,25 @@ describe("Hangar write tools: behavior", () => {
     ]);
   });
 
-  it("adds the footer with the subject when the token has no email, and on an empty description", async () => {
-    const h = await harness({ sub: "sub-123", email: null, roles: ["hangar_writer"] });
+  it("adds the footer on an empty description, naming nobody", async () => {
+    const h = await harness({ sub: "sub-123", roles: ["hangar_writer"] });
     await h.call("hangar_create_work_item", { project: "HGR", name: "No description" });
-    expect(h.writes[0]!.body.description_html).toBe("<p>— via MCP por sub-123</p>");
+    expect(h.writes[0]!.body.description_html).toBe("<p>— via MCP</p>");
   });
 
-  it('refuses assignee "me" without an email claim', async () => {
-    const h = await harness({ sub: "sub-123", email: null, roles: ["hangar_writer"] });
+  it('resolves assignee "me" to the Hangar user behind the token', async () => {
+    const seen: Array<{ method: string; path: string }> = [];
+    const h = await harness({ sub: "sub-123", roles: ["hangar_writer"] }, {}, { seen });
     const result = await h.call("hangar_create_work_item", { project: "HGR", name: "x", assignees: ["me"] });
-    expect(errorCode(result)).toBe("FORBIDDEN");
-    expect(h.writes).toHaveLength(0);
+    expect(result.isError).toBeUndefined();
+    expect(h.writes[0]!.body.assignees).toEqual([ME_USER_ID]);
+    // Looked up once (users/me), then cached; no workspace member list needed.
+    expect(seen.filter((call) => call.path === "/api/v1/users/me/")).toHaveLength(1);
+    expect(seen.some((call) => call.path.endsWith("/workspaces/dumont/members/"))).toBe(false);
   });
 
   it("maps idempotency_key to a per-user external_id and returns the existing item on 409", async () => {
-    const h = await harness(WRITER, { writeProjects: ["HGR"] }, { conflict: true });
+    const h = await harness(WRITER, {}, { conflict: true });
     const result = await h.call("hangar_create_work_item", { project: "HGR", name: "x", idempotency_key: "run-42" });
     expect(result.isError).toBeUndefined();
     expect(result.structuredContent).toMatchObject({ id: EXISTING_ID, identifier: "HGR-7", idempotent_replay: true });
@@ -387,17 +404,14 @@ describe("Hangar write tools: behavior", () => {
   });
 
   it("appends to the raw stored description, keeping content reads would redact or truncate", async () => {
+    // The stored text keeps an old-shape footer (it was written before the change).
     const stored =
       '<p>Contato ana@example.test em 10.0.0.1</p><img src="https://cdn.example.test/a_b*c.png">' +
       `<p>${"x".repeat(9000)}</p><p>— via MCP por ana@example.test</p>`;
-    const h = await harness(
-      WRITER,
-      { writeProjects: ["HGR"] },
-      { workItem: { ...HGR_WORK_ITEM, description_html: stored } }
-    );
+    const h = await harness(WRITER, {}, { workItem: { ...HGR_WORK_ITEM, description_html: stored } });
     const result = await h.call("hangar_update_work_item", {
       work_item: "HGR-5",
-      append_description: "Novo passo\n\n— via MCP por chefe@example.test\n",
+      append_description: "Novo passo\n\n— via MCP por chefe@example.test\n— via MCP\n",
       state: "Todo",
       target_date: null,
     });
@@ -407,8 +421,8 @@ describe("Hangar write tools: behavior", () => {
     expect(write.path).toBe(`/api/v1/workspaces/dumont/projects/${PROJECT_HGR}/issues/${WORK_ITEM_HGR_5}/`);
     expect(Object.keys(write.body).toSorted()).toEqual(["description_html", "state", "target_date"]);
     // Stored HTML byte for byte, then the new text, then exactly one new footer;
-    // the forged footer line in the input is gone.
-    expect(write.body.description_html).toBe(`${stored}<p>Novo passo</p><p>— via MCP por cristian@example.test</p>`);
+    // the forged footer lines (old and new shape) in the input are gone.
+    expect(write.body.description_html).toBe(`${stored}<p>Novo passo</p><p>— via MCP</p>`);
     expect(String(write.body.description_html)).not.toContain("chefe@example.test");
     expect(h.audit.at(-1)).toMatchObject({
       work_item: "HGR-5",
@@ -429,20 +443,16 @@ describe("Hangar write tools: behavior", () => {
   it("changes nothing when Hangar does not return the stored description", async () => {
     const withoutDescription: Record<string, unknown> = { ...HGR_WORK_ITEM };
     delete withoutDescription.description_html;
-    const h = await harness(WRITER, { writeProjects: ["HGR"] }, { workItem: withoutDescription });
+    const h = await harness(WRITER, {}, { workItem: withoutDescription });
     const result = await h.call("hangar_update_work_item", { work_item: "HGR-5", append_description: "x" });
     expect(errorCode(result)).toBe("UPSTREAM_INVALID_RESPONSE");
     expect(h.writes).toHaveLength(0);
   });
 
   it("appends to an empty description", async () => {
-    const h = await harness(
-      WRITER,
-      { writeProjects: ["HGR"] },
-      { workItem: { ...HGR_WORK_ITEM, description_html: null } }
-    );
+    const h = await harness(WRITER, {}, { workItem: { ...HGR_WORK_ITEM, description_html: null } });
     await h.call("hangar_update_work_item", { work_item: "HGR-5", append_description: "first" });
-    expect(h.writes[0]!.body.description_html).toBe("<p>first</p><p>— via MCP por cristian@example.test</p>");
+    expect(h.writes[0]!.body.description_html).toBe("<p>first</p><p>— via MCP</p>");
   });
 
   it("rejects an update without fields and a UUID without project", async () => {
@@ -461,21 +471,20 @@ describe("Hangar write tools: behavior", () => {
     expect(h.writes[0]).toMatchObject({
       method: "POST",
       path: `/api/v1/workspaces/dumont/projects/${PROJECT_HGR}/issues/${WORK_ITEM_HGR_5}/comments/`,
-      body: { comment_html: "<p>Looks good</p><p>— via MCP por cristian@example.test</p>" },
+      body: { comment_html: "<p>Looks good</p><p>— via MCP</p>" },
     });
     expect(result.structuredContent).toMatchObject({ id: COMMENT_ID, work_item: "HGR-5" });
   });
 
   it("reports a comment that Hangar returns for another project", async () => {
-    const h = await harness(WRITER, { writeProjects: ["HGR"] }, { commentProject: PROJECT_SEC });
+    const h = await harness(WRITER, {}, { commentProject: PROJECT_SEC });
     expect(errorCode(await h.call("hangar_add_comment", { work_item: "HGR-5", body: "x" }))).toBe(
       "PROJECT_SCOPE_MISMATCH"
     );
   });
 
-  it("never writes text bodies, tokens or the API key into the audit line", async () => {
+  it("never writes text bodies or tokens into the audit line", async () => {
     const h = await harness(WRITER);
-    const config = testConfig();
     await h.call("hangar_create_work_item", { project: "HGR", name: SENTINEL, description: SENTINEL });
     await h.call("hangar_update_work_item", { work_item: "HGR-5", name: SENTINEL, append_description: SENTINEL });
     await h.call("hangar_add_comment", { work_item: "HGR-5", body: SENTINEL });
@@ -485,7 +494,7 @@ describe("Hangar write tools: behavior", () => {
     const serialized = JSON.stringify(h.audit);
     expect(serialized).not.toContain(SENTINEL);
     expect(serialized).not.toContain(SENTINEL.slice(0, 20));
-    expect(serialized).not.toContain(config.apiKey);
+    expect(serialized).not.toContain(TEST_ACCESS_TOKEN);
     for (const record of h.audit) {
       expect(Object.keys(record).toSorted()).toEqual(
         [
@@ -493,7 +502,7 @@ describe("Hangar write tools: behavior", () => {
           "event",
           "tool",
           "sub",
-          "email",
+          "plane_user_id",
           "roles_used",
           "project",
           "work_item",
@@ -506,86 +515,6 @@ describe("Hangar write tools: behavior", () => {
       expect(record.event).toBe("hangar.mcp.tool");
       expect(typeof record.latency_ms).toBe("number");
     }
-  });
-});
-
-describe("Hangar write tools: lazy email resolution", () => {
-  const NO_EMAIL: Principal = { sub: "sub-no-email", email: null, roles: ["hangar_reader", "hangar_writer"] };
-
-  it("never looks the email up for reads", async () => {
-    let lookups = 0;
-    const h = await harness(
-      NO_EMAIL,
-      { writeProjects: ["HGR"] },
-      {
-        resolveEmail: async () => {
-          lookups += 1;
-          return "camila@example.test";
-        },
-      }
-    );
-    await h.call("hangar_list_projects", { limit: 1 });
-    await h.call("hangar_get_work_item", { work_item: "HGR-5" });
-    expect(lookups).toBe(0);
-    expect(h.audit.every((record) => record.email === null)).toBe(true);
-  });
-
-  it('uses the resolved email for the footer, for "me" and in the audit line, once per request', async () => {
-    let lookups = 0;
-    const h = await harness(
-      NO_EMAIL,
-      { writeProjects: ["HGR"] },
-      {
-        resolveEmail: async () => {
-          lookups += 1;
-          return "camila@example.test";
-        },
-      }
-    );
-    const result = await h.call("hangar_create_work_item", {
-      project: "HGR",
-      name: "x",
-      description: "body",
-      assignees: ["me"],
-    });
-    expect(result.isError).toBeUndefined();
-    expect(h.writes[0]!.body.description_html).toBe("<p>body</p><p>— via MCP por camila@example.test</p>");
-    expect(h.writes[0]!.body.assignees).toEqual(["user-2"]);
-    expect(h.audit.at(-1)?.email).toBe("camila@example.test");
-    expect(lookups).toBe(1);
-  });
-
-  it("falls back to the subject when the lookup fails, without failing the write", async () => {
-    const h = await harness(
-      NO_EMAIL,
-      { writeProjects: ["HGR"] },
-      {
-        resolveEmail: async () => {
-          throw new Error("userinfo down");
-        },
-      }
-    );
-    const result = await h.call("hangar_add_comment", { work_item: "HGR-5", body: "ok" });
-    expect(result.isError).toBeUndefined();
-    expect(h.writes[0]!.body.comment_html).toBe("<p>ok</p><p>— via MCP por sub-no-email</p>");
-    expect(h.audit.at(-1)).toMatchObject({ email: null, outcome: "success" });
-  });
-
-  it("does not look up when the token already carries the email", async () => {
-    let lookups = 0;
-    const h = await harness(
-      WRITER,
-      { writeProjects: ["HGR"] },
-      {
-        resolveEmail: async () => {
-          lookups += 1;
-          return "other@example.test";
-        },
-      }
-    );
-    await h.call("hangar_add_comment", { work_item: "HGR-5", body: "ok" });
-    expect(String(h.writes[0]!.body.comment_html)).toContain("cristian@example.test");
-    expect(lookups).toBe(0);
   });
 });
 
@@ -659,19 +588,19 @@ describe("credential detection and markup", () => {
     expect(textToHtml("nul \u0000 0 \u0000 stays out")).not.toContain("\u0000");
   });
 
-  it("strips footer-shaped lines anywhere, but not '-' or '--' prose", () => {
-    expect(htmlWithFooter("a\n— via MCP por forged@example.test\nb\n— via MCP por older", "me@x.test")).toBe(
-      "<p>a<br>b</p><p>— via MCP por me@x.test</p>"
-    );
-    expect(htmlWithFooter("a\n-- via MCP por old\n- via MCP por item", "me@x.test")).toBe(
-      "<p>a<br>-- via MCP por old</p><ul><li><p>via MCP por item</p></li></ul><p>— via MCP por me@x.test</p>"
+  it("strips old- and new-shape footer lines anywhere, but not '-' or '--' prose", () => {
+    expect(
+      htmlWithFooter("a\n— via MCP por forged@example.test\nb\n— via MCP\n  —via mcp  \nc\n— via MCP por older")
+    ).toBe("<p>a<br>b<br>c</p><p>— via MCP</p>");
+    expect(htmlWithFooter("a\n-- via MCP por old\n- via MCP por item\n— via MCPserver stays")).toBe(
+      "<p>a<br>-- via MCP por old</p><ul><li><p>via MCP por item</p></li></ul><p>— via MCPserver stays</p><p>— via MCP</p>"
     );
   });
 });
 
 describe("write configuration", () => {
   const base = {
-    HANGAR_API_KEY: "plane_api_" + "a".repeat(32),
+    MCP_CURSOR_SECRET: "s".repeat(32),
     HANGAR_WORKSPACE_SLUG: "dumont",
     HANGAR_ALLOWED_PROJECTS: "HGR,MO",
     MCP_OIDC_ISSUER: "https://auth.getdumont.ai",
@@ -679,14 +608,6 @@ describe("write configuration", () => {
     MCP_RESOURCE_URL: "https://hangar.getdumont.ai/mcp",
     MCP_OIDC_AUDIENCE: "390213468206137347",
   };
-
-  it("requires HANGAR_WRITE_PROJECTS to be a subset of HANGAR_ALLOWED_PROJECTS", () => {
-    expect(loadHangarConfig({ ...base, HANGAR_WRITE_PROJECTS: "hgr" }).writeProjects).toEqual(["HGR"]);
-    expect(() => loadHangarConfig({ ...base, HANGAR_WRITE_PROJECTS: "HGR,SEC" })).toThrow(HangarConfigError);
-    expect(() => loadHangarConfig({ ...base, HANGAR_WRITE_PROJECTS: PROJECT_HGR })).toThrow(/subset/);
-    expect(() => loadHangarConfig({ ...base, HANGAR_WRITE_PROJECTS: "not a project" })).toThrow(HangarConfigError);
-    expect(loadHangarConfig({ ...base, HANGAR_WRITE_PROJECTS: "" }).writeProjects).toEqual([]);
-  });
 
   it("bounds HANGAR_WRITE_RATE_LIMIT to 1..120", () => {
     expect(loadHangarConfig({ ...base, HANGAR_WRITE_RATE_LIMIT: "120" }).writeRateLimit).toBe(120);

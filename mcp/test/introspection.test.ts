@@ -1,7 +1,14 @@
-import { describe, expect, it } from "vitest";
+import type { Server } from "node:http";
+import { afterEach, describe, expect, it } from "vitest";
 import { createAuthorizer } from "../src/auth.js";
+import { createHangarHttpServer } from "../src/http.js";
 import { SELF_CHECK_TOKEN } from "../src/introspection.js";
 import { jsonResponse, testConfig } from "./fixtures.js";
+
+const openServers: Server[] = [];
+afterEach(async () => {
+  await Promise.all(openServers.splice(0).map((server) => new Promise((resolve) => server.close(resolve))));
+});
 
 const ISSUER = "https://issuer.example.test";
 const AUDIENCE = "hangar-mcp-project";
@@ -52,7 +59,47 @@ describe("opaque token introspection", () => {
     });
     const result = await authorize(request(SELF_CHECK_TOKEN));
     expect(result).toMatchObject({ failure: null, subject: "user-1" });
+    // Valid for this MCP, but never forwarded to Hangar (Hangar accepts only JWTs).
+    expect(result.upstreamToken).toBeNull();
     expect(calls[0]?.pathname).toBe("/oauth/v2/introspect");
+  });
+
+  it("answers tool calls made with an opaque token with TOKEN_NOT_FORWARDABLE and never calls Hangar", async () => {
+    const hangarCalls: string[] = [];
+    const server = createHangarHttpServer(
+      introspectionConfig(),
+      undefined,
+      { fetch: async () => jsonResponse(activeClaims()) },
+      {
+        fetch: async (input) => {
+          hangarCalls.push(String(input));
+          return jsonResponse({});
+        },
+      }
+    );
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    openServers.push(server);
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("server did not bind");
+    const response = await fetch(`http://127.0.0.1:${address.port}/mcp`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${SELF_CHECK_TOKEN}`,
+        accept: "application/json, text/event-stream",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "hangar_list_projects", arguments: { limit: 1 } },
+      }),
+    });
+    expect(response.status).toBe(200);
+    const payload = (await response.json()) as { result: { isError: boolean; structuredContent: unknown } };
+    expect(payload.result.isError).toBe(true);
+    expect(payload.result.structuredContent).toMatchObject({ error: { code: "TOKEN_NOT_FORWARDABLE" } });
+    expect(hangarCalls).toHaveLength(0);
   });
 
   it("rejects inactive and errored introspection outcomes", async () => {

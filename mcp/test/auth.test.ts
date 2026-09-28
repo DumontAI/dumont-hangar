@@ -78,7 +78,7 @@ async function setupOidc() {
       .setProtectedHeader({ alg: "RS256", kid: keyId })
       .setIssuer(tokenIssuer)
       .setAudience(audience)
-      .setSubject("user-1")
+      .setSubject(typeof overrides.sub === "string" ? overrides.sub : "user-1")
       .setIssuedAt()
       .setExpirationTime(expiration)
       .sign(privateKey);
@@ -143,45 +143,44 @@ describe("OIDC authorization", () => {
     expect(await authorize(request)).toMatchObject({ failure: null, subject: "user-1" });
   });
 
-  it("accepts reader-only and writer-only tokens and hands roles and email to the tools", async () => {
+  it("accepts reader-only and writer-only tokens and hands roles and the forwardable token to the tools", async () => {
     const { config, token } = await setupOidc();
     const authorize = createAuthorizer(config);
-    const request = async (claims: Record<string, unknown>) =>
-      authorize({ headers: { host: "127.0.0.1", authorization: `Bearer ${await token(claims)}` } } as never);
+    const request = async (claims: Record<string, unknown>) => {
+      const bearer = await token(claims);
+      return {
+        bearer,
+        outcome: await authorize({ headers: { host: "127.0.0.1", authorization: `Bearer ${bearer}` } } as never),
+      };
+    };
 
-    expect(await request({})).toMatchObject({
-      failure: null,
-      principal: { sub: "user-1", email: null, roles: ["hangar_reader"] },
-    });
+    const reader = await request({});
+    expect(reader.outcome).toMatchObject({ failure: null, principal: { sub: "user-1", roles: ["hangar_reader"] } });
+    // The verified JWS itself is what gets forwarded to Hangar, with its exp.
+    expect(reader.outcome.upstreamToken).toBe(reader.bearer);
+    expect(reader.outcome.expiresAt).toBeGreaterThan(Date.now() / 1000);
+    expect(reader.outcome.principal).not.toHaveProperty("email");
     expect(
-      await request({
-        email: "Cristian@Example.test",
-        email_verified: true,
-        "urn:zitadel:iam:org:project:roles": { hangar_writer: { "dumont-org": "dumont.example.test" } },
-      })
-    ).toMatchObject({ failure: null, principal: { email: "cristian@example.test", roles: ["hangar_writer"] } });
-    // An email without email_verified === true is not trusted (spoofing).
-    for (const verified of [undefined, "true", 1]) {
-      // oxlint-disable-next-line no-await-in-loop
-      const outcome = await request({
-        email: "boss@example.test",
-        ...(verified === undefined ? {} : { email_verified: verified }),
-      });
-      expect(outcome.principal?.email).toBeNull();
-    }
+      (
+        await request({
+          "urn:zitadel:iam:org:project:roles": { hangar_writer: { "dumont-org": "dumont.example.test" } },
+        })
+      ).outcome
+    ).toMatchObject({ failure: null, principal: { roles: ["hangar_writer"] } });
     expect(
-      await request({
-        email: "x@example.test",
-        email_verified: false,
-        "urn:zitadel:iam:org:project:roles": {
-          hangar_reader: { "dumont-org": "d" },
-          hangar_writer: { "dumont-org": "d" },
-        },
-      })
-    ).toMatchObject({ failure: null, principal: { email: null, roles: ["hangar_reader", "hangar_writer"] } });
-    expect(
-      (await request({ "urn:zitadel:iam:org:project:roles": { some_other_role: { "dumont-org": "d" } } })).failure
-    ).toBe("insufficient_scope");
+      (
+        await request({
+          "urn:zitadel:iam:org:project:roles": {
+            hangar_reader: { "dumont-org": "d" },
+            hangar_writer: { "dumont-org": "d" },
+          },
+        })
+      ).outcome
+    ).toMatchObject({ failure: null, principal: { roles: ["hangar_reader", "hangar_writer"] } });
+    const denied = (await request({ "urn:zitadel:iam:org:project:roles": { some_other_role: { "dumont-org": "d" } } }))
+      .outcome;
+    expect(denied.failure).toBe("insufficient_scope");
+    expect(denied.upstreamToken).toBeUndefined();
   });
 
   it("accepts my:zitadel:grants only as <audience project>:<role>", async () => {
@@ -223,11 +222,13 @@ describe("OIDC authorization", () => {
   });
 
   it("answers a reader calling a write tool with a tool error, not an HTTP 401/403", async () => {
-    const { config: base, token } = await setupOidc();
-    const config = { ...base, writeProjects: ["HGR"] };
+    const { config, token } = await setupOidc();
     const calls: URL[] = [];
-    const server = createHangarHttpServer(config, (principal) =>
-      createHangarServer(config, new HangarClient(config, hangarFetch(calls)), { principal, audit: () => {} })
+    const server = createHangarHttpServer(config, (principal, caller) =>
+      createHangarServer(config, new HangarClient(config, caller, { fetch: hangarFetch(calls) }), {
+        principal,
+        audit: () => {},
+      })
     );
     const port = await listen(server);
     const unauthorized = await fetch(`http://127.0.0.1:${port}/mcp`, { method: "POST", body: "{}" });
@@ -255,20 +256,17 @@ describe("OIDC authorization", () => {
     expect(calls).toHaveLength(0);
   });
 
-  it("resolves a missing email through userinfo with the caller's own bearer on writes", async () => {
-    const { config: base, token } = await setupOidc();
-    const config = {
-      ...base,
-      writeProjects: ["HGR"],
-      oidcUserinfoUrl: new URL("https://issuer.example.test/oidc/v1/userinfo"),
-    };
-    const writerToken = await token({
-      "urn:zitadel:iam:org:project:roles": { hangar_writer: { "dumont-org": "dumont.example.test" } },
-    });
-    const userinfoCalls: string[] = [];
+  it("forwards each request's own bearer to Hangar and writes the '— via MCP' footer", async () => {
+    const { config, token } = await setupOidc();
+    const writerRoles = { "urn:zitadel:iam:org:project:roles": { hangar_writer: { "dumont-org": "d" } } };
+    const aliceToken = await token({ ...writerRoles, sub: "alice" });
+    const bobToken = await token({ ...writerRoles, sub: "bob" });
+    const upstream: Array<{ path: string; authorization: string }> = [];
     const comments: string[] = [];
     const reads = hangarFetch([]);
-    const upstream = async (input: string | URL, init?: RequestInit) => {
+    const fetch = async (input: string | URL, init?: RequestInit) => {
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      upstream.push({ path: new URL(String(input)).pathname, authorization: headers.Authorization ?? "" });
       if (init?.method === "POST") {
         const body = JSON.parse(String(init.body)) as { comment_html: string };
         comments.push(body.comment_html);
@@ -276,46 +274,78 @@ describe("OIDC authorization", () => {
       }
       return reads(input, init);
     };
-    const server = createHangarHttpServer(
-      config,
-      (principal, resolveEmail) =>
-        createHangarServer(config, new HangarClient(config, upstream), { principal, resolveEmail, audit: () => {} }),
-      {},
-      {
-        fetch: async (_input, init) => {
-          userinfoCalls.push(((init?.headers ?? {}) as Record<string, string>).Authorization ?? "");
-          return jsonResponse({ sub: "user-1", email: "camila@example.test", email_verified: true });
-        },
-        log: () => {},
-      }
-    );
+    const server = createHangarHttpServer(config, undefined, {}, { fetch });
     const port = await listen(server);
-    const post = (id: number, name: string, args: Record<string, unknown>) =>
-      fetch(`http://127.0.0.1:${port}/mcp`, {
+    const post = (bearer: string, id: number, name: string, args: Record<string, unknown>) =>
+      globalThis.fetch(`http://127.0.0.1:${port}/mcp`, {
         method: "POST",
         headers: {
-          authorization: `Bearer ${writerToken}`,
+          authorization: `Bearer ${bearer}`,
           accept: "application/json, text/event-stream",
           "content-type": "application/json",
         },
         body: JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } }),
       });
-    expect((await post(1, "hangar_list_projects", { limit: 1 })).status).toBe(200);
-    expect(userinfoCalls).toHaveLength(0);
-    const response = await post(2, "hangar_add_comment", { work_item: "HGR-5", body: "hello" });
+    // get_project resolves through (and fills) Alice's per-subject project cache.
+    expect((await post(aliceToken, 1, "hangar_get_project", { project: "HGR" })).status).toBe(200);
+    expect(upstream.map((call) => call.path)).toContain("/api/v1/workspaces/dumont/projects/");
+    const aliceCalls = upstream.length;
+    expect(aliceCalls).toBeGreaterThan(0);
+    expect(upstream.every((call) => call.authorization === `Bearer ${aliceToken}`)).toBe(true);
+
+    const response = await post(bobToken, 2, "hangar_add_comment", { work_item: "HGR-5", body: "hello" });
     expect(response.status).toBe(200);
-    expect(comments).toEqual(["<p>hello</p><p>— via MCP por camila@example.test</p>"]);
-    expect(userinfoCalls).toEqual([`Bearer ${writerToken}`]);
-    await post(3, "hangar_add_comment", { work_item: "HGR-5", body: "again" });
-    expect(userinfoCalls).toHaveLength(1); // cached by sub across requests
+    expect(comments).toEqual(["<p>hello</p><p>— via MCP</p>"]);
+    const bobCalls = upstream.slice(aliceCalls);
+    expect(bobCalls.length).toBeGreaterThan(0);
+    // Bob's request never reuses Alice's token (nor Alice's cached project list).
+    expect(bobCalls.every((call) => call.authorization === `Bearer ${bobToken}`)).toBe(true);
+    expect(bobCalls.map((call) => call.path)).toContain("/api/v1/workspaces/dumont/projects/");
+    expect(upstream.some((call) => /x-api-key/i.test(call.authorization))).toBe(false);
+  });
+
+  it("turns Hangar's 'account not linked' 401 into a tool error, not an MCP 401", async () => {
+    const { config, token } = await setupOidc();
+    const server = createHangarHttpServer(
+      config,
+      undefined,
+      {},
+      {
+        fetch: async () => jsonResponse({ error_code: "DUMONT_ACCOUNT_NOT_LINKED", error: "Sign in once" }, 401),
+      }
+    );
+    const port = await listen(server);
+    const response = await fetch(`http://127.0.0.1:${port}/mcp`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${await token()}`,
+        accept: "application/json, text/event-stream",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "hangar_list_projects", arguments: { limit: 1 } },
+      }),
+    });
+    expect(response.status).toBe(200);
+    expect(response.headers.get("www-authenticate")).toBeNull();
+    const payload = (await response.json()) as { result: { isError: boolean; structuredContent: unknown } };
+    expect(payload.result.isError).toBe(true);
+    expect(payload.result.structuredContent).toMatchObject({
+      error: { code: "ACCOUNT_NOT_LINKED", message: expect.stringContaining("with Dumont login") },
+    });
   });
 
   it("returns 401 metadata challenge and 403 for a valid token without the role", async () => {
     const { config, token } = await setupOidc();
     const calls: URL[] = [];
-    const hangar = new HangarClient(config, hangarFetch(calls));
-    const server = createHangarHttpServer(config, (principal) =>
-      createHangarServer(config, hangar, { principal, audit: () => {} })
+    const server = createHangarHttpServer(config, (principal, caller) =>
+      createHangarServer(config, new HangarClient(config, caller, { fetch: hangarFetch(calls) }), {
+        principal,
+        audit: () => {},
+      })
     );
     const port = await listen(server);
     const baseUrl = `http://127.0.0.1:${port}`;
@@ -378,13 +408,13 @@ describe("OIDC authorization", () => {
       return (await response.json()) as Record<string, unknown>;
     };
     const listed = await call(3, "tools/list", {});
-    // Writes are disabled in this config, so only the nine read tools are listed.
-    expect((listed.result as { tools: unknown[] }).tools).toHaveLength(9);
+    // Nine read tools plus three write tools (gated per call by the writer role).
+    expect((listed.result as { tools: unknown[] }).tools).toHaveLength(12);
     const result = await call(4, "tools/call", {
       name: "hangar_list_projects",
       arguments: { limit: 10, response_format: "json" },
     });
     expect(result.result).toMatchObject({ structuredContent: { results: [{ id: PROJECT_HGR }] } });
-    expect(calls[0]?.pathname).toBe("/api/v1/workspaces/dumont/projects/");
+    expect(calls.map((url) => url.pathname)).toEqual(["/api/v1/users/me/", "/api/v1/workspaces/dumont/projects/"]);
   });
 });

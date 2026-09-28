@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { HangarConfigError, assertHttpAuthConfigured, isApiKey, loadHangarConfig } from "../src/config.js";
+import { HangarConfigError, assertHttpAuthConfigured, loadHangarConfig } from "../src/config.js";
 
-const VALID_KEY = "plane_api_" + "a".repeat(32);
+const CURSOR_SECRET = "c".repeat(32);
 
 function env(overrides: Record<string, string | undefined> = {}): NodeJS.ProcessEnv {
   return {
-    HANGAR_API_KEY: VALID_KEY,
+    MCP_CURSOR_SECRET: CURSOR_SECRET,
     HANGAR_WORKSPACE_SLUG: "dumont",
     HANGAR_ALLOWED_PROJECTS: "HGR",
     MCP_OIDC_ISSUER: "https://auth.getdumont.ai",
@@ -31,21 +31,51 @@ describe("Hangar configuration", () => {
       "urn:zitadel:iam:org:project:role:hangar_reader",
       "urn:zitadel:iam:org:project:role:hangar_writer",
     ]);
-    expect(config.oidcUserinfoUrl?.href).toBe("https://auth.getdumont.ai/oidc/v1/userinfo");
-    expect(config.writeProjects).toEqual([]);
     expect(config.writeRateLimit).toBe(20);
-    expect(isApiKey(config.apiKey)).toBe(true);
+    expect(config.cursorSecret).toBe(CURSOR_SECRET);
+    expect(Object.keys(config)).not.toContain("apiKey");
+    expect(Object.keys(config)).not.toContain("writeProjects");
   });
 
-  it("fails closed without a well-formed API key", () => {
-    expect(() => loadHangarConfig(env({ HANGAR_API_KEY: undefined }))).toThrow(HangarConfigError);
-    expect(() => loadHangarConfig(env({ HANGAR_API_KEY: "plane_api_" + "A".repeat(32) }))).toThrow(HangarConfigError);
-    expect(() => loadHangarConfig(env({ HANGAR_API_KEY: "a".repeat(41) }))).toThrow(HangarConfigError);
+  it("refuses to start with the retired bot key or write list, even when empty", () => {
+    for (const value of ["plane_api_" + "a".repeat(32), ""]) {
+      expect(() => loadHangarConfig(env({ HANGAR_API_KEY: value }))).toThrow(/HANGAR_API_KEY is retired, remove it/);
+      expect(() => loadHangarConfig(env({ HANGAR_WRITE_PROJECTS: value || "HGR" }))).toThrow(
+        /HANGAR_WRITE_PROJECTS is retired, remove it/
+      );
+    }
+    expect(() => loadHangarConfig(env({ HANGAR_WRITE_PROJECTS: "" }))).toThrow(HangarConfigError);
+    // The error never echoes the value.
+    const secret = "plane_api_" + "b".repeat(32);
+    let message = "";
+    try {
+      loadHangarConfig(env({ HANGAR_API_KEY: secret }));
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toMatch(/retired/);
+    expect(message).not.toContain(secret);
   });
 
-  it("requires a workspace slug and an explicit project allowlist", () => {
+  it("requires MCP_CURSOR_SECRET of at least 32 bytes without echoing it", () => {
+    expect(() => loadHangarConfig(env({ MCP_CURSOR_SECRET: undefined }))).toThrow(/MCP_CURSOR_SECRET is required/);
+    const short = "short-secret-value";
+    let message = "";
+    try {
+      loadHangarConfig(env({ MCP_CURSOR_SECRET: short }));
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toMatch(/at least 32 bytes/);
+    expect(message).not.toContain(short);
+    expect(() => loadHangarConfig(env({ MCP_CURSOR_SECRET: "a".repeat(31) }))).toThrow(HangarConfigError);
+    expect(loadHangarConfig(env({ MCP_CURSOR_SECRET: "a".repeat(32) })).cursorSecret).toHaveLength(32);
+  });
+
+  it("requires a workspace slug; the project ceiling is optional", () => {
     expect(() => loadHangarConfig(env({ HANGAR_WORKSPACE_SLUG: "Dumont" }))).toThrow(HangarConfigError);
-    expect(() => loadHangarConfig(env({ HANGAR_ALLOWED_PROJECTS: undefined }))).toThrow(HangarConfigError);
+    expect(loadHangarConfig(env({ HANGAR_ALLOWED_PROJECTS: undefined })).allowedProjects).toEqual([]);
+    expect(loadHangarConfig(env({ HANGAR_ALLOWED_PROJECTS: "" })).allowedProjects).toEqual([]);
     expect(() => loadHangarConfig(env({ HANGAR_ALLOWED_PROJECTS: "HGR, not a project!" }))).toThrow(HangarConfigError);
   });
 

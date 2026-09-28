@@ -11,13 +11,19 @@
  * [text](http(s)/mailto URL) links. Anything else is literal text.
  */
 
-export const FOOTER_PREFIX = "— via MCP por";
+/**
+ * Hangar records the real author (the MCP calls it as the logged-in user), so
+ * the footer only says the text came through the MCP; it names nobody.
+ */
+export const FOOTER_TEXT = "— via MCP";
 
-// A line shaped like the generated footer (em dash, "via MCP por", a name).
-// Removed from caller text wherever it appears, so a caller can neither stack
-// footers nor forge another person's attribution line. Lines starting with
-// "-" or "--" are ordinary list items/prose and are left alone.
-const FOOTER_LINE = /^[ \t]*—[ \t]*via[ \t]+MCP[ \t]+por[ \t]+\S.*$/i;
+// A line shaped like a generated footer: an em dash, then "via MCP", then
+// anything. That covers the current `— via MCP` and the retired
+// `— via MCP por <name>` (which named a person). Removed from caller text
+// wherever it appears, so a caller can neither stack footers nor forge an old
+// attribution line naming someone else. Lines starting with "-" or "--" are
+// ordinary list items/prose and are left alone.
+const FOOTER_LINE = /^[ \t]*—[ \t]*via[ \t]+MCP(?![A-Za-z0-9_]).*$/i;
 
 export function escapeHtml(value: string): string {
   return value
@@ -161,21 +167,21 @@ export function stripFooter(text: string): string {
   return lines.join("\n");
 }
 
-export function footerHtml(actor: string): string {
-  return `<p>${escapeHtml(`${FOOTER_PREFIX} ${actor}`)}</p>`;
+export function footerHtml(): string {
+  return `<p>${escapeHtml(FOOTER_TEXT)}</p>`;
 }
 
-/** Caller text -> HTML body with exactly one attribution footer at the end. */
-export function htmlWithFooter(text: string, actor: string): string {
+/** Caller text -> HTML body with exactly one footer at the end. */
+export function htmlWithFooter(text: string): string {
   const body = textToHtml(stripFooter(text));
-  return `${body}${footerHtml(actor)}`;
+  return `${body}${footerHtml()}`;
 }
 
 /**
  * Appends caller text (as safe HTML) and one footer after the stored
  * description HTML. The stored HTML is kept byte for byte; it was already
- * sanitized by Plane when it was saved.
+ * sanitized by Plane when it was saved (older footers in it stay as they were).
  */
-export function appendWithFooter(existingHtml: string, text: string, actor: string): string {
-  return `${existingHtml}${textToHtml(stripFooter(text))}${footerHtml(actor)}`;
+export function appendWithFooter(existingHtml: string, text: string): string {
+  return `${existingHtml}${textToHtml(stripFooter(text))}${footerHtml()}`;
 }

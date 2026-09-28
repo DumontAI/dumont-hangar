@@ -1,10 +1,17 @@
 // Post-deploy READ-ONLY smoke with a short-lived OIDC access token: initialize,
 // list the tool catalog, and read the project list. It never calls a write
 // tool. Prints only outcome codes and counts, never the token.
+//
+// The MCP forwards this token to Hangar and acts as its user, so it must be a
+// JWT from the pinned public client, and that user must have signed in once
+// to Hangar web with Dumont login. The project list is what THAT user sees
+// (0 is a valid answer for a user without projects). A tool error prints its
+// code, e.g. HANGAR_PROJECTS_READ_FAILED:ACCOUNT_NOT_LINKED.
 const endpoint = process.env.MCP_URL?.trim() || `http://127.0.0.1:${process.env.MCP_HTTP_PORT || "3014"}/mcp`;
 const token = process.env.MCP_AUTH_TOKEN?.trim() || "";
-// 9 read tools, plus 3 write tools when HANGAR_WRITE_PROJECTS is set.
-const EXPECTED_TOOL_COUNTS = new Set([9, 12]);
+// 9 read tools plus 3 write tools (always listed; the writer role gates them per call).
+const EXPECTED_TOOL_COUNTS = new Set([12]);
+const TOOL_ERROR_CODE = /^[A-Z][A-Z_]{1,63}$/;
 const REQUEST_TIMEOUT_MS = 10000;
 
 function fail(code) {
@@ -94,7 +101,12 @@ const call = await rpc({
   params: { name: "hangar_list_projects", arguments: { limit: 1, response_format: "json" } },
 });
 const structured = call?.body?.result?.structuredContent;
-if (!structured || call.body?.result?.isError === true || !Array.isArray(structured.results)) {
+if (call?.body?.result?.isError === true) {
+  // Only a code-shaped value is printed; tool messages are never echoed.
+  const code = structured?.error?.code;
+  fail(`HANGAR_PROJECTS_READ_FAILED${typeof code === "string" && TOOL_ERROR_CODE.test(code) ? `:${code}` : ""}`);
+}
+if (!structured || !Array.isArray(structured.results)) {
   fail("HANGAR_PROJECTS_READ_FAILED");
 }
 
