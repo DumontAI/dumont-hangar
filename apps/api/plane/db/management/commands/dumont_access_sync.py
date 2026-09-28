@@ -1,0 +1,73 @@
+# Dumont addition: run the ZITADEL -> Hangar membership sync by hand. Not upstream Plane.
+# The logic lives in plane/dumont/access/; this file only parses arguments and prints the report.
+#
+#   python manage.py dumont_access_sync --mode dry-run          # preview, writes nothing
+#   python manage.py dumont_access_sync --mode dry-run --json   # machine-readable report
+#   python manage.py dumont_access_sync                         # uses DUMONT_ACCESS_SYNC
+#
+# Exit status: 0 ok (including dry-run and mode off), 1 error (nothing written), 2 safety brake.
+
+import json
+
+from django.core.management import BaseCommand, CommandError
+
+from plane.dumont.access.config import MODE_DRY_RUN, MODE_ENFORCE, MODE_OFF
+
+
+class Command(BaseCommand):
+    help = "Sync Hangar workspace/project memberships from ZITADEL grants (see docs/dumont/zitadel-access.md)"
+
+    def add_arguments(self, parser):
+        parser.add_argument(
+            "--mode",
+            choices=[MODE_OFF, MODE_DRY_RUN, MODE_ENFORCE],
+            help="Override DUMONT_ACCESS_SYNC for this run (enforce still requires DUMONT_ACCESS_SYNC=enforce)",
+        )
+        parser.add_argument("--json", action="store_true", help="Print the full report as JSON")
+
+    def handle(self, *args, **options):
+        from plane.dumont.access.sync import STATUS_BRAKE, STATUS_BUSY, STATUS_ERROR, run_full_sync
+
+        report = run_full_sync(mode=options.get("mode"))
+        if options.get("json"):
+            self.stdout.write(json.dumps(report, indent=2, sort_keys=True, default=str))
+        else:
+            self._print_human(report)
+        if report["status"] == STATUS_BRAKE:
+            raise CommandError("safety brake: nothing was written", returncode=2)
+        if report["status"] in (STATUS_ERROR, STATUS_BUSY):
+            raise CommandError(f"{report['status']}: {report.get('error', 'another sync is running')}", returncode=1)
+
+    def _print_human(self, report):
+        out = self.stdout.write
+        out(f"status: {report['status']}  mode: {report['mode']}")
+        if report.get("error"):
+            out(f"error: {report['error']}")
+        managed = report.get("managed")
+        if managed is None:
+            return
+        out(f"managed workspace: {'yes' if managed['workspace'] else 'no'}")
+        out(f"managed projects: {', '.join(managed['projects']) or '-'}")
+        for key in ("unknown_project_roles", "invalid_role_keys"):
+            if report.get(key):
+                out(f"{key}: {', '.join(report[key])}")
+        out(f"changes ({len(report['changes'])}):")
+        for change in report["changes"]:
+            role = f"{change['from_role'] or '-'} -> {change['to_role'] or '-'}"
+            cascade = " (cascade)" if change["cascade"] else ""
+            who = change["email"] or change["user_id"]
+            out(f"  {change['action']:<11} {change['scope']:<12} {who}  {role}{cascade}")
+        out(f"pending grants, no Dumont login yet ({len(report['pending'])}):")
+        for item in report["pending"]:
+            out(f"  {item.get('email') or item['zitadel_user_id']}: {', '.join(item['roles'])}")
+        if report["notes"]:
+            out(f"notes ({len(report['notes'])}):")
+            for note in report["notes"]:
+                detail = {k: v for k, v in note.items() if k not in ("kind",)}
+                out(f"  {note['kind']}: {detail}")
+        if "applied" in report:
+            out(
+                f"applied: {report['applied']}  stale: {len(report['stale'])}  failed scopes: {report['failed_scopes']}"
+            )
+        if report["status"] == "aborted_brake":
+            out(f"SAFETY BRAKE: {report['counts']['deactivations']} deactivations > {report.get('max_removals')}")
