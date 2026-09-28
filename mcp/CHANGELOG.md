@@ -1,5 +1,58 @@
 # Hangar MCP changelog
 
+## 0.3.0 — the MCP acts as the logged-in user (not deployed yet)
+
+Needs the Hangar (Plane fork) side first: API v1 accepting
+`Authorization: Bearer <ZITADEL JWT>` (`apps/api/plane/dumont/`,
+`DUMONT_API_BEARER_ENABLED=1`, `DUMONT_API_AUDIENCES` containing
+`MCP_OIDC_AUDIENCE`).
+
+### Changes
+
+- Upstream calls to Hangar API v1 send the caller's own verified access token
+  (`Authorization: Bearer`), never an `x-api-key`. Hangar applies the user's
+  own workspace/project permissions and records the user as the author. The
+  bot account `hangar-mcp@dumont.au` is no longer used.
+- Only a locally verified JWS is forwarded. Opaque (JWE) tokens accepted
+  through introspection are not forwarded; their tool calls answer
+  `TOKEN_NOT_FORWARDABLE` (use the pinned public client).
+- Per request, the HTTP layer builds a new McpServer and a Hangar client bound
+  to the verified caller; no global mutable caller state.
+- Caches (project list, workspace members, Hangar user id) are keyed per token
+  `sub`, bounded (1000 users, LRU) and never shared between users.
+- Pagination cursors: HMAC key from the new required `MCP_CURSOR_SECRET`
+  (>= 32 bytes; previously derived from the API key), and bound to the
+  caller's `sub`.
+- `"me"` is the Hangar user behind the token (`GET /api/v1/users/me/`). The
+  userinfo email lookup and `MCP_OIDC_USERINFO_URL` are removed; the
+  principal no longer carries an email.
+- Footer is now `— via MCP` (no name). Footer-shaped lines of both the new and
+  the old `— via MCP por <name>` shape are stripped from caller text.
+- Hangar errors mapped to actionable tool errors: `ACCOUNT_NOT_LINKED` (sign
+  in once to Hangar web with Dumont login), `WRITER_ROLE_REQUIRED`,
+  `PROJECT_ACCESS_DENIED` (names the `hangar.project.<id>.member` role),
+  `TOKEN_EXPIRED` (retryable; only when the token is within 60 s of `exp`),
+  `UPSTREAM_UNAUTHORIZED`. A Hangar 401 never becomes an MCP HTTP 401.
+- Write tools are always registered (12 tools); `hangar_writer` still gates
+  them per call. `WRITES_DISABLED` and `PROJECT_NOT_WRITABLE` are gone.
+- `HANGAR_ALLOWED_PROJECTS` is now an optional ceiling (empty = whatever
+  Hangar lets the user see). A user with no projects gets an empty list, not
+  an error.
+- Audit line: `email` replaced by `plane_user_id`.
+- `HANGAR_API_KEY` and `HANGAR_WRITE_PROJECTS` are retired: startup error if
+  present (even empty), with a "retired, remove it" message.
+- `scripts/live-smoke.mjs` expects 12 tools and prints the tool error code on
+  a failed read.
+
+### Owner steps
+
+Follow README → "Manual deploy (0.3.0: acting as the user)". In short: deploy
+and verify the Hangar side first; then, in one go, remove `HANGAR_API_KEY` and
+`HANGAR_WRITE_PROJECTS` from `/etc/dumont-hangar-mcp.env`, add
+`MCP_CURSOR_SECRET`, validate, switch, restart. Every user must sign in once
+to Hangar web with Dumont login. Revoke the bot token only after the release
+is stable.
+
 ## 0.2.0 — HGR-6: role-gated writes (not deployed yet)
 
 ### Changes
