@@ -2,6 +2,7 @@
 # Not upstream Plane. Keep this file self-contained so upstream merges stay clean.
 
 # Python imports
+import logging
 import os
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
@@ -16,14 +17,37 @@ from plane.authentication.adapter.error import (
     AuthenticationException,
 )
 
+logger = logging.getLogger("plane.authentication")
+
 # Single tenant, single issuer. Overridable only so a staging instance can point elsewhere.
 DUMONT_AUTH_HOST = os.environ.get("DUMONT_AUTH_HOST", "https://auth.getdumont.ai").rstrip("/")
+
+# ZITADEL scope that adds the user's organization to the userinfo answer, and the claim it adds.
+# https://zitadel.com/docs/apis/openidoauth/scopes (urn:zitadel:iam:user:resourceowner)
+RESOURCE_OWNER_SCOPE = "urn:zitadel:iam:user:resourceowner"
+RESOURCE_OWNER_ID_CLAIM = "urn:zitadel:iam:user:resourceowner:id"
+
+
+def _allowed_org_id():
+    """DUMONT_ZITADEL_ORG_ID, read per login. "" = no org check (the behaviour before this existed).
+
+    A malformed value refuses every Dumont login (fail closed) instead of silently turning the check off.
+    """
+    from plane.dumont.auth.config import BearerConfigError, parse_zitadel_org_id
+
+    try:
+        return parse_zitadel_org_id(os.environ)
+    except BearerConfigError:
+        raise AuthenticationException(
+            error_code=AUTHENTICATION_ERROR_CODES["DUMONT_NOT_CONFIGURED"],
+            error_message="DUMONT_NOT_CONFIGURED",
+        ) from None
 
 
 class DumontOAuthProvider(OauthAdapter):
     token_url = f"{DUMONT_AUTH_HOST}/oauth/v2/token"
     userinfo_url = f"{DUMONT_AUTH_HOST}/oidc/v1/userinfo"
-    scope = "openid email profile"
+    scope = f"openid email profile {RESOURCE_OWNER_SCOPE}"
     provider = "dumont"
 
     def __init__(self, request, code=None, state=None, callback=None):
@@ -98,6 +122,19 @@ class DumontOAuthProvider(OauthAdapter):
 
     def set_user_data(self):
         user_info_response = self.get_user_response()
+        # Organization boundary. The ZITADEL instance is shared with other products' organizations,
+        # and any of their users can complete this OIDC flow. When DUMONT_ZITADEL_ORG_ID is set, only
+        # users of that organization may sign in. This runs before complete_login_or_signup, so a
+        # refused login never creates a user, never links an Account and never matches by e-mail.
+        # The claim comes from the userinfo endpoint (fetched from the issuer with the access token),
+        # not from the unverified id_token.
+        allowed_org_id = _allowed_org_id()
+        if allowed_org_id and user_info_response.get(RESOURCE_OWNER_ID_CLAIM) != allowed_org_id:
+            logger.warning("Dumont login refused: user is not in the configured ZITADEL organization")
+            raise AuthenticationException(
+                error_code=AUTHENTICATION_ERROR_CODES["DUMONT_ORG_NOT_ALLOWED"],
+                error_message="DUMONT_ORG_NOT_ALLOWED",
+            )
         email = user_info_response.get("email")
         # Fail closed exactly like upstream's providers (GHSA-7j95-vh8g-f365): an unverified
         # address would let anyone claim a Hangar account by registering someone else's address
