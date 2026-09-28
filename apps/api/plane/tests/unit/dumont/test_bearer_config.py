@@ -131,3 +131,97 @@ class TestBearerConfig:
     def test_web_url_for_the_not_linked_message(self):
         config = load_bearer_config({**ENABLED, "WEB_URL": "https://hangar.example.test/"})
         assert config.web_url == "https://hangar.example.test"
+
+
+INTROSPECTION_SECRET = "config-test-secret-value"
+WITH_INTROSPECTION = {
+    **ENABLED,
+    "DUMONT_API_INTROSPECTION_CLIENT_ID": "390213468206137347@hangar-api",
+    "DUMONT_API_INTROSPECTION_CLIENT_SECRET": INTROSPECTION_SECRET,
+}
+
+
+@pytest.mark.unit
+class TestIntrospectionConfig:
+    def test_off_by_default(self):
+        config = load_bearer_config(ENABLED)
+        assert config.introspection_enabled is False
+        assert (config.introspection_url, config.introspection_client_id, config.introspection_client_secret) == (
+            "",
+            "",
+            "",
+        )
+
+    def test_on_with_id_and_secret_and_default_url(self):
+        config = load_bearer_config({**WITH_INTROSPECTION, "DUMONT_AUTH_HOST": "https://auth.staging.test/"})
+        assert config.introspection_enabled is True
+        assert config.introspection_url == "https://auth.staging.test/oauth/v2/introspect"
+        assert config.introspection_client_id == "390213468206137347@hangar-api"
+        assert config.introspection_client_secret == INTROSPECTION_SECRET
+
+    def test_explicit_url_same_origin(self):
+        config = load_bearer_config(
+            {**WITH_INTROSPECTION, "DUMONT_API_INTROSPECTION_URL": "https://auth.getdumont.ai/custom/introspect/"}
+        )
+        assert config.introspection_url == "https://auth.getdumont.ai/custom/introspect"
+
+    @pytest.mark.parametrize(
+        "missing, named",
+        [
+            ("DUMONT_API_INTROSPECTION_CLIENT_ID", "DUMONT_API_INTROSPECTION_CLIENT_ID"),
+            ("DUMONT_API_INTROSPECTION_CLIENT_SECRET", "DUMONT_API_INTROSPECTION_CLIENT_SECRET"),
+        ],
+    )
+    def test_one_without_the_other(self, missing, named):
+        env = {**WITH_INTROSPECTION, missing: "  "}
+        with pytest.raises(BearerConfigError, match=named) as error:
+            load_bearer_config(env)
+        assert INTROSPECTION_SECRET not in str(error.value)
+
+    def test_url_without_credentials(self):
+        with pytest.raises(BearerConfigError, match="DUMONT_API_INTROSPECTION_URL"):
+            load_bearer_config(
+                {**ENABLED, "DUMONT_API_INTROSPECTION_URL": "https://auth.getdumont.ai/oauth/v2/introspect"}
+            )
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://evil.test/oauth/v2/introspect",
+            "https://auth.getdumont.ai:8443/oauth/v2/introspect",
+            "http://auth.getdumont.ai/oauth/v2/introspect",
+            "https://auth.getdumont.ai/oauth/v2/introspect?x=1",
+            "https://user:pw@auth.getdumont.ai/oauth/v2/introspect",
+            "ftp://auth.getdumont.ai/introspect",
+        ],
+    )
+    def test_url_must_be_https_same_origin(self, url):
+        with pytest.raises(BearerConfigError, match="DUMONT_API_INTROSPECTION_URL") as error:
+            load_bearer_config({**WITH_INTROSPECTION, "DUMONT_API_INTROSPECTION_URL": url})
+        assert INTROSPECTION_SECRET not in str(error.value)
+
+    def test_loopback_http_allowed_with_loopback_issuer(self):
+        config = load_bearer_config({**WITH_INTROSPECTION, "DUMONT_AUTH_HOST": "http://localhost:8080"})
+        assert config.introspection_url == "http://localhost:8080/oauth/v2/introspect"
+
+    @pytest.mark.parametrize("name", ["DUMONT_API_INTROSPECTION_CLIENT_ID", "DUMONT_API_INTROSPECTION_CLIENT_SECRET"])
+    def test_whitespace_inside_is_refused(self, name):
+        with pytest.raises(BearerConfigError, match=name) as error:
+            load_bearer_config({**WITH_INTROSPECTION, name: "two words"})
+        assert "two words" not in str(error.value)
+
+    def test_secret_not_in_repr(self):
+        config = load_bearer_config(WITH_INTROSPECTION)
+        assert INTROSPECTION_SECRET not in repr(config)
+        assert "introspection_client_secret" not in repr(config)
+
+    def test_ignored_when_bearer_disabled(self):
+        config = load_bearer_config(
+            {
+                "DUMONT_API_BEARER_ENABLED": "0",
+                "DUMONT_API_INTROSPECTION_CLIENT_ID": "id-only",
+                "DUMONT_API_INTROSPECTION_URL": "ftp://x",
+            }
+        )
+        assert config.enabled is False
+        assert config.introspection_enabled is False

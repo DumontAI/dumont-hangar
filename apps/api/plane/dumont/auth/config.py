@@ -6,7 +6,7 @@
 # with a clear message instead of failing on the first request.
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
 from django.core.exceptions import ImproperlyConfigured
@@ -34,6 +34,16 @@ class BearerConfig:
     writer_role: str = DEFAULT_WRITER_ROLE
     rate_limit: str = "60/minute"
     web_url: str = ""
+    # RFC 7662 introspection for opaque (non-JWS) access tokens. All three are "" unless both
+    # DUMONT_API_INTROSPECTION_CLIENT_ID and _CLIENT_SECRET are set. The secret is kept out of
+    # repr() so it never shows up in a log line, a traceback or Django's debug page.
+    introspection_url: str = ""
+    introspection_client_id: str = ""
+    introspection_client_secret: str = field(default="", repr=False)
+
+    @property
+    def introspection_enabled(self):
+        return bool(self.introspection_url and self.introspection_client_id and self.introspection_client_secret)
 
 
 def _canonical_url(value, name):
@@ -85,6 +95,43 @@ def parse_zitadel_org_id(environ):
     return value
 
 
+def _introspection(environ, auth_host, issuer):
+    """(url, client_id, client_secret) for RFC 7662 introspection, or three "" when it is off.
+
+    On only when both the client id and the secret are set. One without the other, or a URL
+    without credentials, is a half-done setup and refuses to start. Error messages name the
+    variable, never its value.
+    """
+    client_id = (environ.get("DUMONT_API_INTROSPECTION_CLIENT_ID") or "").strip()
+    client_secret = (environ.get("DUMONT_API_INTROSPECTION_CLIENT_SECRET") or "").strip()
+    url = (environ.get("DUMONT_API_INTROSPECTION_URL") or "").strip()
+    if not client_id and not client_secret:
+        if url:
+            raise BearerConfigError(
+                "DUMONT_API_INTROSPECTION_URL is set but DUMONT_API_INTROSPECTION_CLIENT_ID and "
+                "DUMONT_API_INTROSPECTION_CLIENT_SECRET are not"
+            )
+        return "", "", ""
+    if not client_id:
+        raise BearerConfigError(
+            "DUMONT_API_INTROSPECTION_CLIENT_ID is required with DUMONT_API_INTROSPECTION_CLIENT_SECRET"
+        )
+    if not client_secret:
+        raise BearerConfigError(
+            "DUMONT_API_INTROSPECTION_CLIENT_SECRET is required with DUMONT_API_INTROSPECTION_CLIENT_ID"
+        )
+    if re.search(r"\s", client_id):
+        raise BearerConfigError("DUMONT_API_INTROSPECTION_CLIENT_ID must be one value without whitespace")
+    if re.search(r"\s", client_secret):
+        raise BearerConfigError("DUMONT_API_INTROSPECTION_CLIENT_SECRET must be one value without whitespace")
+    url = _canonical_url(url or f"{auth_host}/oauth/v2/introspect", "DUMONT_API_INTROSPECTION_URL")
+    if _origin(url) != _origin(issuer):
+        raise BearerConfigError(
+            "DUMONT_API_INTROSPECTION_URL must have the same origin (scheme, host, port) as the issuer"
+        )
+    return url, client_id, client_secret
+
+
 def load_bearer_config(environ, default_rate="60/minute"):
     """Parse the DUMONT_API_BEARER_* / DUMONT_AUTH_* variables. Raises BearerConfigError when enabled but invalid."""
     enabled = _enabled(environ.get("DUMONT_API_BEARER_ENABLED"))
@@ -130,6 +177,8 @@ def load_bearer_config(environ, default_rate="60/minute"):
 
     web_url = (environ.get("WEB_URL") or environ.get("APP_BASE_URL") or "").strip().rstrip("/")
 
+    introspection_url, introspection_client_id, introspection_client_secret = _introspection(environ, auth_host, issuer)
+
     return BearerConfig(
         enabled=True,
         issuer=issuer,
@@ -140,4 +189,7 @@ def load_bearer_config(environ, default_rate="60/minute"):
         writer_role=writer_role,
         rate_limit=rate_limit,
         web_url=web_url,
+        introspection_url=introspection_url,
+        introspection_client_id=introspection_client_id,
+        introspection_client_secret=introspection_client_secret,
     )

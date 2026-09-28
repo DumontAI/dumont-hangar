@@ -20,6 +20,7 @@ from rest_framework import status
 from rest_framework.authentication import BaseAuthentication
 from rest_framework.exceptions import APIException, AuthenticationFailed, PermissionDenied
 
+from plane.dumont.auth.introspection import IntrospectionUnavailable, introspect, token_fingerprint
 from plane.dumont.auth.jwks import UnknownKid, get_jwks_client
 from plane.dumont.auth.roles import granted_roles
 
@@ -32,6 +33,10 @@ NOT_BEFORE_LEEWAY_SECONDS = 30
 BEARER_HEADER = re.compile(r"^Bearer[ \t]+([^ \t]+)$", re.IGNORECASE)
 BEARER_SCHEME = re.compile(r"^Bearer(?:[ \t]|$)", re.IGNORECASE)
 BASE64URL_SEGMENT = re.compile(r"^[A-Za-z0-9_-]+$")
+# RFC 6750 `b64token`: the only shape a non-JWS bearer may have before it is sent to introspection.
+OPAQUE_TOKEN = re.compile(r"^[A-Za-z0-9\-._~+/]+=*$")
+# `token_type` values an introspection answer may carry for an access token (as in the MCP).
+ACCESS_TOKEN_TYPES = frozenset({"bearer", "access_token", "urn:ietf:params:oauth:token-type:access_token"})
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 ERROR_INVALID_TOKEN = "DUMONT_INVALID_TOKEN"
@@ -113,7 +118,11 @@ def _bearer_header(request):
 
 
 class ZitadelBearerAuthentication(BaseAuthentication):
-    """`Authorization: Bearer <ZITADEL JWT access token>` for API v1.
+    """`Authorization: Bearer <ZITADEL access token>` for API v1.
+
+    JWT access tokens are verified locally against the JWKS. Opaque access tokens are checked
+    with RFC 7662 introspection when DUMONT_API_INTROSPECTION_CLIENT_ID/_SECRET are set, and
+    rejected otherwise. Both paths then run the same claim checks and org-bound role gate.
 
     Returns None (so X-Api-Key keeps working unchanged) when the feature is off or the
     request has no Bearer Authorization header.
@@ -145,7 +154,7 @@ class ZitadelBearerAuthentication(BaseAuthentication):
             if not match:
                 raise _invalid("malformed_header")
             token = match.group(1)
-            claims = self._verify(token, config)
+            claims, token_id = self._verify(token, config)
         except InvalidBearerToken:
             setattr(request, _INVALID_TOKEN_FLAG, True)
             raise
@@ -171,15 +180,47 @@ class ZitadelBearerAuthentication(BaseAuthentication):
             )
 
         self._run_hook(user, sub)
-        return (user, AuthContext(sub=sub, roles=roles, token_id=self._token_id(claims, token)))
+        return (user, AuthContext(sub=sub, roles=roles, token_id=token_id))
 
     def _verify(self, token, config):
+        """(claims, token_id) of a valid access token. Raises InvalidBearerToken or AuthUnavailable."""
         if len(token.encode("utf-8")) > MAX_BEARER_BYTES:
             raise _invalid("too_large")
         parts = token.split(".")
-        # Only compact JWS (3 segments). JWE (5 segments), opaque tokens and anything else stop here.
-        if len(parts) != 3 or not all(BASE64URL_SEGMENT.match(part) for part in parts):
+        # Compact JWS (3 segments) is only ever verified locally, so a JWT (an ID token, a forged
+        # token) never reaches the issuer. Anything else (ZITADEL opaque tokens, JWE) is only
+        # accepted through introspection, when it is configured.
+        if len(parts) == 3 and all(BASE64URL_SEGMENT.match(part) for part in parts):
+            claims = self._verify_jws(token, parts, config)
+            return claims, self._token_id(claims, token)
+        if not config.introspection_enabled:
             raise _invalid("not_jws")
+        if not OPAQUE_TOKEN.match(token):
+            raise _invalid("malformed_token")
+        return self._verify_by_introspection(token, config)
+
+    def _verify_by_introspection(self, token, config):
+        try:
+            claims = introspect(token, config)
+        except IntrospectionUnavailable:
+            # We could not check the token, which is not the caller's fault: 503 so clients retry
+            # instead of starting a new login. Never 401, never 500.
+            raise AuthUnavailable(
+                {
+                    "error_code": ERROR_AUTH_UNAVAILABLE,
+                    "error": "Dumont Auth token introspection is temporarily unavailable. Retry shortly.",
+                }
+            ) from None
+        if claims is None:
+            raise _invalid("inactive")
+        token_type = claims.get("token_type")
+        if "token_type" in claims and not (isinstance(token_type, str) and token_type.lower() in ACCESS_TOKEN_TYPES):
+            raise _invalid("token_type")
+        self._check_claims(claims, config)
+        # Always the fingerprint here (never the token): the audit id of an introspected token.
+        return claims, "sha256:" + token_fingerprint(token)[:16]
+
+    def _verify_jws(self, token, parts, config):
         header = _decode_header(parts[0])
         if header is None or header.get("alg") != "RS256" or "enc" in header:
             raise _invalid("bad_header")
@@ -199,7 +240,7 @@ class ZitadelBearerAuthentication(BaseAuthentication):
             raise AuthUnavailable()
 
         try:
-            # Signature only; the claim checks below mirror mcp/src/auth.ts evaluateAccessClaims.
+            # Signature only; _check_claims mirrors mcp/src/auth.ts evaluateAccessClaims.
             claims = jwt.decode(
                 token,
                 signing_key.key,
@@ -220,7 +261,12 @@ class ZitadelBearerAuthentication(BaseAuthentication):
             raise _invalid("bad_signature")
         if not isinstance(claims, dict):
             raise _invalid("bad_payload")
+        self._check_claims(claims, config)
+        return claims
 
+    @staticmethod
+    def _check_claims(claims, config):
+        """The claim checks shared by JWS and introspected tokens (mirror of the MCP's evaluateAccessClaims)."""
         now = int(time.time())
         if claims.get("iss") != config.issuer:
             raise _invalid("issuer")
@@ -239,7 +285,6 @@ class ZitadelBearerAuthentication(BaseAuthentication):
         # `nonce`/`at_hash` only appear in ID tokens; never accept one as an access token.
         if "nonce" in claims or "at_hash" in claims:
             raise _invalid("id_token")
-        return claims
 
     def _resolve_user(self, sub, config):
         # Imported here so this module stays importable before the app registry is ready.
