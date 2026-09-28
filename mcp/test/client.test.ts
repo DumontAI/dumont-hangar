@@ -1,11 +1,17 @@
 import { describe, expect, it } from "vitest";
+import { SubjectCache } from "../src/cache.js";
 import { HangarClient } from "../src/client.js";
+import type { UpstreamCaller } from "../src/types.js";
 import {
   HGR_PROJECT,
   HGR_WORK_ITEM,
+  ME_USER_ID,
   PROJECT_HGR,
   PROJECT_SEC,
   SECRET_PROJECT,
+  TEST_ACCESS_TOKEN,
+  callerFor,
+  meUserIdFor,
   hangarFetch,
   jsonResponse,
   testConfig,
@@ -14,10 +20,22 @@ import {
 type Fetcher = (input: string | URL, init?: RequestInit) => Promise<Response>;
 type ConfigOverrides = Parameters<typeof testConfig>[0];
 
-function client(overrides: ConfigOverrides = {}, fetcher?: Fetcher) {
+const ALICE = { sub: "alice-sub" };
+const BOB = { sub: "bob-sub" };
+
+function client(
+  overrides: ConfigOverrides = {},
+  fetcher?: Fetcher,
+  options: { caller?: UpstreamCaller; cache?: SubjectCache; now?: () => number } = {}
+) {
   const calls: URL[] = [];
   const config = testConfig(overrides);
-  return { client: new HangarClient(config, fetcher ?? hangarFetch(calls)), calls, config };
+  const hangar = new HangarClient(config, options.caller ?? callerFor(ALICE), {
+    fetch: fetcher ?? hangarFetch(calls),
+    ...(options.cache ? { cache: options.cache } : {}),
+    ...(options.now ? { now: options.now } : {}),
+  });
+  return { client: hangar, calls, config };
 }
 
 function projectsPage(...records: unknown[]): Response {
@@ -35,20 +53,36 @@ const stalledCall: Fetcher = (_input, init) =>
     init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
   });
 
-describe("Hangar client allowlist and resolution", () => {
-  it("lists only allowlisted projects", async () => {
+describe("Hangar client project ceiling and resolution", () => {
+  it("lists only projects inside the ceiling", async () => {
     const { client: hangar } = client();
     const page = await hangar.listProjects(50);
     expect(page.results.map((record) => record.identifier)).toEqual(["HGR"]);
     expect(page.nextCursor).toBeNull();
   });
 
-  it("resolves identifiers case-insensitively and refuses projects outside the allowlist", async () => {
+  it("has no ceiling when HANGAR_ALLOWED_PROJECTS is empty: whatever Hangar shows the user", async () => {
+    const { client: hangar } = client({ allowedProjects: [] });
+    const page = await hangar.listProjects(50);
+    expect(page.results.map((record) => record.identifier)).toEqual(["HGR", "SEC"]);
+    await expect(hangar.resolveProject("SEC")).resolves.toMatchObject({ id: PROJECT_SEC });
+  });
+
+  it("resolves identifiers case-insensitively and refuses projects outside the ceiling", async () => {
     const { client: hangar } = client();
     await expect(hangar.resolveProject("hgr")).resolves.toMatchObject({ id: PROJECT_HGR });
     await expect(hangar.resolveProject(PROJECT_HGR)).resolves.toMatchObject({ identifier: "HGR" });
     await expect(hangar.resolveProject("SEC")).rejects.toMatchObject({ code: "PROJECT_NOT_ALLOWED" });
-    await expect(hangar.resolveProject("NOPE")).rejects.toMatchObject({ code: "PROJECT_NOT_FOUND" });
+    await expect(hangar.resolveProject("NOPE")).rejects.toMatchObject({
+      code: "PROJECT_NOT_FOUND",
+      message: expect.stringContaining("hangar.project.nope.member"),
+    });
+  });
+
+  it("treats an empty project list as legitimate (a user with no projects yet)", async () => {
+    const { client: hangar } = client({ allowedProjects: [] }, async () => projectsPage());
+    await expect(hangar.listProjects(10)).resolves.toEqual({ results: [], nextCursor: null });
+    await expect(hangar.searchWorkItems("x", 10, undefined)).rejects.toMatchObject({ code: "PROJECT_NOT_FOUND" });
   });
 
   it("drops work items that do not belong to the requested project", async () => {
@@ -66,7 +100,7 @@ describe("Hangar client allowlist and resolution", () => {
     expect(page.results).toEqual([]);
   });
 
-  it("refuses an identifier that resolves outside the allowlist", async () => {
+  it("refuses an identifier that resolves outside the ceiling", async () => {
     const fetcher: Fetcher = async (input) => {
       const path = new URL(String(input)).pathname;
       if (path.endsWith("/projects/")) return projectsPage(HGR_PROJECT, SECRET_PROJECT);
@@ -127,17 +161,282 @@ describe("Hangar client filters", () => {
   });
 });
 
-describe("Hangar client upstream boundary", () => {
-  it("maps upstream failures without echoing upstream bodies and keeps retryability", async () => {
-    const unauthorized: Fetcher = async () => jsonResponse({ error: "secret upstream detail" }, 401);
-    const { client: hangar } = client({}, unauthorized);
-    const failure = await hangar.listProjects(10).catch((error) => error as Error & { retryable: boolean });
+describe("Hangar client acts as the caller", () => {
+  it("forwards the caller's own token as Authorization: Bearer and never an x-api-key", async () => {
+    const seen: RequestInit[] = [];
+    const fetcher: Fetcher = async (_input, init) => {
+      seen.push(init ?? {});
+      return projectsPage(HGR_PROJECT);
+    };
+    const { client: hangar } = client({}, fetcher);
+    await hangar.listProjects(10);
+    const headers = seen[0]?.headers as Record<string, string>;
+    expect(headers.Authorization).toBe(`Bearer ${TEST_ACCESS_TOKEN}`);
+    expect(Object.keys(headers).map((name) => name.toLowerCase())).not.toContain("x-api-key");
+    expect(seen[0]?.redirect).toBe("error");
+  });
+
+  it("forwards an opaque (introspected) token verbatim as Authorization: Bearer", async () => {
+    const opaque = "eyJhbGciOiJBMjU2R0NNS1cifQ.key.iv.ciphertext.tag";
+    const seen: RequestInit[] = [];
+    const { client: hangar } = client(
+      {},
+      async (_input, init) => {
+        seen.push(init ?? {});
+        return projectsPage(HGR_PROJECT);
+      },
+      { caller: callerFor(ALICE, opaque) }
+    );
+    await hangar.listProjects(10);
+    const headers = seen[0]?.headers as Record<string, string>;
+    expect(headers.Authorization).toBe(`Bearer ${opaque}`);
+  });
+
+  it("refuses to call Hangar without a validated token, before any network call", async () => {
+    let calls = 0;
+    const { client: hangar } = client(
+      {},
+      async () => {
+        calls += 1;
+        return projectsPage(HGR_PROJECT);
+      },
+      { caller: callerFor(ALICE, null) }
+    );
+    await expect(hangar.listProjects(10)).rejects.toMatchObject({
+      code: "TOKEN_NOT_FORWARDABLE",
+      message: expect.stringContaining("Log in to the Hangar MCP again"),
+    });
+    await expect(hangar.currentUserId()).rejects.toMatchObject({ code: "TOKEN_NOT_FORWARDABLE" });
+    expect(calls).toBe(0);
+  });
+
+  it("resolves the current user through GET /api/v1/users/me/ and caches it per subject", async () => {
+    const { client: hangar, calls } = client();
+    expect(hangar.cachedUserId()).toBeNull();
+    expect(await hangar.currentUserId()).toBe(ME_USER_ID);
+    expect(await hangar.currentUserId()).toBe(ME_USER_ID);
+    expect(calls.filter((url) => url.pathname === "/api/v1/users/me/")).toHaveLength(1);
+    expect(hangar.cachedUserId()).toBe(ME_USER_ID);
+  });
+
+  it("never serves user A's cached project list or members to user B", async () => {
+    const cache = new SubjectCache(60_000);
+    const aliceCalls: string[] = [];
+    const bobCalls: string[] = [];
+    const recorder =
+      (log: string[], projects: unknown[], members: unknown[]): Fetcher =>
+      async (input, init) => {
+        const url = new URL(String(input));
+        const headers = (init?.headers ?? {}) as Record<string, string>;
+        log.push(`${url.pathname}|${headers.Authorization}`);
+        if (url.pathname.endsWith("/projects/")) return projectsPage(...projects);
+        if (url.pathname.endsWith("/workspaces/dumont/members/")) return jsonResponse(members);
+        return jsonResponse({}, 404);
+      };
+    const alice = client(
+      { allowedProjects: [] },
+      recorder(aliceCalls, [HGR_PROJECT, SECRET_PROJECT], [{ id: "user-1", display_name: "Secret Sam" }]),
+      { cache, caller: callerFor(ALICE, "alice-token") }
+    ).client;
+    const bob = client({ allowedProjects: [] }, recorder(bobCalls, [HGR_PROJECT], []), {
+      cache,
+      caller: callerFor(BOB, "bob-token"),
+    }).client;
+
+    expect((await alice.listProjects(50)).results.map((record) => record.identifier)).toEqual(["HGR", "SEC"]);
+    await expect(alice.resolveProject("SEC")).resolves.toMatchObject({ id: PROJECT_SEC });
+    expect((await alice.listMembers(undefined, 10)).results).toHaveLength(1);
+    const aliceFetches = aliceCalls.length;
+
+    // Bob shares the process cache but gets his own Hangar answer, with his token.
+    await expect(bob.resolveProject("SEC")).rejects.toMatchObject({ code: "PROJECT_NOT_FOUND" });
+    expect((await bob.listMembers(undefined, 10)).results).toEqual([]);
+    expect(bobCalls.length).toBeGreaterThan(0);
+    expect(bobCalls.every((line) => line.endsWith("|Bearer bob-token"))).toBe(true);
+
+    // Alice's entries are still served to Alice from the cache (no refetch).
+    await expect(alice.resolveProject("SEC")).resolves.toMatchObject({ id: PROJECT_SEC });
+    expect(aliceCalls.length).toBe(aliceFetches);
+    expect(aliceCalls.every((line) => line.endsWith("|Bearer alice-token"))).toBe(true);
+  });
+
+  it("keeps each caller's Hangar user id apart in the shared cache", async () => {
+    const cache = new SubjectCache(60_000);
+    const alice = client({}, undefined, { cache, caller: callerFor(ALICE, "alice-token") }).client;
+    const bob = client({}, undefined, { cache, caller: callerFor(BOB, "bob-token") }).client;
+    const aliceId = await alice.currentUserId();
+    const bobId = await bob.currentUserId();
+    expect(aliceId).toBe(meUserIdFor("Bearer alice-token"));
+    expect(bobId).toBe(meUserIdFor("Bearer bob-token"));
+    expect(aliceId).not.toBe(bobId);
+    // Served from the cache afterwards, still per caller.
+    expect(await alice.currentUserId()).toBe(aliceId);
+    expect(bob.cachedUserId()).toBe(bobId);
+  });
+
+  it("reloads the caller's cached project list once before reporting a project as not found", async () => {
+    const cache = new SubjectCache(60_000);
+    let projects: unknown[] = [HGR_PROJECT];
+    let loads = 0;
+    const fetcher: Fetcher = async () => {
+      loads += 1;
+      return projectsPage(...projects);
+    };
+    const hangar = client({ allowedProjects: [] }, fetcher, { cache }).client;
+    await expect(hangar.resolveProject("HGR")).resolves.toMatchObject({ id: PROJECT_HGR });
+    expect(loads).toBe(1);
+    // Membership granted meanwhile: the stale cached list is refreshed once.
+    projects = [HGR_PROJECT, SECRET_PROJECT];
+    await expect(hangar.resolveProject("SEC")).resolves.toMatchObject({ id: PROJECT_SEC });
+    expect(loads).toBe(2);
+    // A project that really does not exist: one reload, then PROJECT_NOT_FOUND.
+    await expect(hangar.resolveProject("NOPE")).rejects.toMatchObject({ code: "PROJECT_NOT_FOUND" });
+    expect(loads).toBe(3);
+    // A fresh (uncached) miss does not reload twice.
+    const other = client({ allowedProjects: [] }, fetcher, { caller: callerFor(BOB) }).client;
+    await expect(other.resolveProject("NOPE")).rejects.toMatchObject({ code: "PROJECT_NOT_FOUND" });
+    expect(loads).toBe(4);
+  });
+
+  it("binds pagination cursors to the caller subject", async () => {
+    const cache = new SubjectCache(60_000);
+    const twoProjects: Fetcher = async () => projectsPage(HGR_PROJECT, SECRET_PROJECT);
+    const alice = client({ allowedProjects: [] }, twoProjects, { cache, caller: callerFor(ALICE) }).client;
+    const bob = client({ allowedProjects: [] }, twoProjects, { cache, caller: callerFor(BOB) }).client;
+    const first = await alice.listProjects(1);
+    expect(first.nextCursor).toMatch(/^hmc1\./);
+    await expect(alice.listProjects(1, first.nextCursor!)).resolves.toMatchObject({
+      results: [{ identifier: "SEC" }],
+    });
+    await expect(bob.listProjects(1, first.nextCursor!)).rejects.toMatchObject({ code: "INVALID_CURSOR" });
+    // Same subject, different MCP_CURSOR_SECRET: refused as well.
+    const rotated = client(
+      { allowedProjects: [], cursorSecret: "another-cursor-secret-".padEnd(40, "y") },
+      twoProjects,
+      {
+        caller: callerFor(ALICE),
+      }
+    ).client;
+    await expect(rotated.listProjects(1, first.nextCursor!)).rejects.toMatchObject({ code: "INVALID_CURSOR" });
+  });
+});
+
+describe("Hangar client maps Hangar errors for the user", () => {
+  it("tells an unlinked user to sign in once to Hangar web", async () => {
+    const { client: hangar } = client({}, async () =>
+      jsonResponse({ error_code: "DUMONT_ACCOUNT_NOT_LINKED", error: "Sign in once at https://x" }, 401)
+    );
+    await expect(hangar.listProjects(10)).rejects.toMatchObject({
+      code: "ACCOUNT_NOT_LINKED",
+      retryable: false,
+      message: expect.stringContaining("sign in once at https://hangar.example.test with Dumont login"),
+    });
+  });
+
+  it("reports a Plane 401 on a live token as UPSTREAM_UNAUTHORIZED, and near expiry as retryable TOKEN_EXPIRED", async () => {
+    const unauthorized: Fetcher = async () => jsonResponse({ detail: "secret upstream detail" }, 401);
+    const nowMs = 1_800_000_000_000;
+    const live = client({}, unauthorized, {
+      caller: callerFor(ALICE, TEST_ACCESS_TOKEN, nowMs / 1000 + 600),
+      now: () => nowMs,
+    }).client;
+    const failure = await live.listProjects(10).catch((error) => error as Error & { code: string });
     expect(failure).toMatchObject({ code: "UPSTREAM_UNAUTHORIZED", retryable: false });
     expect(String(failure.message)).not.toContain("secret upstream detail");
 
-    const unavailable: Fetcher = async () => jsonResponse({ error: "down" }, 503);
-    const { client: other } = client({}, unavailable);
-    await expect(other.listProjects(10)).rejects.toMatchObject({ code: "UPSTREAM_UNAVAILABLE", retryable: true });
+    const expiring = client({}, unauthorized, {
+      caller: callerFor(ALICE, TEST_ACCESS_TOKEN, nowMs / 1000 + 5),
+      now: () => nowMs,
+    }).client;
+    // Not retryable with the same token: the authorizer 401s it on the next request.
+    await expect(expiring.listProjects(10)).rejects.toMatchObject({ code: "TOKEN_EXPIRED", retryable: false });
+  });
+
+  it("maps writer-role, project and managed 403s", async () => {
+    const forbidden =
+      (body: Record<string, unknown>): Fetcher =>
+      async (input, init) => {
+        const url = new URL(String(input));
+        if (init?.method === "GET" && url.pathname.endsWith("/projects/")) return projectsPage(HGR_PROJECT);
+        return jsonResponse(body, 403);
+      };
+    const writerRole = client({}, forbidden({ error_code: "DUMONT_WRITER_ROLE_REQUIRED" })).client;
+    const project = await writerRole.resolveProject("HGR");
+    await expect(writerRole.addComment(project, HGR_WORK_ITEM.id, "<p>x</p>")).rejects.toMatchObject({
+      code: "WRITER_ROLE_REQUIRED",
+      message: expect.stringContaining("hangar_writer"),
+    });
+
+    const noMember = client({}, forbidden({ detail: "You do not have permission" })).client;
+    await expect(noMember.listStates("HGR", 10)).rejects.toMatchObject({
+      code: "PROJECT_ACCESS_DENIED",
+      message: "No read access to project HGR in Hangar; ask for the role hangar.project.hgr.member in Dumont Auth",
+    });
+    await expect(noMember.getWorkItemByIdentifier("HGR-5")).rejects.toMatchObject({ code: "PROJECT_ACCESS_DENIED" });
+
+    const managed = client({}, forbidden({ error_code: "DUMONT_MANAGED_BY_ZITADEL", error: "x" })).client;
+    await expect(managed.listStates("HGR", 10)).rejects.toMatchObject({
+      code: "UPSTREAM_FORBIDDEN",
+      message: expect.stringContaining("Dumont Auth"),
+    });
+  });
+
+  it("maps Hangar's user-not-allowed answer (403, and the older 401) to a non-retryable USER_NOT_ALLOWED", async () => {
+    for (const status of [403, 401]) {
+      const { client: hangar } = client({}, async () =>
+        jsonResponse({ error_code: "DUMONT_USER_NOT_ALLOWED", error: "This Hangar user cannot use the API." }, status)
+      );
+      // oxlint-disable-next-line no-await-in-loop
+      await expect(hangar.listProjects(10)).rejects.toMatchObject({
+        code: "USER_NOT_ALLOWED",
+        retryable: false,
+        message: expect.stringContaining("logging in again will not help"),
+      });
+    }
+  });
+
+  it("maps Hangar's auth-unavailable 503 to a retryable error for reads and writes", async () => {
+    const unavailable: Fetcher = async (input, init) => {
+      const url = new URL(String(input));
+      if (init?.method === "GET" && url.pathname.endsWith("/projects/")) return projectsPage(HGR_PROJECT);
+      return jsonResponse({ error_code: "DUMONT_AUTH_UNAVAILABLE", error: "Retry shortly." }, 503);
+    };
+    const hangar = client({}, unavailable).client;
+    await expect(hangar.listStates("HGR", 10)).rejects.toMatchObject({
+      code: "UPSTREAM_AUTH_UNAVAILABLE",
+      retryable: true,
+    });
+    // Auth fails before any view runs, so even a write is safe to retry.
+    const project = await hangar.resolveProject("HGR");
+    await expect(hangar.addComment(project, HGR_WORK_ITEM.id, "<p>x</p>")).rejects.toMatchObject({
+      code: "UPSTREAM_AUTH_UNAVAILABLE",
+      retryable: true,
+    });
+    // A plain write 503 stays not retryable (it may have been applied).
+    const plain = client({}, async (input, init) => {
+      const url = new URL(String(input));
+      if (init?.method === "GET" && url.pathname.endsWith("/projects/")) return projectsPage(HGR_PROJECT);
+      return jsonResponse({ error: "down" }, 503);
+    }).client;
+    const plainProject = await plain.resolveProject("HGR");
+    await expect(plain.addComment(plainProject, HGR_WORK_ITEM.id, "<p>x</p>")).rejects.toMatchObject({
+      code: "UPSTREAM_UNAVAILABLE",
+      retryable: false,
+    });
+  });
+
+  it("maps Hangar's invalid_token 401 challenge to a tool error by error_code", async () => {
+    const { client: hangar } = client({}, async () => {
+      const response = jsonResponse({ error_code: "DUMONT_INVALID_TOKEN", error: "Invalid or expired" }, 401);
+      response.headers.set("www-authenticate", 'Bearer realm="api", error="invalid_token"');
+      return response;
+    });
+    await expect(hangar.listProjects(10)).rejects.toMatchObject({ code: "UPSTREAM_UNAUTHORIZED", retryable: false });
+  });
+
+  it("keeps 5xx retryable for reads", async () => {
+    const { client: hangar } = client({}, async () => jsonResponse({ error: "down" }, 503));
+    await expect(hangar.listProjects(10)).rejects.toMatchObject({ code: "UPSTREAM_UNAVAILABLE", retryable: true });
   });
 
   it("refuses an oversized upstream response before parsing it", async () => {
@@ -149,17 +448,29 @@ describe("Hangar client upstream boundary", () => {
     const { client: hangar } = client({ timeoutMs: 50 }, stalledCall);
     await expect(hangar.listProjects(10)).rejects.toMatchObject({ code: "UPSTREAM_TIMEOUT", retryable: true });
   });
+});
 
-  it("sends the API key as x-api-key and never as a bearer token", async () => {
-    const seen: RequestInit[] = [];
-    const fetcher: Fetcher = async (_input, init) => {
-      seen.push(init ?? {});
-      return projectsPage(HGR_PROJECT);
-    };
-    const { client: hangar } = client({}, fetcher);
-    await hangar.listProjects(10);
-    const headers = seen[0]?.headers as Record<string, string>;
-    expect(headers["x-api-key"]).toBe(hangar.config.apiKey);
-    expect(headers.authorization).toBeUndefined();
+describe("per-subject cache", () => {
+  it("expires entries, bounds subjects and is disabled with a zero TTL", () => {
+    let now = 0;
+    const cache = new SubjectCache(1000, 2, () => now);
+    cache.set("a", "projects", ["A"]);
+    expect(cache.get("a", "projects")).toEqual(["A"]);
+    expect(cache.get("b", "projects")).toBeUndefined();
+    now = 1000;
+    expect(cache.get("a", "projects")).toBeUndefined();
+    cache.set("a", "me", "1");
+    cache.set("b", "me", "2");
+    cache.set("c", "me", "3");
+    expect(cache.size).toBe(2);
+    expect(cache.get("a", "me")).toBeUndefined();
+    expect(cache.get("c", "me")).toBe("3");
+    cache.set("c", "projects", ["C"]);
+    cache.forget("c", "projects");
+    expect(cache.get("c", "projects")).toBeUndefined();
+    expect(cache.get("c", "me")).toBe("3");
+    const off = new SubjectCache(0);
+    off.set("a", "me", "1");
+    expect(off.get("a", "me")).toBeUndefined();
   });
 });

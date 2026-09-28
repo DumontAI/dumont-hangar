@@ -1,9 +1,35 @@
-import { createHash } from "node:crypto";
+import { createHmac } from "node:crypto";
+import { MIN_TOKEN_LIFETIME_SECONDS } from "./auth.js";
+import { SubjectCache } from "./cache.js";
 import { decodeCursor, encodeCursor, type CursorState } from "./cursor.js";
-import type { HangarConfig } from "./types.js";
+import type { HangarConfig, UpstreamCaller } from "./types.js";
 import { HangarError, type HangarPage, type JsonRecord, type RawPage, type ResourceName } from "./types.js";
 
-type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Response>;
+export type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Response>;
+
+/**
+ * Plane answers these `error_code`s for the Dumont bearer (fork module
+ * apps/api/plane/dumont/). Only matched against constants, never echoed.
+ */
+const PLANE_ACCOUNT_NOT_LINKED = "DUMONT_ACCOUNT_NOT_LINKED";
+const PLANE_WRITER_ROLE_REQUIRED = "DUMONT_WRITER_ROLE_REQUIRED";
+const PLANE_MANAGED_BY_ZITADEL = "DUMONT_MANAGED_BY_ZITADEL";
+// 403: the linked Hangar user is inactive, a bot, or ambiguous. A new login
+// cannot fix it, so it is not retryable.
+const PLANE_USER_NOT_ALLOWED = "DUMONT_USER_NOT_ALLOWED";
+// 503: Hangar could not check the token (Dumont Auth keys or token
+// introspection unreachable).
+// Raised before any view runs, so nothing was applied: retryable, and never a
+// reason to log in again.
+const PLANE_AUTH_UNAVAILABLE = "DUMONT_AUTH_UNAVAILABLE";
+// A Plane 401 this close to (or past) the token `exp` is treated as expiry.
+// The authorizer already refuses (HTTP 401) tokens with this little lifetime
+// left, so this only triggers when a call outlives that margin or the clocks
+// of Hangar and this host disagree.
+const EXPIRY_MARGIN_SECONDS = MIN_TOKEN_LIFETIME_SECONDS;
+const PROJECT_IDENTIFIER = /^[A-Z][A-Z0-9]{1,9}$/;
+
+type Operation = "read" | "write";
 
 const MAX_LIST_PAGES_PER_CALL = 10;
 const MAX_PROJECT_PAGES = 5;
@@ -53,20 +79,44 @@ export interface ProjectRecord {
   readonly name: string | null;
 }
 
+export interface HangarClientOptions {
+  readonly fetch?: FetchLike;
+  /**
+   * Shared across requests by the HTTP server (one per process). Everything
+   * in it is keyed by the caller's `sub`; a private one is created otherwise.
+   */
+  readonly cache?: SubjectCache;
+  readonly now?: () => number;
+}
+
+/**
+ * Hangar API v1 client acting as ONE caller: every upstream call carries the
+ * caller's own access token (`Authorization: Bearer`), so Hangar applies that
+ * user's workspace and project permissions. Create one per MCP request.
+ */
 export class HangarClient {
   private readonly fetcher: FetchLike;
   private readonly cursorSecret: string;
-  private projects: { readonly at: number; readonly records: ProjectRecord[] } | null = null;
+  private readonly cache: SubjectCache;
+  private readonly now: () => number;
 
   constructor(
     readonly config: HangarConfig,
-    fetcher: FetchLike = (input, init) => globalThis.fetch(input, init)
+    private readonly caller: UpstreamCaller,
+    options: HangarClientOptions = {}
   ) {
-    this.fetcher = fetcher;
-    this.cursorSecret = createHash("sha256").update(config.apiKey).digest("hex");
+    this.fetcher = options.fetch ?? ((input, init) => globalThis.fetch(input, init));
+    this.cache = options.cache ?? new SubjectCache(config.projectCacheSeconds * 1000);
+    this.now = options.now ?? Date.now;
+    // Per-subject key: a cursor issued to one user never decodes for another.
+    this.cursorSecret = createHmac("sha256", config.cursorSecret)
+      .update(`hangar-mcp-cursor\u0000${caller.sub}`)
+      .digest("hex");
   }
 
+  /** True when the project is inside the optional HANGAR_ALLOWED_PROJECTS ceiling. */
   isAllowedProject(project: ProjectRecord): boolean {
+    if (this.config.allowedProjects.length === 0) return true;
     return (
       this.config.allowedProjects.includes(project.identifier) ||
       this.config.allowedProjects.includes(project.id.toLowerCase())
@@ -82,19 +132,32 @@ export class HangarClient {
     if (!value || value.length > 64) {
       throw new HangarError("INVALID_ARGUMENT", "project has an invalid format");
     }
-    const projects = await this.loadProjects();
-    let project: ProjectRecord | undefined;
-    if (PROJECT_UUID.test(value)) {
-      project = projects.find((item) => item.id.toLowerCase() === value.toLowerCase());
-    } else {
-      const identifier = value.toUpperCase();
-      project = projects.find((item) => item.identifier === identifier);
+    const find = (projects: readonly ProjectRecord[]) =>
+      PROJECT_UUID.test(value)
+        ? projects.find((item) => item.id.toLowerCase() === value.toLowerCase())
+        : projects.find((item) => item.identifier === value.toUpperCase());
+    const cached = this.cache.get<ProjectRecord[]>(this.caller.sub, "projects") !== undefined;
+    let project = find(await this.loadProjects());
+    if (!project && cached) {
+      // The cached list may predate a new membership (e.g. a role just granted
+      // in Dumont Auth): drop this caller's entry and ask Hangar once more.
+      this.cache.forget(this.caller.sub, "projects");
+      project = find(await this.loadProjects());
     }
     if (!project) {
-      throw new HangarError("PROJECT_NOT_FOUND", "The requested project was not found in this workspace");
+      const identifier = value.toUpperCase();
+      throw new HangarError(
+        "PROJECT_NOT_FOUND",
+        PROJECT_IDENTIFIER.test(identifier)
+          ? `Project ${identifier} was not found among the Hangar projects you can access; if it exists, ask for the role ${projectRole(identifier)} in Dumont Auth`
+          : "The requested project was not found among the Hangar projects you can access"
+      );
     }
     if (!this.isAllowedProject(project)) {
-      throw new HangarError("PROJECT_NOT_ALLOWED", "The requested project is not in the configured allowlist");
+      throw new HangarError(
+        "PROJECT_NOT_ALLOWED",
+        "The requested project is outside this MCP server's project ceiling (HANGAR_ALLOWED_PROJECTS)"
+      );
     }
     return project;
   }
@@ -136,7 +199,11 @@ export class HangarClient {
 
   async getProject(reference: string): Promise<JsonRecord> {
     const project = await this.resolveProject(reference);
-    const record = await this.request<JsonRecord>(`/projects/${encodeURIComponent(project.id)}/`);
+    const record = await this.request<JsonRecord>(
+      `/projects/${encodeURIComponent(project.id)}/`,
+      {},
+      project.identifier
+    );
     const resolved = this.projectRecord(record);
     if (!resolved || resolved.id.toLowerCase() !== project.id.toLowerCase()) {
       throw new HangarError("PROJECT_SCOPE_MISMATCH", "The returned project is outside the requested scope");
@@ -163,7 +230,10 @@ export class HangarClient {
   ): Promise<HangarPage<JsonRecord>> {
     const projects = options.project ? [await this.resolveProject(options.project)] : await this.allowlistedProjects();
     if (projects.length === 0) {
-      throw new HangarError("PROJECT_NOT_ALLOWED", "No allowlisted project is visible to this token");
+      throw new HangarError(
+        "PROJECT_NOT_FOUND",
+        "No Hangar project is visible to you through this MCP; ask for a hangar.project.<identifier>.member role in Dumont Auth"
+      );
     }
     const filters = { ...options.filters, search: query };
     const scope = `search_work_items|${projects.map((project) => project.id).join(",")}|${JSON.stringify(filters)}`;
@@ -177,7 +247,13 @@ export class HangarClient {
       if (filters.orderBy) params.order_by = filters.orderBy;
       // Sequential pagination: each page needs the previous cursor.
       // oxlint-disable-next-line no-await-in-loop
-      const page = await this.requestPage(`/projects/${project.id}/issues/`, limit, state.upstreamCursor, params);
+      const page = await this.requestPage(
+        `/projects/${project.id}/issues/`,
+        limit,
+        state.upstreamCursor,
+        params,
+        project.identifier
+      );
       scanned += 1;
       const visible = page.results
         .filter((record) => this.matchesProject(record, project))
@@ -204,7 +280,9 @@ export class HangarClient {
       throw new HangarError("INVALID_ARGUMENT", "work_item_id must be the work item UUID when a project is given");
     }
     const record = await this.request<JsonRecord>(
-      `/projects/${encodeURIComponent(project.id)}/issues/${encodeURIComponent(id)}/`
+      `/projects/${encodeURIComponent(project.id)}/issues/${encodeURIComponent(id)}/`,
+      {},
+      project.identifier
     );
     this.assertRecordProject(record, project);
     return record;
@@ -212,19 +290,23 @@ export class HangarClient {
 
   async getWorkItemByIdentifier(identifier: string): Promise<JsonRecord> {
     const value = identifier.trim().toUpperCase();
-    if (!WORK_ITEM_IDENTIFIER.test(value)) {
+    const match = WORK_ITEM_IDENTIFIER.exec(value);
+    if (!match) {
       throw new HangarError("INVALID_ARGUMENT", "work_item must look like HGR-5 or be the work item UUID");
     }
-    const record = await this.request<JsonRecord>(`/work-items/${encodeURIComponent(value)}/`);
+    const record = await this.request<JsonRecord>(`/work-items/${encodeURIComponent(value)}/`, {}, match[1]);
     const project = this.projectRecord(record) ?? (await this.projectOfRecord(record));
     if (!project) {
       throw new HangarError(
         "PROJECT_SCOPE_MISMATCH",
-        "The work item could not be verified against the configured project allowlist"
+        "The work item could not be verified against a Hangar project you can access"
       );
     }
     if (!this.isAllowedProject(project)) {
-      throw new HangarError("PROJECT_NOT_ALLOWED", "The work item is outside the configured project allowlist");
+      throw new HangarError(
+        "PROJECT_NOT_ALLOWED",
+        "The work item is outside this MCP server's project ceiling (HANGAR_ALLOWED_PROJECTS)"
+      );
     }
     return record;
   }
@@ -366,34 +448,36 @@ export class HangarClient {
     });
   }
 
-  // ---------------------------------------------------------------- writes
+  // ---------------------------------------------------------------- caller
 
-  isWritableProject(project: ProjectRecord): boolean {
-    return (
-      this.config.writeProjects.includes(project.identifier) ||
-      this.config.writeProjects.includes(project.id.toLowerCase())
-    );
-  }
-
-  /** Allowlisted AND write-enabled project, or a PROJECT_NOT_WRITABLE error. */
-  async resolveWritableProject(reference: string): Promise<ProjectRecord> {
-    const project = await this.resolveProject(reference);
-    this.assertWritable(project);
-    return project;
-  }
-
-  assertWritable(project: ProjectRecord): void {
-    if (!this.isWritableProject(project)) {
-      throw new HangarError(
-        "PROJECT_NOT_WRITABLE",
-        `Project ${project.identifier} is readable but not enabled for writes (HANGAR_WRITE_PROJECTS)`
-      );
+  /**
+   * The Hangar user behind the caller's token (`GET /api/v1/users/me/`),
+   * cached per subject. Used for assignee "me" and the audit line.
+   */
+  async currentUserId(): Promise<string> {
+    const cached = this.cache.get<string>(this.caller.sub, "me");
+    if (cached) return cached;
+    const record = await this.requestUrl<JsonRecord>(new URL("/api/v1/users/me/", this.config.baseUrl));
+    const id = asRecord(record) ? stringField(record, "id") : null;
+    if (!id || !PROJECT_UUID.test(id)) {
+      throw new HangarError("UPSTREAM_INVALID_RESPONSE", "Hangar returned an invalid current user");
     }
+    const normalized = id.toLowerCase();
+    this.cache.set(this.caller.sub, "me", normalized);
+    return normalized;
   }
+
+  /** The Hangar user id if it is already known for this subject; never calls Hangar. */
+  cachedUserId(): string | null {
+    return this.cache.get<string>(this.caller.sub, "me") ?? null;
+  }
+
+  // ---------------------------------------------------------------- writes
 
   /**
    * Loads the work item a write targets (IDENTIFIER-N, or UUID together with
-   * project) and returns it with its allowlisted, write-enabled project.
+   * project) and returns it with its project (inside the optional ceiling).
+   * Whether the caller may write there is Hangar's decision.
    */
   async workItemForWrite(
     workItem: string,
@@ -421,7 +505,6 @@ export class HangarClient {
         }
       }
     }
-    this.assertWritable(project);
     const id = stringField(record, "id");
     if (!id || !PROJECT_UUID.test(id)) {
       throw new HangarError("UPSTREAM_INVALID_RESPONSE", "Hangar returned an invalid work item");
@@ -441,35 +524,16 @@ export class HangarClient {
   }
 
   /**
-   * Member UUID, exact display name / full name, or "me" (the workspace member
-   * whose email equals the caller's verified token email).
+   * Member UUID, exact display name / full name, or "me" (the Hangar user
+   * behind the caller's token, from `GET /api/v1/users/me/`).
    */
-  async resolveAssigneeIds(
-    project: ProjectRecord,
-    references: readonly string[],
-    callerEmail: string | null
-  ): Promise<string[]> {
+  async resolveAssigneeIds(project: ProjectRecord, references: readonly string[]): Promise<string[]> {
     const parts = references.map((reference) => reference.trim()).filter(Boolean);
     if (parts.length === 0) return [];
-    const members = await this.loadWorkspaceMembers();
-    const ids = parts.map((part) => {
-      if (part.toLowerCase() !== "me") return this.resolveMember(project, part, members);
-      if (!callerEmail) {
-        throw new HangarError(
-          "FORBIDDEN",
-          'assignee "me" needs your email, which neither the token nor userinfo provided (log in again with the openid and email scopes)'
-        );
-      }
-      const matches = members.filter((member) => stringField(member, "email")?.toLowerCase() === callerEmail);
-      const id = matches.length === 1 ? stringField(matches[0]!, "id") : null;
-      if (!id) {
-        throw new HangarError(
-          "FORBIDDEN",
-          'assignee "me" did not match exactly one Hangar workspace member with the token email'
-        );
-      }
-      return id;
-    });
+    const me = parts.some((part) => part.toLowerCase() === "me") ? await this.currentUserId() : null;
+    const others = parts.filter((part) => part.toLowerCase() !== "me");
+    const members = others.every((part) => PROJECT_UUID.test(part)) ? [] : await this.loadWorkspaceMembers();
+    const ids = parts.map((part) => (part.toLowerCase() === "me" ? me! : this.resolveMember(project, part, members)));
     return [...new Set(ids)];
   }
 
@@ -496,7 +560,7 @@ export class HangarClient {
    * IssueListCreateAPIEndpoint.post); that existing item is returned instead.
    */
   async createWorkItem(project: ProjectRecord, body: JsonRecord): Promise<{ record: JsonRecord; replayed: boolean }> {
-    const response = await this.write("POST", `/projects/${project.id}/issues/`, body, [409]);
+    const response = await this.write("POST", `/projects/${project.id}/issues/`, body, project, [409]);
     if (response.status === 409) {
       const existing = stringField(response.json, "id");
       if (!existing || !PROJECT_UUID.test(existing)) {
@@ -510,30 +574,58 @@ export class HangarClient {
 
   async updateWorkItem(project: ProjectRecord, workItemId: string, body: JsonRecord): Promise<JsonRecord> {
     const id = validId(workItemId, "work_item_id");
-    const response = await this.write("PATCH", `/projects/${project.id}/issues/${encodeURIComponent(id)}/`, body);
+    const response = await this.write(
+      "PATCH",
+      `/projects/${project.id}/issues/${encodeURIComponent(id)}/`,
+      body,
+      project
+    );
     this.assertRecordProject(response.json, project);
     return response.json;
   }
 
   async addComment(project: ProjectRecord, workItemId: string, commentHtml: string): Promise<JsonRecord> {
     const id = validId(workItemId, "work_item_id");
-    const response = await this.write("POST", `/projects/${project.id}/issues/${encodeURIComponent(id)}/comments/`, {
-      comment_html: commentHtml,
-    });
+    const response = await this.write(
+      "POST",
+      `/projects/${project.id}/issues/${encodeURIComponent(id)}/comments/`,
+      { comment_html: commentHtml },
+      project
+    );
     this.assertRecordProject(response.json, project);
     return response.json;
+  }
+
+  /**
+   * The caller's bearer for Hangar, verbatim: a verified JWS or an opaque
+   * token that passed introspection. Without a validated token (defensive:
+   * the authorizer always sets one) the call is refused before any network
+   * call.
+   */
+  private authorization(): string {
+    const token = this.caller.accessToken;
+    if (!token) {
+      throw new HangarError(
+        "TOKEN_NOT_FORWARDABLE",
+        "This MCP request carries no validated access token to act as you in Hangar; nothing was sent. Log in to the Hangar MCP again."
+      );
+    }
+    return `Bearer ${token}`;
+  }
+
+  private workspaceUrl(path: string): URL {
+    return new URL(`/api/v1/workspaces/${encodeURIComponent(this.config.workspaceSlug)}${path}`, this.config.baseUrl);
   }
 
   private async write(
     method: "POST" | "PATCH",
     path: string,
     body: JsonRecord,
+    project: ProjectRecord,
     passStatuses: readonly number[] = []
   ): Promise<{ status: number; json: JsonRecord }> {
-    const url = new URL(
-      `/api/v1/workspaces/${encodeURIComponent(this.config.workspaceSlug)}${path}`,
-      this.config.baseUrl
-    );
+    const url = this.workspaceUrl(path);
+    const authorization = this.authorization();
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.config.timeoutMs);
     try {
@@ -543,7 +635,7 @@ export class HangarClient {
         headers: {
           Accept: "application/json",
           "Content-Type": "application/json",
-          "x-api-key": this.config.apiKey,
+          Authorization: authorization,
         },
         body: JSON.stringify(body),
         signal: controller.signal,
@@ -555,7 +647,9 @@ export class HangarClient {
       } catch {
         if (response.ok) throw new HangarError("UPSTREAM_INVALID_RESPONSE", "Hangar returned invalid JSON");
       }
-      if (!response.ok && !passStatuses.includes(response.status)) throw this.writeError(response.status, json);
+      if (!response.ok && !passStatuses.includes(response.status)) {
+        throw this.upstreamError(response.status, json, "write", project.identifier);
+      }
       return { status: response.status, json };
     } catch (error) {
       if (error instanceof HangarError) throw error;
@@ -572,6 +666,98 @@ export class HangarClient {
     }
   }
 
+  private tokenExpiring(): boolean {
+    const expiresAt = this.caller.expiresAt;
+    return expiresAt !== null && expiresAt - Math.floor(this.now() / 1000) <= EXPIRY_MARGIN_SECONDS;
+  }
+
+  /**
+   * Maps a Hangar error to a tool error. None of these becomes an HTTP 401 of
+   * this MCP (that would restart the client's login loop for a problem a new
+   * login cannot fix). A token at (or within the margin of) its `exp` is
+   * reported as TOKEN_EXPIRED, not retryable with the same token: the next MCP
+   * request with it gets the regular 401 challenge from the authorizer, which
+   * makes the client refresh, so this cannot loop.
+   * `projectIdentifier` names the project the call was scoped to, if any.
+   */
+  private upstreamError(
+    status: number,
+    json: JsonRecord,
+    operation: Operation,
+    projectIdentifier?: string
+  ): HangarError {
+    const code = typeof json.error_code === "string" ? json.error_code : null;
+    if (status === 503 && code === PLANE_AUTH_UNAVAILABLE) {
+      return new HangarError(
+        "UPSTREAM_AUTH_UNAVAILABLE",
+        "Hangar could not verify your Dumont login right now (Dumont Auth unreachable from Hangar); nothing was changed. Retry shortly; logging in again will not help",
+        true
+      );
+    }
+    // Older Hangar releases answered this with 401; both mean the same.
+    if ((status === 403 || status === 401) && code === PLANE_USER_NOT_ALLOWED) {
+      return new HangarError(
+        "USER_NOT_ALLOWED",
+        "Your Hangar account cannot use the API (deactivated, a bot account, or linked more than once); logging in again will not help, ask a Hangar admin"
+      );
+    }
+    // A Plane 401 (its challenge carries `error="invalid_token"`) is mapped by
+    // `error_code` and never passed on as this server's 401.
+    if (status === 401) {
+      if (code === PLANE_ACCOUNT_NOT_LINKED) {
+        return new HangarError(
+          "ACCOUNT_NOT_LINKED",
+          `Your Dumont login is not linked to a Hangar account yet: sign in once at ${this.config.baseUrl.origin} with Dumont login, then retry`
+        );
+      }
+      if (this.tokenExpiring()) {
+        return new HangarError(
+          "TOKEN_EXPIRED",
+          "Your Dumont access token expired during this call and Hangar refused it (nothing was changed). Your MCP client will be asked to refresh the login on its next request"
+        );
+      }
+      return new HangarError(
+        "UPSTREAM_UNAUTHORIZED",
+        "Hangar did not accept your Dumont token (it may have been revoked, or Hangar's Dumont bearer login is misconfigured); if you logged out or your access changed, log in again"
+      );
+    }
+    if (status === 403) {
+      if (code === PLANE_WRITER_ROLE_REQUIRED) {
+        return new HangarError(
+          "WRITER_ROLE_REQUIRED",
+          `Hangar requires the ${this.config.oidcWriterRole} role for this change; ask for it in Dumont Auth and log in again`
+        );
+      }
+      if (code === PLANE_MANAGED_BY_ZITADEL) {
+        return new HangarError("UPSTREAM_FORBIDDEN", "Hangar refused: this access is managed in Dumont Auth (ZITADEL)");
+      }
+      if (projectIdentifier) {
+        return new HangarError(
+          "PROJECT_ACCESS_DENIED",
+          `No ${operation} access to project ${projectIdentifier} in Hangar; ask for the role ${projectRole(projectIdentifier)} in Dumont Auth`
+        );
+      }
+      return new HangarError("UPSTREAM_FORBIDDEN", `Hangar denied the ${operation} operation for your account`);
+    }
+    if (status === 404) {
+      return new HangarError(
+        "UPSTREAM_NOT_FOUND",
+        projectIdentifier
+          ? `Hangar did not find the requested resource in project ${projectIdentifier}, or your account cannot see it`
+          : "Hangar did not find the requested resource"
+      );
+    }
+    if (status === 429) {
+      return new HangarError("UPSTREAM_RATE_LIMITED", `Hangar rate-limited the ${operation} operation`, true);
+    }
+    return operation === "write" ? this.writeError(status, json) : this.readError(status);
+  }
+
+  private readError(status: number): HangarError {
+    if (status >= 500) return new HangarError("UPSTREAM_UNAVAILABLE", "Hangar is temporarily unavailable", true);
+    return new HangarError("UPSTREAM_REQUEST_FAILED", "Hangar rejected the read operation");
+  }
+
   private writeError(status: number, json: JsonRecord): HangarError {
     if (status === 400) {
       // Only the field names Plane complained about; messages may echo input.
@@ -585,17 +771,7 @@ export class HangarClient {
           : "Hangar rejected the write as invalid"
       );
     }
-    if (status === 401) return new HangarError("UPSTREAM_UNAUTHORIZED", "Hangar rejected the service credential");
-    if (status === 403) {
-      return new HangarError(
-        "UPSTREAM_FORBIDDEN",
-        "Hangar denied the write; the MCP service account must be a Member of the project"
-      );
-    }
-    if (status === 404) return new HangarError("UPSTREAM_NOT_FOUND", "Hangar did not find the requested resource");
     if (status === 409) return new HangarError("UPSTREAM_CONFLICT", "Hangar reported a conflicting resource");
-    if (status === 429)
-      return new HangarError("UPSTREAM_RATE_LIMITED", "Hangar rate-limited the write operation", true);
     if (status >= 500) {
       return new HangarError(
         "UPSTREAM_UNAVAILABLE",
@@ -639,7 +815,11 @@ export class HangarClient {
         "work_item must be the work item UUID or IDENTIFIER-N of the given project"
       );
     }
-    const record = await this.request<JsonRecord>(`/work-items/${encodeURIComponent(normalized)}/`);
+    const record = await this.request<JsonRecord>(
+      `/work-items/${encodeURIComponent(normalized)}/`,
+      {},
+      project.identifier
+    );
     const id = stringField(record, "id");
     if (!id || !SAFE_ID.test(id)) {
       throw new HangarError("UPSTREAM_INVALID_RESPONSE", "Hangar returned an invalid work item");
@@ -662,7 +842,7 @@ export class HangarClient {
     while (results.length < limit && scanned < MAX_LIST_PAGES_PER_CALL && state.projectIndex < 1) {
       // Sequential pagination: each page needs the previous cursor.
       // oxlint-disable-next-line no-await-in-loop
-      const page = await this.requestPage(path, limit, state.upstreamCursor, params);
+      const page = await this.requestPage(path, limit, state.upstreamCursor, params, project.identifier);
       scanned += 1;
       const visible = page.results.filter((record) => this.matchesProject(record, project));
       const selected = visible.slice(state.offset, state.offset + (limit - results.length));
@@ -740,11 +920,10 @@ export class HangarClient {
     }
   }
 
+  /** The projects Hangar shows THIS caller, cached per subject. */
   private async loadProjects(): Promise<ProjectRecord[]> {
-    const now = Date.now();
-    if (this.projects && now - this.projects.at < this.config.projectCacheSeconds * 1000) {
-      return this.projects.records;
-    }
+    const cached = this.cache.get<ProjectRecord[]>(this.caller.sub, "projects");
+    if (cached) return cached;
     const records: ProjectRecord[] = [];
     let cursor: string | null = null;
     for (let page = 0; page < MAX_PROJECT_PAGES; page += 1) {
@@ -758,10 +937,8 @@ export class HangarClient {
       if (!payload.nextCursor) break;
       cursor = payload.nextCursor;
     }
-    if (records.length === 0) {
-      throw new HangarError("UPSTREAM_INVALID_RESPONSE", "Hangar returned no readable projects for this token");
-    }
-    this.projects = { at: now, records };
+    // An empty list is legitimate now: the user may not be in any project yet.
+    this.cache.set(this.caller.sub, "projects", records);
     return records;
   }
 
@@ -771,13 +948,10 @@ export class HangarClient {
     return visible;
   }
 
-  private memberCache: { readonly at: number; readonly records: JsonRecord[] } | null = null;
-
+  /** Workspace members as Hangar shows them to THIS caller, cached per subject. */
   private async loadWorkspaceMembers(): Promise<JsonRecord[]> {
-    const now = Date.now();
-    if (this.memberCache && now - this.memberCache.at < this.config.projectCacheSeconds * 1000) {
-      return this.memberCache.records;
-    }
+    const cached = this.cache.get<JsonRecord[]>(this.caller.sub, "workspace_members");
+    if (cached) return cached;
     const payload = await this.request<unknown>("/members/");
     const records = Array.isArray(payload)
       ? payload.flatMap((value) => {
@@ -785,7 +959,7 @@ export class HangarClient {
           return record ? [record] : [];
         })
       : [];
-    this.memberCache = { at: now, records };
+    this.cache.set(this.caller.sub, "workspace_members", records);
     return records;
   }
 
@@ -793,11 +967,12 @@ export class HangarClient {
     path: string,
     limit: number,
     upstreamCursor: string | null,
-    params: Record<string, string> = {}
+    params: Record<string, string> = {},
+    projectIdentifier?: string
   ): Promise<RawPage> {
     const query: Record<string, string> = { ...params, per_page: String(Math.min(Math.max(limit, 1), PER_PAGE_MAX)) };
     if (upstreamCursor) query.cursor = validCursor(upstreamCursor);
-    const payload = await this.request<JsonRecord>(path, query);
+    const payload = await this.request<JsonRecord>(path, query, projectIdentifier);
     const rawResults = payload.results;
     const results = Array.isArray(rawResults)
       ? rawResults.flatMap((value) => {
@@ -815,23 +990,27 @@ export class HangarClient {
     return validCursor(next);
   }
 
-  private async request<T>(path: string, params: Record<string, string> = {}): Promise<T> {
-    const url = new URL(
-      `/api/v1/workspaces/${encodeURIComponent(this.config.workspaceSlug)}${path}`,
-      this.config.baseUrl
-    );
+  private async request<T>(path: string, params: Record<string, string> = {}, projectIdentifier?: string): Promise<T> {
+    const url = this.workspaceUrl(path);
     for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+    return this.requestUrl<T>(url, projectIdentifier);
+  }
+
+  private async requestUrl<T>(url: URL, projectIdentifier?: string): Promise<T> {
+    const authorization = this.authorization();
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.config.timeoutMs);
     try {
       const response = await this.fetcher(url, {
         method: "GET",
         redirect: "error",
-        headers: { Accept: "application/json", "x-api-key": this.config.apiKey },
+        headers: { Accept: "application/json", Authorization: authorization },
         signal: controller.signal,
       });
       const body = await this.readBody(response, controller);
-      if (!response.ok) throw this.responseError(response.status);
+      if (!response.ok) {
+        throw this.upstreamError(response.status, parseErrorBody(body), "read", projectIdentifier);
+      }
       try {
         return JSON.parse(body) as T;
       } catch {
@@ -891,13 +1070,18 @@ export class HangarClient {
       throw new HangarError("UPSTREAM_RESPONSE_TOO_LARGE", "Hangar response exceeded the configured safety limit");
     }
   }
+}
 
-  private responseError(status: number): HangarError {
-    if (status === 401) return new HangarError("UPSTREAM_UNAUTHORIZED", "Hangar rejected the read credential");
-    if (status === 403) return new HangarError("UPSTREAM_FORBIDDEN", "Hangar denied the read operation");
-    if (status === 404) return new HangarError("UPSTREAM_NOT_FOUND", "Hangar did not find the requested resource");
-    if (status === 429) return new HangarError("UPSTREAM_RATE_LIMITED", "Hangar rate-limited the read operation", true);
-    if (status >= 500) return new HangarError("UPSTREAM_UNAVAILABLE", "Hangar is temporarily unavailable", true);
-    return new HangarError("UPSTREAM_REQUEST_FAILED", "Hangar rejected the read operation");
+/** Error bodies are parsed only to read `error_code`; they are never echoed. */
+function parseErrorBody(text: string): JsonRecord {
+  try {
+    return asRecord(text ? JSON.parse(text) : {}) ?? {};
+  } catch {
+    return {};
   }
+}
+
+/** The ZITADEL role that grants Member access to a managed Hangar project. */
+function projectRole(identifier: string): string {
+  return `hangar.project.${identifier.toLowerCase()}.member`;
 }

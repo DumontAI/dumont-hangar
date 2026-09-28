@@ -66,14 +66,16 @@ export type AuditOutcome = "success" | "denied" | "error";
 
 /**
  * One line per tool call. Only identifiers and field NAMES: never text bodies,
- * tokens, the Hangar API key, or free-form arguments.
+ * tokens, emails, or free-form arguments. `plane_user_id` is the Hangar user
+ * behind the caller's token when it is known (null when Hangar could not be
+ * asked, e.g. an unlinked account or a non-forwardable token).
  */
 export interface AuditRecord {
   readonly ts: string;
   readonly event: "hangar.mcp.tool";
   readonly tool: string;
   readonly sub: string | null;
-  readonly email: string | null;
+  readonly plane_user_id: string | null;
   readonly roles_used: readonly string[];
   readonly project: string | null;
   readonly work_item: string | null;

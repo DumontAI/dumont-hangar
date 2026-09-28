@@ -12,7 +12,6 @@ import {
   type ToolKind,
 } from "./access.js";
 import { HangarClient, type ProjectRecord, type WorkItemFilters } from "./client.js";
-import { loadHangarConfig } from "./config.js";
 import { appendWithFooter, htmlWithFooter } from "./markup.js";
 import {
   containsCredential,
@@ -75,14 +74,32 @@ export const HANGAR_WRITE_TOOL_NAMES = [
 
 export const HANGAR_TOOL_NAMES = [...HANGAR_READ_TOOL_NAMES, ...HANGAR_WRITE_TOOL_NAMES] as const;
 
-// Denials are policy outcomes, not failures of Hangar or of this server.
+// Denials are policy outcomes (this server's or Hangar's), not failures of
+// Hangar or of this server.
 const DENIAL_CODES = new Set([
   "FORBIDDEN",
-  "WRITES_DISABLED",
   "PROJECT_NOT_ALLOWED",
-  "PROJECT_NOT_WRITABLE",
   "RATE_LIMITED",
   "SECRET_DETECTED",
+  "ACCOUNT_NOT_LINKED",
+  "TOKEN_NOT_FORWARDABLE",
+  "WRITER_ROLE_REQUIRED",
+  "PROJECT_ACCESS_DENIED",
+  "UPSTREAM_FORBIDDEN",
+  "USER_NOT_ALLOWED",
+]);
+
+// Failures of the caller's credential itself: when looking up the Hangar user
+// id hits one of these, the tool call stops there (every other call would fail
+// the same way; Hangar's token check being unavailable is included for that
+// reason). Any other lookup failure only leaves the audit id empty.
+const CREDENTIAL_FAILURES = new Set([
+  "ACCOUNT_NOT_LINKED",
+  "TOKEN_NOT_FORWARDABLE",
+  "TOKEN_EXPIRED",
+  "UPSTREAM_UNAUTHORIZED",
+  "USER_NOT_ALLOWED",
+  "UPSTREAM_AUTH_UNAVAILABLE",
 ]);
 
 type ResponseFormat = "json" | "markdown";
@@ -126,11 +143,6 @@ export interface HangarServerContext {
   /** Shared across requests by the HTTP server; a private one is created otherwise. */
   readonly rateLimiter?: WriteRateLimiter;
   readonly audit?: AuditSink;
-  /**
-   * Lazy email lookup (userinfo) for callers whose token has no email claim.
-   * Called only for attribution footers and assignee "me"; must not throw.
-   */
-  readonly resolveEmail?: () => Promise<string | null>;
 }
 
 interface CallAudit {
@@ -139,38 +151,24 @@ interface CallAudit {
   fields_changed: string[];
 }
 
+/**
+ * Builds the MCP server for ONE request. `client` must be bound to the same
+ * caller as `context.principal` (it carries that caller's token to Hangar).
+ */
 export function createHangarServer(
-  config: HangarConfig = loadHangarConfig(),
-  client = new HangarClient(config),
+  config: HangarConfig,
+  client: HangarClient,
   context: HangarServerContext = { principal: null }
 ): McpServer {
   const principal = context.principal;
   const rateLimiter = context.rateLimiter ?? new WriteRateLimiter(config.writeRateLimit);
   const audit = context.audit ?? stderrAuditSink;
-  const writesEnabled = config.writeProjects.length > 0;
-  // Email from the token claim, else (lazily, once per request) from userinfo.
-  let resolvedEmail: Promise<string | null> | null = null;
-  let knownEmail: string | null = principal?.email ?? null;
-  function callerEmail(): Promise<string | null> {
-    if (knownEmail || !principal) return Promise.resolve(knownEmail);
-    resolvedEmail ??= (context.resolveEmail?.() ?? Promise.resolve(null))
-      .catch(() => null)
-      .then((email) => {
-        knownEmail = email;
-        return email;
-      });
-    return resolvedEmail;
-  }
-  async function actor(): Promise<string> {
-    return (await callerEmail()) ?? principal?.sub ?? "unknown";
-  }
 
   const server = new McpServer(
-    { name: "hangar-mcp-server", version: "0.2.0" },
+    { name: "hangar-mcp-server", version: "0.3.0" },
     {
-      instructions: writesEnabled
-        ? "Hangar (Plane) triage: read projects, work items, comments, states, labels and members; create and update work items and add comments in write-enabled projects (needs the hangar_writer role). Deletes are not available. Descriptions are never replaced, only appended to. Read text is redacted and truncated: never write it back. Writes are attributed to the logged-in user in a footer; text that looks like a credential is refused."
-        : "Hangar (Plane) triage: read projects, work items, comments, states, labels and members. Project access is limited by the server allowlist; writes are disabled on this server.",
+      instructions:
+        "Hangar (Plane) triage as the logged-in user: read projects, work items, comments, states, labels and members; create and update work items and add comments (needs the hangar_writer role, and Member access to the project in Hangar). Your own Hangar permissions apply. Deletes are not available. Descriptions are never replaced, only appended to. Read text is redacted and truncated: never write it back. Hangar records you as the author and a '— via MCP' footer marks the text; text that looks like a credential is refused.",
     }
   );
 
@@ -196,12 +194,10 @@ export function createHangarServer(
     let rolesUsed: string[] = [];
     let outcome: AuditOutcome = "error";
     let errorCode: string | null = null;
+    let planeUserId: string | null = null;
     try {
       rolesUsed = [authorizeTool(config, principal, kind)];
       if (kind === "write") {
-        if (!writesEnabled) {
-          throw new HangarError("WRITES_DISABLED", "Hangar writes are disabled on this MCP server");
-        }
         if (stringsOf(args).some(containsCredential)) {
           throw new HangarError(
             "SECRET_DETECTED",
@@ -210,6 +206,11 @@ export function createHangarServer(
         }
         rateLimiter.consume(principal!.sub);
       }
+      // The Hangar user behind the token, for the audit line (cached per sub).
+      planeUserId = await client.currentUserId().catch((error: unknown) => {
+        if (error instanceof HangarError && CREDENTIAL_FAILURES.has(error.code)) throw error;
+        return null;
+      });
       const value = await operation(call);
       outcome = "success";
       return success(value, title, format);
@@ -223,7 +224,7 @@ export function createHangarServer(
         event: "hangar.mcp.tool",
         tool,
         sub: principal?.sub ?? null,
-        email: knownEmail,
+        plane_user_id: planeUserId ?? (principal ? client.cachedUserId() : null),
         roles_used: rolesUsed,
         project: call.project,
         work_item: call.work_item,
@@ -245,7 +246,7 @@ export function createHangarServer(
     "hangar_list_projects",
     {
       title: "List Hangar projects",
-      description: "List only the Hangar projects in the server-side allowlist.",
+      description: "List the Hangar projects your account can see (within this server's optional project ceiling).",
       inputSchema: z.object(common),
       outputSchema,
       annotations: readAnnotations,
@@ -264,7 +265,7 @@ export function createHangarServer(
     "hangar_get_project",
     {
       title: "Get a Hangar project",
-      description: "Get one allowlisted Hangar project by identifier (like HGR) or UUID.",
+      description: "Get one Hangar project you can see, by identifier (like HGR) or UUID.",
       inputSchema: z.object({ project: projectReference, response_format: common.response_format }),
       outputSchema,
       annotations: readAnnotations,
@@ -280,7 +281,7 @@ export function createHangarServer(
     {
       title: "List Hangar work items",
       description:
-        "List work items of one allowlisted project, newest first unless order_by says otherwise. state/label accept a UUID or an exact name; assignee accepts a member UUID or exact display name. Text fields are redacted (credentials, emails, IPs) and truncated; never write them back to Hangar.",
+        "List work items of one project you can see, newest first unless order_by says otherwise. state/label accept a UUID or an exact name; assignee accepts a member UUID or exact display name. Text fields are redacted (credentials, emails, IPs) and truncated; never write them back to Hangar.",
       inputSchema: z.object({
         ...common,
         project: projectReference,
@@ -344,7 +345,7 @@ export function createHangarServer(
     {
       title: "Search Hangar work items",
       description:
-        "Search work items by text. Omit project to search every allowlisted project, paging project by project. Text fields are redacted (credentials, emails, IPs) and truncated; never write them back to Hangar.",
+        "Search work items by text. Omit project to search every project you can see, paging project by project. Text fields are redacted (credentials, emails, IPs) and truncated; never write them back to Hangar.",
       inputSchema: z.object({
         ...common,
         query: z.string().trim().min(1).max(256),
@@ -421,7 +422,7 @@ export function createHangarServer(
     "hangar_list_states",
     {
       title: "List Hangar states",
-      description: "List the workflow states of one allowlisted project.",
+      description: "List the workflow states of one project you can see.",
       inputSchema: z.object({ ...common, project: projectReference }),
       outputSchema,
       annotations: readAnnotations,
@@ -437,7 +438,7 @@ export function createHangarServer(
     "hangar_list_labels",
     {
       title: "List Hangar labels",
-      description: "List the labels of one allowlisted project.",
+      description: "List the labels of one project you can see.",
       inputSchema: z.object({ ...common, project: projectReference }),
       outputSchema,
       annotations: readAnnotations,
@@ -454,7 +455,7 @@ export function createHangarServer(
     {
       title: "List Hangar members",
       description:
-        "List workspace members, or the members of one allowlisted project when project is given. Emails are never returned.",
+        "List workspace members, or the members of one project you can see when project is given. Emails are never returned.",
       inputSchema: z.object({ ...common, project: projectReference.optional() }),
       outputSchema,
       annotations: readAnnotations,
@@ -467,9 +468,8 @@ export function createHangarServer(
   );
 
   // ------------------------------------------------------------------ writes
-  // Write tools are only registered when HANGAR_WRITE_PROJECTS is set, so a
-  // read-only server does not advertise tools that can only fail.
-  if (!writesEnabled) return server;
+  // Always registered: the hangar_writer role gates them here, and Hangar
+  // decides per project whether this user may write there.
 
   interface WriteFieldInput {
     readonly name?: string | undefined;
@@ -498,17 +498,17 @@ export function createHangarServer(
       fields.push("name");
     }
     if (input.description !== undefined) {
-      body.description_html = htmlWithFooter(input.description, await actor());
+      body.description_html = htmlWithFooter(input.description);
       fields.push("description");
     } else if (withFooterOnEmptyDescription) {
-      body.description_html = htmlWithFooter("", await actor());
+      body.description_html = htmlWithFooter("");
     }
     if (input.append_description !== undefined) {
       if (existingDescriptionHtml === undefined) {
         throw new HangarError("INTERNAL_ERROR", "append_description needs the stored description");
       }
       // Raw stored HTML (server-side only, never returned) + the new text + footer.
-      body.description_html = appendWithFooter(existingDescriptionHtml, input.append_description, await actor());
+      body.description_html = appendWithFooter(existingDescriptionHtml, input.append_description);
       fields.push("append_description");
     }
     if (input.state !== undefined) {
@@ -524,8 +524,7 @@ export function createHangarServer(
       fields.push("labels");
     }
     if (input.assignees !== undefined) {
-      const wantsMe = input.assignees.some((assignee) => assignee.trim().toLowerCase() === "me");
-      body.assignees = await client.resolveAssigneeIds(project, input.assignees, wantsMe ? await callerEmail() : null);
+      body.assignees = await client.resolveAssigneeIds(project, input.assignees);
       fields.push("assignees");
     }
     if (input.parent !== undefined) {
@@ -564,7 +563,7 @@ export function createHangarServer(
     {
       title: "Create a Hangar work item",
       description:
-        "Create a work item in a write-enabled project. Requires the hangar_writer role. The description gets a footer naming the caller. Pass idempotency_key to make retries safe: a repeat with the same key returns the item created first.",
+        "Create a work item as yourself in a project where you are a Hangar Member. Requires the hangar_writer role. The description ends with a '— via MCP' footer. Pass idempotency_key to make retries safe: a repeat with the same key returns the item created first.",
       inputSchema: z.object({
         project: projectReference,
         name: z.string().trim().min(1).max(255),
@@ -572,7 +571,7 @@ export function createHangarServer(
           .string()
           .max(20_000)
           .optional()
-          .describe("Markdown or plain text; converted to safe HTML. An attribution footer is appended."),
+          .describe("Markdown or plain text; converted to safe HTML. A '— via MCP' footer is appended."),
         ...writeFields,
         parent: workItemReference.optional().describe("Parent work item, like HGR-5, in the same project"),
         start_date: isoDate.optional(),
@@ -594,7 +593,7 @@ export function createHangarServer(
         args.response_format,
         args,
         async (call) => {
-          const project = await client.resolveWritableProject(args.project);
+          const project = await client.resolveProject(args.project);
           call.project = project.identifier;
           const { body, fields } = await writeBody(project, args, true);
           call.fields_changed = fields;
@@ -618,7 +617,7 @@ export function createHangarServer(
     {
       title: "Update a Hangar work item",
       description:
-        "Update fields of one work item (like HGR-5, or UUID plus project) in a write-enabled project. Requires the hangar_writer role. Only the fields you pass change; labels/assignees replace the whole set. Moving to a cancelled state is allowed; deleting is not available. The description cannot be replaced: use append_description, which adds your text plus an attribution footer after the stored description. Text returned by the read tools is redacted and truncated; never write it back.",
+        "Update fields of one work item (like HGR-5, or UUID plus project) as yourself, in a project where you are a Hangar Member. Requires the hangar_writer role. Only the fields you pass change; labels/assignees replace the whole set. Moving to a cancelled state is allowed; deleting is not available. The description cannot be replaced: use append_description, which adds your text plus a '— via MCP' footer after the stored description. Text returned by the read tools is redacted and truncated; never write it back.",
       // Strict: an unknown key such as `description` is an error, not silently ignored.
       inputSchema: z.strictObject({
         work_item: workItemReference,
@@ -631,7 +630,7 @@ export function createHangarServer(
           .max(20_000)
           .optional()
           .describe(
-            "Markdown or plain text APPENDED to the stored description, followed by an attribution footer. The existing description is kept as stored; do not paste read-tool output here."
+            "Markdown or plain text APPENDED to the stored description, followed by a '— via MCP' footer. The existing description is kept as stored; do not paste read-tool output here."
           ),
         ...writeFields,
         parent: workItemReference.nullable().optional().describe("Parent like HGR-5 in the same project; null clears"),
@@ -687,7 +686,7 @@ export function createHangarServer(
     {
       title: "Comment on a Hangar work item",
       description:
-        "Add a comment to one work item (like HGR-5, or UUID plus project) in a write-enabled project. Requires the hangar_writer role. Markdown or plain text; a footer names the caller.",
+        "Add a comment as yourself to one work item (like HGR-5, or UUID plus project) in a project where you are a Hangar Member. Requires the hangar_writer role. Markdown or plain text; a '— via MCP' footer is appended.",
       inputSchema: z.object({
         work_item: workItemReference,
         project: projectReference.optional().describe("Required when work_item is a UUID"),
@@ -703,7 +702,7 @@ export function createHangarServer(
         call.project = target.project.identifier;
         call.work_item = workItemIdentifier(target.record, target.project.identifier) ?? target.id;
         call.fields_changed = ["comment"];
-        const comment = await client.addComment(target.project, target.id, htmlWithFooter(args.body, await actor()));
+        const comment = await client.addComment(target.project, target.id, htmlWithFooter(args.body));
         return { ...sanitizeComment(comment), work_item: call.work_item };
       })
   );

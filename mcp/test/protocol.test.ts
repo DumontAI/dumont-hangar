@@ -7,7 +7,7 @@ import {
   HANGAR_TOOL_NAMES,
   HANGAR_WRITE_TOOL_NAMES,
 } from "../src/tools.js";
-import { PROJECT_HGR, READER, hangarFetch, testConfig } from "./fixtures.js";
+import { PROJECT_HGR, READER, callerFor, hangarFetch, testConfig } from "./fixtures.js";
 
 function isResponse(message: JSONRPCMessage, id: number): message is JSONRPCMessage & { id: number } {
   return "id" in message && message.id === id;
@@ -39,14 +39,18 @@ const forbiddenUpstream: (input: string | URL, init?: RequestInit) => Promise<Re
 
 describe("MCP protocol catalog and in-memory transport", () => {
   it("lists the deterministic Hangar tool catalog and calls one tool", async () => {
-    // Write tools are registered only when writes are enabled.
-    const config = testConfig({ writeProjects: ["HGR"] });
+    // Write tools are always registered (the writer role gates them per call).
+    const config = testConfig();
     const calls: URL[] = [];
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-    const server = createHangarServer(config, new HangarClient(config, hangarFetch(calls)), {
-      principal: READER,
-      audit: () => {},
-    });
+    const server = createHangarServer(
+      config,
+      new HangarClient(config, callerFor(READER), { fetch: hangarFetch(calls) }),
+      {
+        principal: READER,
+        audit: () => {},
+      }
+    );
     try {
       await server.connect(serverTransport);
       await clientTransport.start();
@@ -89,7 +93,7 @@ describe("MCP protocol catalog and in-memory transport", () => {
       expect(result.result).toMatchObject({
         structuredContent: { results: [{ id: PROJECT_HGR, identifier: "HGR", name: "Hangar" }] },
       });
-      expect(calls[0]?.pathname).toBe("/api/v1/workspaces/dumont/projects/");
+      expect(calls.map((url) => url.pathname)).toEqual(["/api/v1/users/me/", "/api/v1/workspaces/dumont/projects/"]);
     } finally {
       await clientTransport.close();
       await server.close();
@@ -99,10 +103,14 @@ describe("MCP protocol catalog and in-memory transport", () => {
   it("returns a tool error without leaking upstream details when the read fails", async () => {
     const config = testConfig();
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-    const server = createHangarServer(config, new HangarClient(config, forbiddenUpstream), {
-      principal: READER,
-      audit: () => {},
-    });
+    const server = createHangarServer(
+      config,
+      new HangarClient(config, callerFor(READER), { fetch: forbiddenUpstream }),
+      {
+        principal: READER,
+        audit: () => {},
+      }
+    );
     try {
       await server.connect(serverTransport);
       await clientTransport.start();
@@ -124,6 +132,7 @@ describe("MCP protocol catalog and in-memory transport", () => {
         params: { name: "hangar_list_projects", arguments: { limit: 10, response_format: "json" } },
       });
       const payload = JSON.stringify(result.result);
+      // A 403 on the workspace project list is not project-scoped.
       expect(payload).toContain("UPSTREAM_FORBIDDEN");
       expect(payload).not.toContain("upstream secret detail");
     } finally {

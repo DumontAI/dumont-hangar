@@ -2,11 +2,14 @@
 
 MCP server for the Dumont Hangar (Plane) instance. It exposes Hangar projects,
 work items, comments, states, labels and members to MCP clients, and (for users
-with the `hangar_writer` role, in write-enabled projects) lets them create work
-items, change their fields, append to their descriptions and add comments. The caller's credential is never forwarded
-to Hangar: upstream calls use a server-side Hangar API token (bot
-`hangar-mcp@dumont.au`), and every write is attributed to the logged-in user in
-a footer and in the audit log.
+with the `hangar_writer` role) lets them create work items, change their
+fields, append to their descriptions and add comments.
+
+The MCP **acts as the logged-in user**: every upstream call to Hangar API v1
+carries the caller's own ZITADEL access token (`Authorization: Bearer <JWT>`,
+the same token this server verified), so Hangar applies that user's workspace
+and project permissions and records that user as the author. There is no bot
+account and no shared API key any more.
 
 Only **Streamable HTTP** (`dist/http.js`) is supported, behind ZITADEL OIDC.
 The earlier API-key/stdio launcher and static MCP bearer mode are retired.
@@ -15,11 +18,11 @@ The earlier API-key/stdio launcher and static MCP bearer mode are retired.
 
 | Tool                             | Kind  | Purpose                                                                    |
 | -------------------------------- | ----- | -------------------------------------------------------------------------- |
-| `hangar_list_projects`           | read  | Projects in the server allowlist                                           |
+| `hangar_list_projects`           | read  | Projects you can see (within the optional server ceiling)                  |
 | `hangar_get_project`             | read  | One project by identifier or UUID                                          |
 | `hangar_list_work_items`         | read  | Work items of a project, with state/assignee/label/priority/search filters |
 | `hangar_get_work_item`           | read  | One work item by `HGR-5` or UUID                                           |
-| `hangar_search_work_items`       | read  | Text search, one project or the whole allowlist                            |
+| `hangar_search_work_items`       | read  | Text search, one project or every project you can see                      |
 | `hangar_list_work_item_comments` | read  | Comments of a work item                                                    |
 | `hangar_list_states`             | read  | Workflow states of a project                                               |
 | `hangar_list_labels`             | read  | Labels of a project                                                        |
@@ -28,8 +31,9 @@ The earlier API-key/stdio launcher and static MCP bearer mode are retired.
 | `hangar_update_work_item`        | write | Change given fields, append to the description; no replace, no delete      |
 | `hangar_add_comment`             | write | Comment on a work item                                                     |
 
-Write tools are **registered only when `HANGAR_WRITE_PROJECTS` is set**; a
-read-only server lists just the nine read tools.
+All twelve tools are always listed. Write tools need the `hangar_writer` role
+(checked by this server on every call) **and** write access to the project in
+Hangar (Member or Admin; checked by Hangar).
 
 Read tools are annotated read-only. Write tools are `readOnlyHint: false`,
 `destructiveHint: false`, `idempotentHint: false`.
@@ -58,13 +62,15 @@ That is why update cannot replace a description, only append to it.
 
 Behavior common to all writes:
 
-- **Attribution**: the description on create, each `append_description`, and
-  each comment end with `— via MCP por <email>`. Every line of caller text
-  shaped like that footer (em dash, `via MCP por`, a name) is removed first, so
-  footers never stack and a caller cannot forge someone else's attribution;
-  lines starting with `-` or `--` are left alone. The email comes from the
-  caller (see "Caller email" below); if none is found the footer names the
-  token `sub`.
+- **Authorship**: Hangar records the logged-in user as the author (the call is
+  made with their token). The description on create, each
+  `append_description`, and each comment end with the footer `— via MCP`,
+  which names nobody. Every line of caller text shaped like a footer (em dash,
+  then `via MCP`, then anything: both the current `— via MCP` and the retired
+  `— via MCP por <name>`) is removed first, so footers never stack and nobody
+  can forge an old-style attribution line naming someone else; lines starting
+  with `-` or `--` are left alone. Footers already stored in Hangar are kept as
+  they are.
 - **Safe HTML**: input is escaped completely and converted from a small
   Markdown subset (paragraphs, headings, lists, quotes, code, bold/italic,
   http/https/mailto links) to `description_html`/`comment_html`. Links are
@@ -86,9 +92,8 @@ Behavior common to all writes:
   `tokenUrl: https://…` or `secret: HANGAR_API_KEY` goes through, while
   `senha: minhasenha123` or `pwd=Sup3rS3cret!x9` is refused.
 
-- **`"me"`** resolves to the Hangar workspace member whose email equals the
-  caller email (below). Without an email, or without exactly one matching
-  member, `"me"` fails with `FORBIDDEN`.
+- **`"me"`** resolves to the Hangar user behind the caller's token
+  (`GET /api/v1/users/me/`, cached per user).
 - **Idempotency**: `idempotency_key` becomes Plane `external_id`
   (`<sha256(sub)[:16]>:<key>`, so keys are per user) with
   `external_source=dumont-hangar-mcp`. Plane answers a repeat with 409 and the
@@ -99,67 +104,130 @@ Behavior common to all writes:
   fixed 60 s window, shared across requests of the process; over the limit the
   tool returns `RATE_LIMITED` with `retryable: true`.
 
-### Caller email
+### Acting as the user
 
-ZITADEL JWT access tokens usually carry no `email`. The server resolves it
-only when a write needs it (footer or `"me"`), never for reads:
-
-1. the token's `email` claim, only when `email_verified` is exactly `true`;
-2. otherwise the issuer's userinfo endpoint, called with the caller's own
-   bearer (`MCP_OIDC_USERINFO_URL`, default `${MCP_OIDC_ISSUER}/oidc/v1/userinfo`,
-   must be on the issuer's origin; 2 s timeout, no redirects, 64 KiB cap, the
-   returned `sub` must match). It takes `email` only when `email_verified` is
-   exactly `true`. `preferred_username` is never used (a user may be able to
-   set it to someone else's address). Results are cached per `sub` (10 min
-   when found, 60 s when not, at most 1000 entries).
-
-Any failure falls back to the `sub` and never fails the tool call; stderr gets
-one line per failure class per minute (`hangar-mcp userinfo-email outcome=…`,
-no token). ZITADEL returns `email` from userinfo only when the token was issued
-with the `openid email` scopes, which is why the server advertises them.
+- **Which token is forwarded**: only an access token that passed this
+  server's own validation is sent to Hangar, verbatim, as
+  `Authorization: Bearer`, and only to `HANGAR_BASE_URL` (HTTPS, no redirects
+  followed). That is either a JWS verified locally (RS256, issuer, audience,
+  lifetime, org-bound role, not an ID token) or an opaque (JWE) token that
+  ZITADEL introspection reported `active` and that then passed the same
+  checks (issuer, audience, `exp`, org-bound role, access-token type).
+  Dynamically registered clients (Codex, OpenCode, ...) get opaque tokens;
+  Hangar introspects them again with the same checks
+  (`DUMONT_API_INTROSPECTION_*` on the Hangar side). ID tokens, tokens for
+  another audience or issuer, inactive tokens and tokens without an
+  org-bound Hangar role are rejected by this server (HTTP 401/403) and never
+  reach Hangar. When introspection itself fails (timeout, non-200, bad
+  response) or is overloaded, this server answers HTTP 503 without a
+  challenge (retry, no new login) and nothing reaches Hangar. The token is
+  never logged or stored; it lives in the per-request Hangar client only.
+- **Revocation delay for opaque tokens**: both sides cache active
+  introspection answers, so a revoked opaque token can keep working for up to
+  max(`MCP_OIDC_INTROSPECTION_CACHE_SECONDS`, 60 s on Hangar), never past its
+  `exp`.
+- **Per-request isolation**: the HTTP layer builds a new McpServer and a new
+  Hangar client bound to the verified caller for every request; there is no
+  global "current user".
+- **Caches are per user**: the project list, the workspace member list and the
+  Hangar user id are cached per token `sub` (`HANGAR_PROJECT_CACHE_SECONDS`,
+  at most 1000 users, least recently used dropped first). One user's cached
+  data is never served to another user. The cache only helps name resolution;
+  Hangar still authorizes every call. A project missing from a user's cached
+  list triggers one reload of that user's list before `PROJECT_NOT_FOUND`, so a
+  just-granted project works at once.
+- **One `users/me` lookup per tool call**: every tool call first asks Hangar
+  who the caller is (`GET /api/v1/users/me/`) for the audit line and `"me"`.
+  It is cached per user for `HANGAR_PROJECT_CACHE_SECONDS`; with `0` it is an
+  extra GET on every call.
+- **Cursors are per user**: pagination cursors are HMAC-signed with
+  `MCP_CURSOR_SECRET` and bound to the caller's `sub`; a cursor issued to one
+  user is `INVALID_CURSOR` for anyone else.
+- **Hangar 401 is not an MCP 401**: a 401 from Hangar becomes a tool error
+  (HTTP 200), so the client does not restart its login for a problem a new
+  login cannot fix. The same mapping applies to JWS and opaque tokens.
+  Expiry is handled before forwarding: a token with 30 s or less left
+  (`MIN_TOKEN_LIFETIME_SECONDS`; the JWT `exp`, or for an opaque token the
+  introspection `exp`) already gets this server's regular HTTP 401 challenge, so the client refreshes before the token reaches Hangar.
+  Only if a call outlives that margin (or the clocks disagree) and Hangar
+  answers 401 within 30 s of `exp` does the tool answer `TOKEN_EXPIRED`, not
+  retryable with the same token; the client's next request gets the 401
+  challenge and refreshes, so this cannot loop. Hangar's 401 challenge
+  (`error="invalid_token"`) is read only through its `error_code`, never
+  passed on. Hangar's 403 `DUMONT_USER_NOT_ALLOWED` and 503
+  `DUMONT_AUTH_UNAVAILABLE` are tool errors as well (`USER_NOT_ALLOWED`,
+  `UPSTREAM_AUTH_UNAVAILABLE`), so neither starts a new login.
 
 ### Error codes (tool errors, HTTP 200)
 
-| Code                   | Meaning                                                             |
-| ---------------------- | ------------------------------------------------------------------- |
-| `FORBIDDEN`            | Token lacks the role for this tool, or `"me"` could not be resolved |
-| `WRITES_DISABLED`      | Defensive only: with writes off the write tools are not registered  |
-| `PROJECT_NOT_ALLOWED`  | Project is not in `HANGAR_ALLOWED_PROJECTS`                         |
-| `PROJECT_NOT_WRITABLE` | Project is readable but not in `HANGAR_WRITE_PROJECTS`              |
-| `SECRET_DETECTED`      | Input looked like a credential; nothing written                     |
-| `RATE_LIMITED`         | Per-user write limit reached; retry after the window                |
-| `UPSTREAM_*`           | Hangar refused or failed; `UPSTREAM_VALIDATION_FAILED` lists fields |
+| Code                        | Meaning                                                                                                       |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `FORBIDDEN`                 | Token lacks the role for this tool (write tools need `hangar_writer`)                                         |
+| `ACCOUNT_NOT_LINKED`        | Hangar has no account linked to this Dumont login: sign in once at https://hangar.getdumont.ai (Dumont login) |
+| `TOKEN_NOT_FORWARDABLE`     | Defensive: no validated token to forward (should not happen); nothing sent; log in again                      |
+| `TOKEN_EXPIRED`             | Token expired during the call; nothing changed; the next request gets a 401 and the client refreshes          |
+| `WRITER_ROLE_REQUIRED`      | Hangar requires `hangar_writer` for this change                                                               |
+| `USER_NOT_ALLOWED`          | The linked Hangar user is deactivated, a bot or linked twice; not retryable, a new login will not help        |
+| `UPSTREAM_AUTH_UNAVAILABLE` | Hangar could not check the token (Dumont Auth unreachable); nothing changed; retryable, no new login          |
+| `PROJECT_ACCESS_DENIED`     | Hangar denied access to project X; ask for role `hangar.project.x.member` in Dumont Auth                      |
+| `PROJECT_NOT_FOUND`         | Not among the projects you can see (the message names the role to ask for)                                    |
+| `PROJECT_NOT_ALLOWED`       | Project is outside this server's `HANGAR_ALLOWED_PROJECTS` ceiling                                            |
+| `SECRET_DETECTED`           | Input looked like a credential; nothing written                                                               |
+| `RATE_LIMITED`              | Per-user write limit reached; retry after the window                                                          |
+| `UPSTREAM_*`                | Hangar refused or failed; `UPSTREAM_VALIDATION_FAILED` lists fields                                           |
 
 A write that times out or gets a 5xx is **not** marked retryable: it may have
 been applied. Use `idempotency_key` for safe retries of creates.
 
-## Roles and scopes
+## Roles and access
 
-| Role            | Grants                                    |
-| --------------- | ----------------------------------------- |
-| `hangar_reader` | Read tools                                |
-| `hangar_writer` | Read tools and write tools (implies read) |
+Two separate layers:
 
-- The HTTP layer accepts a token that carries **either** role. A token without
+| Layer                 | Where it is managed                             | What it decides                                           |
+| --------------------- | ----------------------------------------------- | --------------------------------------------------------- |
+| MCP gate              | ZITADEL roles `hangar_reader` / `hangar_writer` | May this user use the read tools / the write tools at all |
+| Hangar access (Plane) | Hangar workspace/project membership of the user | Which projects the user sees and where they may write     |
+
+- `hangar_reader` grants the read tools; `hangar_writer` grants the read and
+  write tools (implies read). Hangar also requires `hangar_writer` on the
+  token for any change (`WRITER_ROLE_REQUIRED` otherwise).
+- Hangar membership is per user. For projects managed by Dumont Auth, it
+  follows the ZITADEL roles `hangar.project.<identifier>.admin|member|guest`
+  (e.g. `hangar.project.hgr.member`); writing needs Member or Admin.
+- `HANGAR_ALLOWED_PROJECTS` is an optional ceiling on top: when set, the MCP
+  refuses every project outside it, whatever Hangar would allow.
+- The HTTP layer accepts a token that carries **either** role. A token with
   neither role is `403 insufficient_scope`. A reader calling a write tool gets a
   `FORBIDDEN` tool error, not an HTTP 401/403, so clients do not restart login.
 - Protected-resource metadata `scopes_supported` and the `WWW-Authenticate`
   `scope=` list, in order: `openid`, `email`,
   `urn:zitadel:iam:org:project:role:hangar_reader`,
   `urn:zitadel:iam:org:project:role:hangar_writer`. ZITADEL only asserts roles
-  the client requested, so clients must request both role scopes; `openid` and
-  `email` let userinfo return the caller's email. None of these has to be
-  present in the token: a token with only `hangar_reader` is still accepted for
-  reads.
+  the client requested, so clients must request both role scopes. `openid` and
+  `email` stay advertised so existing client logins do not change; none of
+  these has to be present in the token.
 - `MCP_OIDC_REQUIRED_ROLE` (pre-HGR-6) is still read as the reader role.
-- Where roles are read from (token already bound to issuer and audience):
-  `urn:zitadel:iam:org:project:<audience>:roles` (only the audience project's
-  roles); `urn:zitadel:iam:org:project:roles` and `roles` (roles of the
-  requesting application's project: our clients live in the audience project,
-  but a client of another project that also requests our audience would carry
-  that project's roles here, so no other ZITADEL project may define roles named
-  `hangar_reader`/`hangar_writer`); `my:zitadel:grants` only as the exact
-  `<audience>:<role>` string.
+- **Every role is bound to our organization** (`MCP_OIDC_ALLOWED_ORG_ID`,
+  required). The ZITADEL instance is shared with other products'
+  organizations: any of them can define a project role named `hangar_writer`,
+  and any organization's Actions can set the legacy claims. So a role name
+  alone never counts. Where roles are read from (token already bound to issuer
+  and audience):
+  - `urn:zitadel:iam:org:project:<audience>:roles` and
+    `urn:zitadel:iam:org:project:roles`, in ZITADEL's object form
+    `{ "<role>": { "<orgId>": "<org domain>" } }`: the role counts only when
+    `claim[role]` is an object that has the allowed org id as a key, i.e. the
+    role was granted in our organization. A grant of some other role in our
+    org (for example `hangar.project.hgr.guest`) never vouches for a
+    `hangar_writer` granted in another org.
+  - Any other form (these claims as an array, the legacy flat `roles` claim,
+    `my:zitadel:grants` as the exact `<audience>:<role>` string): counts only
+    when `urn:zitadel:iam:user:resourceowner:id` equals the allowed org id.
+    `org_id` / `urn:zitadel:iam:org:id` are never used.
+  - There is no separate organization check: a token whose Hangar roles are
+    not bound to our org has no Hangar role and gets `403 insufficient_scope`.
+    Opaque (introspected) tokens go through the same function. Hangar applies
+    the same rules to the forwarded token, JWS or opaque.
 
 ## Audit log
 
@@ -172,7 +240,7 @@ One JSON line per tool call (read and write) on stderr, i.e. in journald for
   "event": "hangar.mcp.tool",
   "tool": "hangar_create_work_item",
   "sub": "…",
-  "email": "…",
+  "plane_user_id": "…",
   "roles_used": ["hangar_writer"],
   "project": "HGR",
   "work_item": "HGR-12",
@@ -183,11 +251,16 @@ One JSON line per tool call (read and write) on stderr, i.e. in journald for
 }
 ```
 
-`outcome` is `success`, `denied` (policy: role, disabled, allowlist, secret,
-rate) or `error`. `fields_changed` are field names only (on an error, the
-fields that were attempted). Text bodies, tokens and the API key are never
-logged; caller-supplied references that do not look like an identifier or UUID
-are logged as `[invalid]`.
+`plane_user_id` is the Hangar user behind the token (from
+`GET /api/v1/users/me/`, cached per user); it can be `null` when Hangar was
+not or could not be asked (unlinked account, a role denial
+before any call with nothing cached yet).
+`outcome` is `success`, `denied` (policy: role, ceiling, secret, rate, or a
+Hangar denial such as `PROJECT_ACCESS_DENIED`/`ACCOUNT_NOT_LINKED`) or
+`error`. `fields_changed` are field names only (on an error, the fields that
+were attempted). Text bodies, tokens and emails are never logged;
+caller-supplied references that do not look like an identifier or UUID are
+logged as `[invalid]`.
 
 `journalctl -u dumont-hangar-mcp -o cat | grep '"hangar.mcp.tool"'`
 
@@ -195,44 +268,68 @@ are logged as `[invalid]`.
 
 See [.env.example](.env.example). The important ones:
 
-| Variable                   | Meaning                                                                 |
-| -------------------------- | ----------------------------------------------------------------------- |
-| `HANGAR_BASE_URL`          | Hangar origin, default `https://hangar.getdumont.ai`                    |
-| `HANGAR_API_KEY`           | Dedicated Hangar bot token. Server-side only                            |
-| `HANGAR_WORKSPACE_SLUG`    | Workspace slug                                                          |
-| `HANGAR_ALLOWED_PROJECTS`  | CSV of identifiers (`HGR`) or project UUIDs readable through the MCP    |
-| `HANGAR_WRITE_PROJECTS`    | Subset of the above (same spelling) where writes are allowed; empty=off |
-| `HANGAR_WRITE_RATE_LIMIT`  | Write calls per user per 60 s, default 20, max 120                      |
-| `MCP_AUTH_MODE`            | `oidc` only                                                             |
-| `MCP_RESOURCE_URL`         | Public MCP URL, `https://hangar.getdumont.ai/mcp`                       |
-| `MCP_OIDC_AUDIENCE`        | ZITADEL project audience (the `ZITADEL DCR` project)                    |
-| `MCP_OIDC_READER_ROLE`     | `hangar_reader` (legacy name: `MCP_OIDC_REQUIRED_ROLE`)                 |
-| `MCP_OIDC_WRITER_ROLE`     | `hangar_writer`                                                         |
-| `MCP_OIDC_USERINFO_URL`    | Optional; default `${MCP_OIDC_ISSUER}/oidc/v1/userinfo`, same origin    |
-| `MCP_OIDC_INTROSPECTION_*` | Optional RFC 7662 introspection for opaque tokens                       |
+| Variable                       | Meaning                                                                             |
+| ------------------------------ | ----------------------------------------------------------------------------------- |
+| `HANGAR_BASE_URL`              | Hangar origin, default `https://hangar.getdumont.ai`; the caller's token goes here  |
+| `HANGAR_WORKSPACE_SLUG`        | Workspace slug                                                                      |
+| `HANGAR_ALLOWED_PROJECTS`      | Optional ceiling: CSV of identifiers (`HGR`) or UUIDs. Empty = no ceiling           |
+| `MCP_CURSOR_SECRET`            | **Required**, at least 32 bytes: HMAC key of the pagination cursors. Secret         |
+| `HANGAR_WRITE_RATE_LIMIT`      | Write calls per user per 60 s, default 20, max 120                                  |
+| `HANGAR_PROJECT_CACHE_SECONDS` | Per-user cache TTL (projects, members, user id), default 60, 0 disables             |
+| `MCP_AUTH_MODE`                | `oidc` only                                                                         |
+| `MCP_RESOURCE_URL`             | Public MCP URL, `https://hangar.getdumont.ai/mcp`                                   |
+| `MCP_OIDC_AUDIENCE`            | ZITADEL project audience (the `ZITADEL DCR` project); Hangar must accept it as well |
+| `MCP_OIDC_ALLOWED_ORG_ID`      | **Required**: ZITADEL org id whose role grants count (see "Roles and access")       |
+| `MCP_OIDC_READER_ROLE`         | `hangar_reader` (legacy name: `MCP_OIDC_REQUIRED_ROLE`)                             |
+| `MCP_OIDC_WRITER_ROLE`         | `hangar_writer`                                                                     |
+| `MCP_OIDC_INTROSPECTION_*`     | RFC 7662 introspection for opaque tokens; accepted ones are forwarded to Hangar     |
 
-`HANGAR_WRITE_PROJECTS` is checked at startup against
-`HANGAR_ALLOWED_PROJECTS` literally (after upper-casing identifiers), so an
-identifier in one list cannot be matched to a UUID in the other.
+Retired keys:
 
-The bot account behind `HANGAR_API_KEY` must be a **Member** (not Guest) of
-every write project, or Hangar answers `UPSTREAM_FORBIDDEN`.
+| Variable                | Status                                                                           |
+| ----------------------- | -------------------------------------------------------------------------------- |
+| `HANGAR_API_KEY`        | **Startup error if present, even empty** ("retired, remove it"): no bot any more |
+| `HANGAR_WRITE_PROJECTS` | **Startup error if present, even empty**: Hangar membership decides writes       |
+| `MCP_OIDC_USERINFO_URL` | Ignored (no more email lookup); remove it                                        |
+
+Hangar side (fork module `apps/api/plane/dumont/`): API v1 must accept the
+bearer, i.e. `DUMONT_API_BEARER_ENABLED=1` with `MCP_OIDC_AUDIENCE` listed in
+`DUMONT_API_AUDIENCES`, and, for opaque tokens, RFC 7662 introspection
+configured (`DUMONT_API_INTROSPECTION_*`).
 
 ## Team access with login
 
 Point compatible clients at `https://hangar.getdumont.ai/mcp` and pin the
 pre-registered public client (`392047847798800387`, redirect
 `http://127.0.0.1:19876/mcp/oauth/callback`, PKCE, no secret). The client opens
-the Dumont login; the token must carry `hangar_reader` or `hangar_writer`. Do
-not let the client self-register through ZITADEL DCR: those applications
-receive opaque (JWE) access tokens, which only work when the introspection
-credentials are configured.
+the Dumont login; the token must carry `hangar_reader` or `hangar_writer`.
+
+For a new teammate, in this order:
+
+1. **Dumont Auth (ZITADEL)**: grant `hangar_reader` (or `hangar_writer`) in
+   the `ZITADEL DCR` project, plus the Hangar project roles they need (e.g.
+   `hangar.project.hgr.member`) where projects are managed by Dumont Auth.
+   The grant must be made **in our organization** (`MCP_OIDC_ALLOWED_ORG_ID`):
+   a `hangar_*` role granted in any other organization of the shared ZITADEL
+   instance is ignored, and the login then gets `403 insufficient_scope`.
+2. **Hangar web, once**: they sign in at https://hangar.getdumont.ai with
+   **Dumont login**. That links their ZITADEL user to a Hangar account; until
+   then every tool answers `ACCOUNT_NOT_LINKED`.
+3. **MCP client**: connect with the pinned client above and log in.
+
+Clients that self-register through ZITADEL DCR (Codex, OpenCode, ...) receive
+opaque (JWE) access tokens. They work when this server has
+`MCP_OIDC_INTROSPECTION_*` and Hangar has `DUMONT_API_INTROSPECTION_*`
+configured: this server introspects the token, and once it passes, forwards
+it to Hangar, which introspects it again. If Hangar lacks introspection, those
+users get a tool error from Hangar's answer (typically
+`UPSTREAM_UNAUTHORIZED`) on every call.
 
 After `hangar_writer` is granted, a client must **log in again** so the new
 token requests and carries the role (Claude Code: `/mcp`, pick the Hangar
 server, re-authenticate; dumont-code: expire/remove the stored Hangar token so
-the next call opens the login). Clients that request the advertised scopes
-also get `openid email`, which the email lookup needs.
+the next call opens the login). Project-role changes in Hangar need no new
+MCP login.
 
 dumont-code example:
 
@@ -271,11 +368,38 @@ permissions, no secrets, no self-hosted runner and **no deploy job**. Deploys
 are manual (below); an automated deploy is left to a later ticket, driven from
 a private repository.
 
-### Manual deploy (keeps the existing env file)
+### Manual deploy (0.3.0: acting as the user)
 
-It keeps `/etc/dumont-hangar-mcp.env` as is and only appends the new non-secret
-keys.
-Never `cat` that file: it holds the API key.
+**Order matters.** This release calls Hangar with the user's token, so Hangar
+must accept it first, and this release refuses to start while
+`HANGAR_API_KEY` or `HANGAR_WRITE_PROJECTS` is in the env file. So:
+
+0. **Prerequisite (Hangar side, deployed and verified first)**: Hangar runs
+   the fork release with the Dumont bearer (`apps/api/plane/dumont/`), with
+   `DUMONT_API_BEARER_ENABLED=1` and `DUMONT_API_AUDIENCES` containing the
+   value of `MCP_OIDC_AUDIENCE`, **and with `DUMONT_API_INTROSPECTION_*`
+   configured and verified** (this release forwards introspected opaque
+   tokens; without Hangar-side introspection, every user of a dynamically
+   registered client, e.g. Codex or OpenCode, gets an error from Hangar on
+   every tool call). Verify both, printing no values:
+
+   ```bash
+   # On airbase-hel1: the Hangar api container has the introspection client
+   # id set (prints a count of the NAME only; expect 1).
+   sudo docker exec <hangar-api-container> env | grep -c '^DUMONT_API_INTROSPECTION_CLIENT_ID='
+   # From a workstation, with a real OPAQUE token from a DCR client (Codex or
+   # OpenCode) in the environment, never in argv or shell history; expect 200.
+   curl -s -o /dev/null -w '%{http_code}\n' -H @<(printf 'Authorization: Bearer %s\n' "$OPAQUE_TOKEN") \
+     https://hangar.getdumont.ai/api/v1/users/me/
+   ```
+
+   Every MCP user has signed in once to Hangar
+   web with Dumont login (otherwise `ACCOUNT_NOT_LINKED`) and is a member of
+   the projects they use. **Do not remove `HANGAR_API_KEY` /
+   `HANGAR_WRITE_PROJECTS` before this is live**: the old MCP release (still
+   running) needs them, and the new one cannot work without the Hangar side.
+
+Never `cat` the env file: it holds secrets. Print key names only.
 
 1. **Build locally** from the commit being released (repo root):
 
@@ -297,41 +421,66 @@ Never `cat` that file: it holds the API key.
    printf 'release_id=%s\nsource_commit=%s\nsource_ref=manual\n' "$SHA-manual" "$SHA" > "$REL/RELEASE"
    ```
 
-3. **Add only the new non-secret keys** (back up first; print key names only):
+3. **Prepare the new env file as a copy** (only after step 0). The live file
+   is not touched until step 5; the backup keeps the old API key for a
+   rollback. `cp -p` keeps owner and mode (`root:deploy`, `0640`).
 
    ```bash
-   sudo cp -p /etc/dumont-hangar-mcp.env /etc/dumont-hangar-mcp.env.bak-$SHA
-   sudo sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' /etc/dumont-hangar-mcp.env   # names only
-   printf '%s\n' 'HANGAR_WRITE_PROJECTS=""' 'HANGAR_WRITE_RATE_LIMIT="20"' \
-     'MCP_OIDC_WRITER_ROLE="hangar_writer"' | sudo tee -a /etc/dumont-hangar-mcp.env >/dev/null
+   ENV=/etc/dumont-hangar-mcp.env
+   sudo cp -p "$ENV" "$ENV.bak-$SHA"
+   sudo cp -p "$ENV" "$ENV.new"
+   sudo sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' "$ENV.new"   # names only
+   # Compare the two NON-secret project lists before removing the write list
+   # (this prints only these two keys):
+   sudo grep -E '^(HANGAR_ALLOWED_PROJECTS|HANGAR_WRITE_PROJECTS)=' "$ENV.new"
+   # Remove the retired keys (and the no-longer-read userinfo URL, if present).
+   sudo sed -i -e '/^HANGAR_API_KEY=/d' -e '/^HANGAR_WRITE_PROJECTS=/d' \
+     -e '/^MCP_OIDC_USERINFO_URL=/d' "$ENV.new"
+   # Add the new cursor secret, generated on the host and never printed.
+   printf 'MCP_CURSOR_SECRET="%s"\n' "$(openssl rand -hex 32)" | sudo tee -a "$ENV.new" >/dev/null
+   sudo sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' "$ENV.new"   # names only, check
+   sudo stat -c '%U:%G %a' "$ENV.new"                                  # expect root:deploy 640
    ```
 
-   Leave `MCP_OIDC_REQUIRED_ROLE` as it is (it is read as the reader role; do
-   not add `MCP_OIDC_READER_ROLE` with a different value). Leave
-   `MCP_OIDC_USERINFO_URL` unset to use `${issuer}/oidc/v1/userinfo`. Start
-   with `HANGAR_WRITE_PROJECTS=""` (writes off); set it to `"HGR"` with
-   `sudoedit` later and restart. The unauthenticated checks below (401 and
-   metadata) work whatever `MCP_ALLOWED_HOSTS` says; `127.0.0.1` is only needed
-   there for an authenticated call over loopback (`mcp/scripts/live-smoke.mjs`).
+   **Write scope changes with this release.** `HANGAR_WRITE_PROJECTS` used to
+   be a subset of `HANGAR_ALLOWED_PROJECTS` where writes were allowed; that
+   subset is gone. From now on a user with `hangar_writer` can write in
+   **every project inside `HANGAR_ALLOWED_PROJECTS` where they are a Hangar
+   Member or Admin**. If the two lists printed above differ, decide before the
+   switch: either shrink `HANGAR_ALLOWED_PROJECTS` in `$ENV.new` (this also
+   limits reads) or accept that Hangar membership now decides writes there.
+   `HANGAR_ALLOWED_PROJECTS` is now an optional ceiling; emptying it later lets
+   each user reach every project Hangar shows them.
 
-4. **Validate the config with the new release** before switching. `systemd-run`
-   reads the env file exactly as the service does and runs the check as
-   `deploy`; secrets stay in the unit's environment, never in argv or output:
+4. **Validate the new file with the new release** before switching.
+   `systemd-run` reads `$ENV.new` exactly as the service will read the live
+   file and runs the check as `deploy`; secrets stay in the unit's
+   environment, never in argv or output:
 
    ```bash
    sudo systemd-run --pipe --wait --quiet --collect \
-     -p EnvironmentFile=/etc/dumont-hangar-mcp.env -p User=deploy -p Group=deploy \
+     -p EnvironmentFile=/etc/dumont-hangar-mcp.env.new -p User=deploy -p Group=deploy \
      -p WorkingDirectory="$REL" \
      /usr/bin/node --input-type=module -e '
        const m = await import("./mcp/dist/config.js");
        try { const c = m.loadHangarConfig(); m.assertHttpAuthConfigured(c);
-         console.log("OK write projects=" + c.writeProjects.length); }
+         console.log("OK project ceiling=" + (c.allowedProjects.join(",") || "none")); }
        catch (e) { console.error("ERROR " + e.message); process.exit(1); }'
    ```
 
-5. **Switch and restart**:
+   `ERROR HANGAR_API_KEY is retired, remove it…` means step 3 did not remove
+   it; `ERROR MCP_CURSOR_SECRET is required…` means the secret is missing;
+   `ERROR MCP_OIDC_ALLOWED_ORG_ID is required…` means the org id is missing
+   or empty. It is not a secret: add the line
+   `MCP_OIDC_ALLOWED_ORG_ID=<org id>` (our ZITADEL organization) to
+   `$ENV.new`.
+
+5. **Put the new env in place, switch and restart**, back to back (the old
+   release keeps running on the environment it read at start until the
+   restart):
 
    ```bash
+   sudo mv /etc/dumont-hangar-mcp.env.new /etc/dumont-hangar-mcp.env
    ln -s "$REL" /opt/dumont-hangar-mcp/.current.new
    mv -Tf /opt/dumont-hangar-mcp/.current.new /opt/dumont-hangar-mcp/current
    sudo systemctl restart dumont-hangar-mcp.service
@@ -358,16 +507,36 @@ Never `cat` that file: it holds the API key.
      node metadata-smoke.mjs
    ```
 
-7. **Rollback**: switch the symlink back and restart; restore the env backup
-   only if you changed keys other than the appended ones.
+   Then the authenticated read smoke with a real user's short-lived JWT
+   (`mcp/scripts/live-smoke.mjs`, `MCP_AUTH_TOKEN` from the environment, never
+   in argv): it expects 12 tools and lists up to 50 projects, printing how
+   many **that user** sees (capped at 50). `HANGAR_PROJECTS_READ_FAILED:ACCOUNT_NOT_LINKED` means that
+   user never signed in to Hangar web with Dumont login;
+   `…:UPSTREAM_UNAUTHORIZED` means Hangar does not accept the bearer (step 0).
+
+   **Repeat the read smoke with an opaque token** from a DCR client (Codex or
+   OpenCode) in `MCP_AUTH_TOKEN`. It must pass like the JWT run.
+   `…:UPSTREAM_UNAUTHORIZED` there (while the JWT run passed) means Hangar's
+   introspection (`DUMONT_API_INTROSPECTION_*`) is missing or broken: **roll
+   back** (step 7) and fix the Hangar side first.
+
+   In the journal, audit lines now carry `plane_user_id` and no email.
+
+7. **Rollback**: the previous release needs the old env file (with
+   `HANGAR_API_KEY` and `HANGAR_WRITE_PROJECTS`), so restore
+   `.bak-$SHA` (not the `.new` copy), switch the symlink back and restart:
 
    ```bash
+   sudo cp -p /etc/dumont-hangar-mcp.env.bak-$SHA /etc/dumont-hangar-mcp.env
    ln -s "$(cat /tmp/hangar-mcp-previous-release)" /opt/dumont-hangar-mcp/.current.new
    mv -Tf /opt/dumont-hangar-mcp/.current.new /opt/dumont-hangar-mcp/current
    sudo systemctl restart dumont-hangar-mcp.service
    ```
 
-   The appended keys are harmless for the previous release (it ignores them).
+8. **After it is stable**: revoke the old bot API token of
+   `hangar-mcp@dumont.au` in Hangar (only after confirming nothing else uses
+   it) and delete `/etc/dumont-hangar-mcp.env.bak-*`, which still hold it.
+   Rollback past this point needs a new bot token.
 
 The historical downloadable `/hangar-mcp` launcher is disabled. Older local
 copies cannot be disabled by a server release: remove their MCP registrations

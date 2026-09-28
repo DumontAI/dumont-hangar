@@ -1,8 +1,8 @@
 {
   "name": "hangar-mcp-server",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
-  "description": "MCP server for the Dumont Hangar (Plane) instance: reads plus role-gated writes",
+  "description": "MCP server for the Dumont Hangar (Plane) instance: reads plus role-gated writes, acting as the logged-in user",
   "bin": {
     "hangar-mcp-http": "dist/http.js"
   },

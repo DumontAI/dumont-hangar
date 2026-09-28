@@ -3,9 +3,12 @@ import { SignJWT, type JWTPayload } from "jose";
 import type { HangarConfig, OidcIntrospectionAuth } from "./types.js";
 
 // RFC 7662 token introspection for access tokens that cannot be verified
-// locally (ZITADEL's default "opaque" access token is a JWE). The client
-// token is only ever sent to the configured issuer's introspection endpoint,
-// never to Hangar, and is never logged or used as a cache key.
+// locally (ZITADEL's default "opaque" access token is a JWE). This module
+// sends the client token only to the configured issuer's introspection
+// endpoint and never logs it or uses it as a cache key. Once the authorizer
+// has accepted the outcome (active, issuer, audience, org-bound role, enough
+// lifetime left), the same token is forwarded verbatim to Hangar, which
+// introspects it again with the same checks.
 
 type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Response>;
 

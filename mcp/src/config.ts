@@ -3,7 +3,6 @@ import type { HangarConfig, OidcIntrospectionAuth } from "./types.js";
 
 const DEFAULT_BASE_URL = "https://hangar.getdumont.ai";
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
-const API_KEY_PATTERN = /^plane_api_[0-9a-f]{32}$/;
 const WORKSPACE_SLUG_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const PROJECT_IDENTIFIER_PATTERN = /^[A-Z][A-Z0-9]{1,9}$/;
 const PROJECT_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -51,29 +50,46 @@ function parseProjectList(env: NodeJS.ProcessEnv, name: string): string[] {
   return [...new Set(normalized)];
 }
 
+/**
+ * Optional ceiling on the projects reachable through the MCP. Empty or unset =
+ * no ceiling: whatever Hangar lets the calling user see.
+ */
 function parseAllowedProjects(env: NodeJS.ProcessEnv): string[] {
-  const values = parseProjectList(env, "HANGAR_ALLOWED_PROJECTS");
-  if (values.length === 0) {
-    throw new HangarConfigError("HANGAR_ALLOWED_PROJECTS is required");
+  return parseProjectList(env, "HANGAR_ALLOWED_PROJECTS");
+}
+
+const MIN_CURSOR_SECRET_BYTES = 32;
+
+/** Error messages must never echo the value. */
+function parseCursorSecret(env: NodeJS.ProcessEnv): string {
+  const value = env.MCP_CURSOR_SECRET?.trim() ?? "";
+  if (/[\r\n]/.test(value) || Buffer.byteLength(value, "utf8") < MIN_CURSOR_SECRET_BYTES) {
+    throw new HangarConfigError(
+      `MCP_CURSOR_SECRET is required and must be at least ${MIN_CURSOR_SECRET_BYTES} bytes on one line (for example: openssl rand -hex 32)`
+    );
   }
-  return values;
+  return value;
 }
 
 /**
- * Projects where the write tools may act. Every entry must also appear, in the
- * same form (identifier or UUID), in HANGAR_ALLOWED_PROJECTS: the subset is
- * checked offline at startup, so an identifier cannot be matched to a UUID.
- * Empty or unset disables every write tool.
+ * Keys of the retired bot-token model. Present at all (even empty) = startup
+ * error, so a stale env file is noticed instead of silently ignored.
  */
-function parseWriteProjects(env: NodeJS.ProcessEnv, allowedProjects: readonly string[]): string[] {
-  const values = parseProjectList(env, "HANGAR_WRITE_PROJECTS");
-  const outside = values.filter((value) => !allowedProjects.includes(value));
-  if (outside.length > 0) {
-    throw new HangarConfigError(
-      `HANGAR_WRITE_PROJECTS must be a subset of HANGAR_ALLOWED_PROJECTS (written the same way); not allowed: ${outside.join(", ")}`
-    );
+const RETIRED_VARIABLES: ReadonlyArray<readonly [string, string]> = [
+  [
+    "HANGAR_API_KEY",
+    "HANGAR_API_KEY is retired, remove it: the MCP now calls Hangar as the logged-in user with the caller's own Dumont (ZITADEL) token, so the bot API key is no longer used",
+  ],
+  [
+    "HANGAR_WRITE_PROJECTS",
+    "HANGAR_WRITE_PROJECTS is retired, remove it: Hangar project membership now decides where each user may write (the hangar_writer role still gates the write tools); HANGAR_ALLOWED_PROJECTS remains as an optional ceiling",
+  ],
+];
+
+function rejectRetiredVariables(env: NodeJS.ProcessEnv): void {
+  for (const [name, message] of RETIRED_VARIABLES) {
+    if (env[name] !== undefined) throw new HangarConfigError(message);
   }
-  return values;
 }
 
 function parseRoleName(env: NodeJS.ProcessEnv, name: string): string {
@@ -183,6 +199,24 @@ function parseOidcAudience(env: NodeJS.ProcessEnv): string {
   return audience;
 }
 
+/**
+ * The ZITADEL instance is shared with other products' organizations, so every
+ * Hangar role is bound to this organization (see `hasRole` in auth.ts).
+ * Without it no token could be accepted, so it is a startup error.
+ */
+function parseAllowedOrgId(env: NodeJS.ProcessEnv): string {
+  const value = parseOptionalToken(env, "MCP_OIDC_ALLOWED_ORG_ID");
+  if (!value) {
+    throw new HangarConfigError(
+      "MCP_OIDC_ALLOWED_ORG_ID is required: the ZITADEL organization id whose role grants count (the ZITADEL instance is shared with other organizations)"
+    );
+  }
+  if (/\s/.test(value) || value.length > 200) {
+    throw new HangarConfigError("MCP_OIDC_ALLOWED_ORG_ID must be one organization id without whitespace");
+  }
+  return value;
+}
+
 function parseOidcScope(env: NodeJS.ProcessEnv, fallback: string): string {
   const scope = env.MCP_OIDC_REQUIRED_SCOPE?.trim() || fallback;
   if (!OIDC_SCOPE_PATTERN.test(scope)) {
@@ -289,28 +323,8 @@ function parseIntrospection(
   return { oidcIntrospectionUrl: url, oidcIntrospectionAuth: parseIntrospectionPrivateKey(privateKeyJson, clientId) };
 }
 
-/**
- * Userinfo endpoint used to find the caller's email when the access token has
- * none. The caller's bearer is sent there, so it must be on the issuer's origin.
- * Default: ZITADEL's `${issuer}/oidc/v1/userinfo`.
- */
-function parseUserinfoUrl(env: NodeJS.ProcessEnv, oidcIssuer: URL | null): URL | null {
-  const configured = parseOptionalHttpsUrl(env, "MCP_OIDC_USERINFO_URL");
-  if (!oidcIssuer) return configured;
-  const url = configured ?? new URL(`${oidcIssuer.href.replace(/\/+$/, "")}/oidc/v1/userinfo`);
-  if (url.origin !== oidcIssuer.origin) {
-    throw new HangarConfigError("MCP_OIDC_USERINFO_URL must be on the same origin as MCP_OIDC_ISSUER");
-  }
-  return url;
-}
-
 export function loadHangarConfig(env: NodeJS.ProcessEnv = process.env): HangarConfig {
-  const apiKey = env.HANGAR_API_KEY?.trim() ?? "";
-  if (!API_KEY_PATTERN.test(apiKey)) {
-    throw new HangarConfigError(
-      "HANGAR_API_KEY is required and must be a Hangar API token (plane_api_ followed by 32 lowercase hexadecimal characters)"
-    );
-  }
+  rejectRetiredVariables(env);
 
   const httpHost = env.MCP_HTTP_HOST?.trim() || "127.0.0.1";
   const allowedHosts = parseHosts(env);
@@ -331,28 +345,27 @@ export function loadHangarConfig(env: NodeJS.ProcessEnv = process.env): HangarCo
   const { readerRole, writerRole } = parseRoles(env);
   const oidcRequiredScope = parseOidcScope(env, zitadelRoleScope(readerRole));
   // ZITADEL only asserts the roles a client asked for, so clients must request
-  // both role scopes. `openid email` lets the userinfo endpoint return the
-  // caller's email for attribution; neither is required on the token.
+  // both role scopes. `openid email` are kept as advertised so existing client
+  // logins and consents do not change; neither is required on the token.
   const oidcScopesSupported = [
     ...new Set(["openid", "email", oidcRequiredScope, zitadelRoleScope(readerRole), zitadelRoleScope(writerRole)]),
   ];
   const allowedProjects = parseAllowedProjects(env);
-  const oidcAllowedOrgId = parseOptionalToken(env, "MCP_OIDC_ALLOWED_ORG_ID");
   const oidcAllowedSubjects = parseCsv(env, "MCP_OIDC_ALLOWED_SUBJECTS");
   const introspection = parseIntrospection(env, oidcIssuer);
-  const oidcUserinfoUrl = parseUserinfoUrl(env, oidcIssuer);
+  const cursorSecret = parseCursorSecret(env);
 
   if (!oidcIssuer) throw new HangarConfigError("MCP_OIDC_ISSUER is required");
   if (!oidcJwksUrl) throw new HangarConfigError("MCP_OIDC_JWKS_URL is required");
   if (!resourceUrl) throw new HangarConfigError("MCP_RESOURCE_URL is required");
   parseOidcAudience(env);
+  const oidcAllowedOrgId = parseAllowedOrgId(env);
 
   return {
     baseUrl: validateBaseUrl(env.HANGAR_BASE_URL?.trim() || DEFAULT_BASE_URL),
-    apiKey,
     workspaceSlug: parseWorkspaceSlug(env),
     allowedProjects,
-    writeProjects: parseWriteProjects(env, allowedProjects),
+    cursorSecret,
     writeRateLimit: boundedInt(env, "HANGAR_WRITE_RATE_LIMIT", 20, 1, 120),
     timeoutMs: boundedInt(env, "HANGAR_TIMEOUT_MS", 7500, 100, 30000),
     maxResponseBytes: boundedInt(env, "HANGAR_MAX_RESPONSE_BYTES", 2 * 1024 * 1024, 1024, 8 * 1024 * 1024),
@@ -369,7 +382,6 @@ export function loadHangarConfig(env: NodeJS.ProcessEnv = process.env): HangarCo
     oidcReaderRole: readerRole,
     oidcWriterRole: writerRole,
     oidcScopesSupported,
-    oidcUserinfoUrl,
     oidcAllowedOrgId,
     oidcAllowedSubjects,
     resourceUrl,
@@ -382,11 +394,13 @@ export function loadHangarConfig(env: NodeJS.ProcessEnv = process.env): HangarCo
 }
 
 export function assertHttpAuthConfigured(config: HangarConfig): void {
-  if (!config.oidcIssuer || !config.oidcJwksUrl || !config.oidcAudience || !config.resourceUrl) {
+  if (
+    !config.oidcIssuer ||
+    !config.oidcJwksUrl ||
+    !config.oidcAudience ||
+    !config.oidcAllowedOrgId ||
+    !config.resourceUrl
+  ) {
     throw new HangarConfigError("OIDC configuration is incomplete for Streamable HTTP");
   }
-}
-
-export function isApiKey(value: string): boolean {
-  return API_KEY_PATTERN.test(value);
 }
