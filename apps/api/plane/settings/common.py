@@ -153,6 +153,12 @@ REST_FRAMEWORK = {
 # API key throttle rate (DRF SimpleRateThrottle format, e.g. "60/minute")
 API_KEY_RATE_LIMIT = os.environ.get("API_KEY_RATE_LIMIT", "60/minute")
 
+# Dumont addition: ZITADEL bearer tokens on API v1 (plane/dumont/auth/config.py). Off unless
+# DUMONT_API_BEARER_ENABLED=1; raises at startup when enabled but misconfigured.
+from plane.dumont.auth.config import load_bearer_config  # noqa: E402
+
+DUMONT_API_BEARER = load_bearer_config(os.environ, default_rate=API_KEY_RATE_LIMIT)
+
 # Django Auth Backend
 AUTHENTICATION_BACKENDS = ("django.contrib.auth.backends.ModelBackend",)  # default
 
