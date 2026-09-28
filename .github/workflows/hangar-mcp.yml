@@ -42,7 +42,8 @@ jobs:
       - name: Use pnpm
         uses: pnpm/action-setup@v6
         with:
-          version: ${{ env.PNPM_VERSION }}
+          # mcp/ is its own package (pnpm@10.33.2); the repo root pins pnpm 11.
+          package_json_file: mcp/package.json
 
       - name: Use Node.js
         uses: actions/setup-node@v7
