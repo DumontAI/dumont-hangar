@@ -72,10 +72,11 @@ export interface Principal {
 
 /**
  * What the Hangar client needs to act as the caller for one MCP request.
- * `accessToken` is the caller's own verified JWS access token, forwarded to
- * Hangar as `Authorization: Bearer`; null when the token cannot be forwarded
- * (an opaque/JWE token accepted through introspection: Hangar only accepts
- * JWTs). `expiresAt` is the token `exp` (epoch seconds). Never logged.
+ * `accessToken` is the caller's own access token that passed this MCP's
+ * validation (a verified JWS or an introspected opaque token), forwarded
+ * verbatim to Hangar as `Authorization: Bearer`; null only when no validated
+ * token is available (the tools then refuse before any network call).
+ * `expiresAt` is the token `exp` (epoch seconds). Never logged.
  */
 export interface UpstreamCaller {
   readonly sub: string;

@@ -150,7 +150,8 @@ export function createHangarHttpServer(
       const body = req.method === "POST" ? await readJsonBody(req) : undefined;
       const principal = authorization.principal;
       // The verified bearer lives only in this request's client and is sent
-      // only to HANGAR_BASE_URL (never logged). Opaque tokens get null.
+      // only to HANGAR_BASE_URL (never logged), whether it is a JWS or an
+      // opaque token that passed introspection.
       const caller: UpstreamCaller = {
         sub: principal.sub,
         accessToken: authorization.upstreamToken ?? null,

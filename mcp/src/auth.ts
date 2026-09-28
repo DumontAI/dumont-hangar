@@ -8,10 +8,12 @@ const MAX_BEARER_BYTES = 16 * 1024;
 // Small allowance for clock skew between this host and the issuer on `nbf`.
 const NOT_BEFORE_TOLERANCE_SECONDS = 30;
 /**
- * A JWS access token is forwarded to Hangar, so it must still be valid there
- * for the whole tool call: a token with at most this many seconds left is
- * answered with the regular 401 challenge (the client refreshes) instead of
- * being forwarded and failing upstream.
+ * Every accepted access token (a verified JWS, or an opaque token that passed
+ * introspection) is forwarded to Hangar, so it must still be valid there for
+ * the whole tool call: a token with at most this many seconds left (its JWT
+ * `exp`, or the introspection `exp`) is answered with the regular 401
+ * challenge (the client refreshes) instead of being forwarded and failing
+ * upstream.
  */
 export const MIN_TOKEN_LIFETIME_SECONDS = 30;
 const BASE64URL_SEGMENT = /^[A-Za-z0-9_-]*$/;
@@ -35,9 +37,11 @@ export interface AuthorizationResult {
   /** Set only when failure is null: the verified caller handed to the tools. */
   readonly principal?: Principal | null;
   /**
-   * Set only when failure is null: the caller's verified bearer to forward to
-   * Hangar, or null when it must not be forwarded (an opaque/JWE token that
-   * passed introspection; Hangar only accepts JWTs). Never logged.
+   * Set only when failure is null: the caller's bearer, verbatim, to forward
+   * to Hangar. Only a token that passed this MCP's own validation (a locally
+   * verified RS256 JWS, or an opaque token introspected as active with our
+   * issuer, audience, org-bound role and enough lifetime left) is ever set
+   * here. Never logged.
    */
   readonly upstreamToken?: string | null;
   /** Set only when failure is null: the token `exp` (epoch seconds). */
@@ -307,10 +311,16 @@ function createOidcVerifier(config: HangarConfig, dependencies: AuthorizerDepend
     if (outcome.status !== "active" || !isAccessTokenType(outcome.claims.token_type)) {
       return invalidCredentials();
     }
-    const result = evaluateAccessClaims(outcome.claims, config, Math.floor(now() / 1000));
-    // Hangar accepts only JWTs: an opaque token is valid for this MCP but is
-    // never forwarded (the tools answer TOKEN_NOT_FORWARDABLE).
-    return result.failure ? result : { ...result, upstreamToken: null };
+    const nowSeconds = Math.floor(now() / 1000);
+    // Same near-expiry rule as the JWS path, on the introspection `exp`.
+    const exp = outcome.claims.exp;
+    if (typeof exp !== "number" || exp <= nowSeconds + MIN_TOKEN_LIFETIME_SECONDS) {
+      return invalidCredentials();
+    }
+    const result = evaluateAccessClaims(outcome.claims, config, nowSeconds);
+    // Passed introspection and the same claims policy as a JWS: forwarded to
+    // Hangar verbatim (Hangar introspects it again with the same checks).
+    return result.failure ? result : { ...result, upstreamToken: token };
   }
 
   return async (token: string): Promise<AuthorizationResult> => {

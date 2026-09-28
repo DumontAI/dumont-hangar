@@ -250,7 +250,7 @@ describe("Hangar write tools: authorization and gates", () => {
     expect(h.audit.at(-1)).toMatchObject({ outcome: "denied" });
   });
 
-  it("answers a non-forwardable (opaque) token with a tool error and never calls Hangar", async () => {
+  it("answers a call without a validated token with a tool error and never calls Hangar", async () => {
     const seen: Array<{ method: string; path: string }> = [];
     const h = await harness(WRITER, {}, { accessToken: null, seen });
     for (const [tool, args] of [

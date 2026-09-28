@@ -176,7 +176,23 @@ describe("Hangar client acts as the caller", () => {
     expect(seen[0]?.redirect).toBe("error");
   });
 
-  it("refuses to forward an opaque (introspected) token, before any network call", async () => {
+  it("forwards an opaque (introspected) token verbatim as Authorization: Bearer", async () => {
+    const opaque = "eyJhbGciOiJBMjU2R0NNS1cifQ.key.iv.ciphertext.tag";
+    const seen: RequestInit[] = [];
+    const { client: hangar } = client(
+      {},
+      async (_input, init) => {
+        seen.push(init ?? {});
+        return projectsPage(HGR_PROJECT);
+      },
+      { caller: callerFor(ALICE, opaque) }
+    );
+    await hangar.listProjects(10);
+    const headers = seen[0]?.headers as Record<string, string>;
+    expect(headers.Authorization).toBe(`Bearer ${opaque}`);
+  });
+
+  it("refuses to call Hangar without a validated token, before any network call", async () => {
     let calls = 0;
     const { client: hangar } = client(
       {},
@@ -188,7 +204,7 @@ describe("Hangar client acts as the caller", () => {
     );
     await expect(hangar.listProjects(10)).rejects.toMatchObject({
       code: "TOKEN_NOT_FORWARDABLE",
-      message: expect.stringContaining("pinned"),
+      message: expect.stringContaining("Log in to the Hangar MCP again"),
     });
     await expect(hangar.currentUserId()).rejects.toMatchObject({ code: "TOKEN_NOT_FORWARDABLE" });
     expect(calls).toBe(0);

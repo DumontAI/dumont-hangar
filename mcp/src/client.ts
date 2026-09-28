@@ -596,16 +596,17 @@ export class HangarClient {
   }
 
   /**
-   * The caller's bearer for Hangar. Only a locally verified JWS is ever
-   * forwarded; an opaque token (accepted through introspection) is refused
-   * before any network call.
+   * The caller's bearer for Hangar, verbatim: a verified JWS or an opaque
+   * token that passed introspection. Without a validated token (defensive:
+   * the authorizer always sets one) the call is refused before any network
+   * call.
    */
   private authorization(): string {
     const token = this.caller.accessToken;
     if (!token) {
       throw new HangarError(
         "TOKEN_NOT_FORWARDABLE",
-        "Your MCP login uses an opaque access token, which Hangar does not accept. Connect with the pinned Dumont public client (it issues JWT access tokens) and log in again; see the Hangar MCP README, 'Team access'."
+        "This MCP request carries no validated access token to act as you in Hangar; nothing was sent. Log in to the Hangar MCP again."
       );
     }
     return `Bearer ${token}`;
