@@ -23,6 +23,9 @@ PROJECT_ID = "300000000000000042"
 ORG_ID = "200000000000000001"
 KEY_ID = "key-0001"
 SERVICE_USER_ID = "svc-hangar-sync"
+# The exact shape production ZITADEL returns for an EMPTY management v1 search (verified 2026-09-28 on
+# users/_search): no `result` and no `details.totalResult`. Only the timestamp value is made up.
+ZITADEL_EMPTY_SEARCH_BODY = {"details": {"viewTimestamp": "2026-09-28T12:00:00.000000Z"}}
 
 
 @pytest.fixture(scope="session")

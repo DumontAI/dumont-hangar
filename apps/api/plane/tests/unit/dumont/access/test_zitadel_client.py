@@ -4,7 +4,7 @@ import pytest
 
 from plane.dumont.access import zitadel as Z
 from plane.dumont.access.config import parse_service_key
-from plane.tests.unit.dumont.access.conftest import BASE_URL, ORG_ID, PROJECT_ID
+from plane.tests.unit.dumont.access.conftest import BASE_URL, ORG_ID, PROJECT_ID, ZITADEL_EMPTY_SEARCH_BODY
 
 
 @pytest.fixture
@@ -119,7 +119,7 @@ class TestZitadelClient:
         assert chunks == [Z.USER_IDS_PER_QUERY, 5]
 
     def test_no_grants_no_user_lookup(self, client, fake_zitadel):
-        # an explicit "result": [] is the only way to say "nothing"
+        # the fake answers "result": [] with totalResult 0
         assert client.list_user_grants(PROJECT_ID) == []
         assert fake_zitadel.api_calls("users/_search") == []
 
@@ -133,18 +133,41 @@ class TestZitadelClient:
             client.list_user_grants(PROJECT_ID)
         assert "no 'result'" in str(exc.value)
 
-    @pytest.mark.parametrize("body", [{"details": {"totalResult": "0"}}, {"details": {"totalResult": 0}}])
-    def test_omitted_result_with_explicit_zero_total_is_empty(self, client, fake_zitadel, body):
-        # proto3 JSON without EmitUnpopulated omits an empty `result`; only an explicit zero total says so
+    @pytest.mark.parametrize(
+        "body",
+        [
+            ZITADEL_EMPTY_SEARCH_BODY,  # what production actually sends for an empty search
+            {"details": {"totalResult": "0"}},
+            {"details": {"totalResult": 0}},
+            {"details": {}},
+        ],
+        ids=["production-empty", "zero-string", "zero-number", "empty-details"],
+    )
+    def test_omitted_result_with_details_and_no_positive_total_is_empty(self, client, fake_zitadel, body):
+        # proto3 JSON without EmitUnpopulated omits an empty `result` and a zero `totalResult`
         fake_zitadel.raw_body_on = ("roles", body)
         assert client.list_project_role_keys(PROJECT_ID) == []
+
+    def test_production_empty_grants_answer_is_no_grants(self, client, fake_zitadel):
+        fake_zitadel.raw_body_on = ("grants", ZITADEL_EMPTY_SEARCH_BODY)
+        assert client.list_user_grants(PROJECT_ID) == []
+        assert fake_zitadel.api_calls("users/_search") == []
+
+    def test_production_empty_answer_ends_a_list_that_never_announced_a_total(self, client, fake_zitadel, monkeypatch):
+        monkeypatch.setattr(Z, "PAGE_SIZE", 2)
+        served = self._scripted(
+            monkeypatch,
+            fake_zitadel,
+            [{"result": [{"key": "a"}, {"key": "b"}]}, ZITADEL_EMPTY_SEARCH_BODY],
+        )
+        assert client.list_project_role_keys(PROJECT_ID) == ["a", "b"]
+        assert served == ["0", "2"]
 
     @pytest.mark.parametrize(
         "body,message",
         [
-            # reviewer probe: no result AND no totalResult is NOT an empty list
-            ({"details": {"viewTimestamp": "2026-09-28T00:00:00Z"}}, "no 'result'"),
             ({"details": {"totalResult": "3"}}, "no 'result'"),  # rows exist but none were sent
+            ({"details": {"totalResult": "3", "viewTimestamp": "x"}}, "no 'result'"),
             ({}, "no 'result'"),  # no details at all
             ({"details": "x"}, "no 'result'"),
             ({"details": {"totalResult": "0"}, "result": {"a": 1}}, "'result' is not a list"),
@@ -188,11 +211,13 @@ class TestZitadelClient:
             fake_zitadel,
             [
                 {"details": {"totalResult": "5"}, "result": [{"key": "a"}, {"key": "b"}]},
-                {"details": {"viewTimestamp": "x"}},
+                ZITADEL_EMPTY_SEARCH_BODY,
             ],
         )
-        with pytest.raises(Z.ZitadelError):
+        # The production empty body is an empty page, but 3 rows are still owed: truncated answer.
+        with pytest.raises(Z.ZitadelError) as exc:
             client.list_project_role_keys(PROJECT_ID)
+        assert "empty page at offset 2 of totalResult 5" in str(exc.value)
 
     def test_short_page_without_total_after_a_total_keeps_paging(self, client, fake_zitadel, monkeypatch):
         # page 2 is short and carries no total, but page 1 said 5: 3 rows are still owed

@@ -31,8 +31,9 @@
 #
 # The client never writes to ZITADEL, never logs tokens or the private key, and raises
 # ZitadelError for every failure so callers can fail safe (change nothing). Answers that look like
-# success but are incomplete are failures too: a search answer without `result` (unless
-# `details.totalResult` is present and 0), an empty page while any page's `totalResult` says more rows
+# success but are incomplete are failures too: a search answer without `result` unless it has a
+# `details` object and no `totalResult` above 0 (ZITADEL's real empty answer is
+# {"details": {"viewTimestamp": ...}}), an empty page while any page's `totalResult` says more rows
 # exist, and grants whose users the org-scoped users/_search does not
 # return at all (a silently filtered HTTP 200).
 
@@ -200,11 +201,15 @@ class ZitadelClient:
             data = self._request("POST", path, json_body=body)
             total = _total_result(data, path)
             if "result" not in data:
-                # ZITADEL's gateway may omit empty repeated fields and zero numbers (proto3 JSON without
-                # EmitUnpopulated). An omitted `result` is an empty list ONLY when the answer says so
-                # explicitly: `details.totalResult` present and 0. Anything else without `result` is a
-                # changed or partial answer, and reading it as empty would look like a mass revocation.
-                if total != 0:
+                # ZITADEL's gateway omits empty repeated fields and zero numbers (proto3 JSON without
+                # EmitUnpopulated). Production answers an empty search with exactly
+                # {"details": {"viewTimestamp": "..."}}: no `result` and no `totalResult` (verified on
+                # management v1 users/_search, 2026-09-28). So an omitted `result` is an empty page when
+                # `details` is an object and `totalResult` is absent or 0. Still an error: no `details`
+                # (or not an object), or a `totalResult` above 0 (rows exist but none were sent). A
+                # total announced by an earlier page is remembered below, so a later page like this
+                # while rows are still owed is refused as a truncated answer.
+                if not isinstance(data.get("details"), dict) or (total is not None and total != 0):
                     raise ZitadelError(f"POST {path}: response has no 'result' (API shape changed?)")
                 page = []
             else:

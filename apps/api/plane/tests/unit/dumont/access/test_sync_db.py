@@ -17,6 +17,7 @@ from plane.dumont.access.sync import (
 from plane.license.models import Instance, InstanceAdmin
 from plane.tests.unit.dumont.access.conftest import (
     ORG_ID,
+    ZITADEL_EMPTY_SEARCH_BODY,
     make_project,
     make_user,
     pr_member,
@@ -680,9 +681,21 @@ def _small_state(w):
 class TestNoSilentWipe:
     """Second-round review: answers that used to wipe a small workspace now write nothing."""
 
-    def test_grants_answer_without_result_and_total_is_an_error(self, small_world):
-        # reviewer probe: grants/_search answers 200 {"details": {"viewTimestamp": ...}}
-        small_world["fake"].raw_body_on = ("grants", {"details": {"viewTimestamp": "2026-09-28T00:00:00Z"}})
+    def test_real_empty_grants_answer_hits_the_zero_grants_guard(self, small_world):
+        # grants/_search answers 200 with ZITADEL's real empty body {"details": {"viewTimestamp": ...}}.
+        # That is a legitimately empty list for the client; the full sync's zero-grants guard is what
+        # keeps it from wiping the workspace.
+        from plane.dumont.access.sync import ZERO_GRANTS_ERROR
+
+        small_world["fake"].raw_body_on = ("grants", ZITADEL_EMPTY_SEARCH_BODY)
+        dry = run_full_sync(mode="dry-run")
+        assert ZERO_GRANTS_ERROR in dry["would_refuse"], dry
+        report = run_full_sync()
+        assert report["status"] == "error" and report["error"] == ZERO_GRANTS_ERROR, report
+        assert _small_state(small_world) == [(True, True, True)] * 4
+
+    def test_answer_without_details_is_an_error(self, small_world):
+        small_world["fake"].raw_body_on = ("grants", {})
         report = run_full_sync()
         assert report["status"] == "error" and "no 'result'" in report["error"]
         assert _small_state(small_world) == [(True, True, True)] * 4
