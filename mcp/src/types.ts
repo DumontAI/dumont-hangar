@@ -20,6 +20,10 @@ export interface HangarConfig {
   readonly apiKey: string;
   readonly workspaceSlug: string;
   readonly allowedProjects: readonly string[];
+  /** Subset of allowedProjects where write tools may act. Empty = writes disabled. */
+  readonly writeProjects: readonly string[];
+  /** Per-subject write tool calls allowed per fixed 60 s window. */
+  readonly writeRateLimit: number;
   readonly timeoutMs: number;
   readonly maxResponseBytes: number;
   readonly maxSearchPages: number;
@@ -31,8 +35,18 @@ export interface HangarConfig {
   readonly oidcIssuer: URL | null;
   readonly oidcJwksUrl: URL | null;
   readonly oidcAudience: string;
+  /**
+   * Scope that must be literally present on the token. When it is the ZITADEL
+   * reserved role scope of the reader or writer role (the default), the role
+   * claim is checked instead, because ZITADEL does not echo reserved scopes.
+   */
   readonly oidcRequiredScope: string;
-  readonly oidcRequiredRole: string;
+  /** Role that grants the read tools (MCP_OIDC_READER_ROLE, legacy MCP_OIDC_REQUIRED_ROLE). */
+  readonly oidcReaderRole: string;
+  /** Role that grants the write tools and implies the reader role. */
+  readonly oidcWriterRole: string;
+  /** Scopes advertised in protected-resource metadata and in the 401/403 challenge. */
+  readonly oidcScopesSupported: readonly string[];
   readonly oidcAllowedOrgId: string;
   readonly oidcAllowedSubjects: readonly string[];
   readonly resourceUrl: URL | null;
@@ -42,6 +56,17 @@ export interface HangarConfig {
   readonly oidcIntrospectionCacheSeconds: number;
   readonly oidcIntrospectionMaxInFlight: number;
   readonly oidcIntrospectionRatePerSecond: number;
+}
+
+/**
+ * The verified caller of one MCP HTTP request. `roles` holds only the
+ * configured Hangar roles (reader and/or writer) the token actually carries.
+ * `email` is null when the token has no (verified) email claim.
+ */
+export interface Principal {
+  readonly sub: string;
+  readonly email: string | null;
+  readonly roles: readonly string[];
 }
 
 export interface HangarPage<T> {

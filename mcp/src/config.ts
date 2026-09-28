@@ -41,20 +41,68 @@ function parseWorkspaceSlug(env: NodeJS.ProcessEnv): string {
   return slug;
 }
 
-function parseAllowedProjects(env: NodeJS.ProcessEnv): string[] {
-  const values = parseCsv(env, "HANGAR_ALLOWED_PROJECTS");
-  if (values.length === 0) {
-    throw new HangarConfigError("HANGAR_ALLOWED_PROJECTS is required");
-  }
-  const normalized = values.map((value) => {
+function parseProjectList(env: NodeJS.ProcessEnv, name: string): string[] {
+  const normalized = parseCsv(env, name).map((value) => {
     if (PROJECT_UUID_PATTERN.test(value)) return value.toLowerCase();
     const identifier = value.toUpperCase();
     if (PROJECT_IDENTIFIER_PATTERN.test(identifier)) return identifier;
-    throw new HangarConfigError(
-      "HANGAR_ALLOWED_PROJECTS must contain only project identifiers (like HGR) or project UUIDs"
-    );
+    throw new HangarConfigError(`${name} must contain only project identifiers (like HGR) or project UUIDs`);
   });
   return [...new Set(normalized)];
+}
+
+function parseAllowedProjects(env: NodeJS.ProcessEnv): string[] {
+  const values = parseProjectList(env, "HANGAR_ALLOWED_PROJECTS");
+  if (values.length === 0) {
+    throw new HangarConfigError("HANGAR_ALLOWED_PROJECTS is required");
+  }
+  return values;
+}
+
+/**
+ * Projects where the write tools may act. Every entry must also appear, in the
+ * same form (identifier or UUID), in HANGAR_ALLOWED_PROJECTS: the subset is
+ * checked offline at startup, so an identifier cannot be matched to a UUID.
+ * Empty or unset disables every write tool.
+ */
+function parseWriteProjects(env: NodeJS.ProcessEnv, allowedProjects: readonly string[]): string[] {
+  const values = parseProjectList(env, "HANGAR_WRITE_PROJECTS");
+  const outside = values.filter((value) => !allowedProjects.includes(value));
+  if (outside.length > 0) {
+    throw new HangarConfigError(
+      `HANGAR_WRITE_PROJECTS must be a subset of HANGAR_ALLOWED_PROJECTS (written the same way); not allowed: ${outside.join(", ")}`
+    );
+  }
+  return values;
+}
+
+function parseRoleName(env: NodeJS.ProcessEnv, name: string): string {
+  const value = parseOptionalToken(env, name);
+  if (/\s/.test(value) || value.length > 200) {
+    throw new HangarConfigError(`${name} must be one role name without whitespace`);
+  }
+  return value;
+}
+
+function parseRoles(env: NodeJS.ProcessEnv): { readerRole: string; writerRole: string } {
+  const reader = parseRoleName(env, "MCP_OIDC_READER_ROLE");
+  // MCP_OIDC_REQUIRED_ROLE is the pre-HGR-6 name of the reader role.
+  const legacy = parseRoleName(env, "MCP_OIDC_REQUIRED_ROLE");
+  if (reader && legacy && reader !== legacy) {
+    throw new HangarConfigError(
+      "MCP_OIDC_READER_ROLE and the legacy MCP_OIDC_REQUIRED_ROLE disagree; keep only MCP_OIDC_READER_ROLE"
+    );
+  }
+  const readerRole = reader || legacy || "hangar_reader";
+  const writerRole = parseRoleName(env, "MCP_OIDC_WRITER_ROLE") || "hangar_writer";
+  if (readerRole === writerRole) {
+    throw new HangarConfigError("MCP_OIDC_READER_ROLE and MCP_OIDC_WRITER_ROLE must be different roles");
+  }
+  return { readerRole, writerRole };
+}
+
+export function zitadelRoleScope(role: string): string {
+  return `urn:zitadel:iam:org:project:role:${role}`;
 }
 
 function validateBaseUrl(raw: string): URL {
@@ -265,11 +313,14 @@ export function loadHangarConfig(env: NodeJS.ProcessEnv = process.env): HangarCo
   const oidcJwksUrl = parseOptionalHttpsUrl(env, "MCP_OIDC_JWKS_URL");
   const resourceUrl = parseOptionalHttpsUrl(env, "MCP_RESOURCE_URL");
   const oidcAudience = env.MCP_OIDC_AUDIENCE?.trim() ?? "";
-  const oidcRequiredRole = parseOptionalToken(env, "MCP_OIDC_REQUIRED_ROLE") || "hangar_reader";
-  if (/\s/.test(oidcRequiredRole)) {
-    throw new HangarConfigError("MCP_OIDC_REQUIRED_ROLE must not contain whitespace");
-  }
-  const oidcRequiredScope = parseOidcScope(env, `urn:zitadel:iam:org:project:role:${oidcRequiredRole}`);
+  const { readerRole, writerRole } = parseRoles(env);
+  const oidcRequiredScope = parseOidcScope(env, zitadelRoleScope(readerRole));
+  // ZITADEL only asserts the roles a client asked for, so clients must request
+  // both role scopes; a custom required scope is advertised first.
+  const oidcScopesSupported = [
+    ...new Set([oidcRequiredScope, zitadelRoleScope(readerRole), zitadelRoleScope(writerRole)]),
+  ];
+  const allowedProjects = parseAllowedProjects(env);
   const oidcAllowedOrgId = parseOptionalToken(env, "MCP_OIDC_ALLOWED_ORG_ID");
   const oidcAllowedSubjects = parseCsv(env, "MCP_OIDC_ALLOWED_SUBJECTS");
   const introspection = parseIntrospection(env, oidcIssuer);
@@ -283,7 +334,9 @@ export function loadHangarConfig(env: NodeJS.ProcessEnv = process.env): HangarCo
     baseUrl: validateBaseUrl(env.HANGAR_BASE_URL?.trim() || DEFAULT_BASE_URL),
     apiKey,
     workspaceSlug: parseWorkspaceSlug(env),
-    allowedProjects: parseAllowedProjects(env),
+    allowedProjects,
+    writeProjects: parseWriteProjects(env, allowedProjects),
+    writeRateLimit: boundedInt(env, "HANGAR_WRITE_RATE_LIMIT", 20, 1, 120),
     timeoutMs: boundedInt(env, "HANGAR_TIMEOUT_MS", 7500, 100, 30000),
     maxResponseBytes: boundedInt(env, "HANGAR_MAX_RESPONSE_BYTES", 2 * 1024 * 1024, 1024, 8 * 1024 * 1024),
     maxSearchPages: boundedInt(env, "HANGAR_MAX_SEARCH_PAGES", 3, 1, 10),
@@ -296,7 +349,9 @@ export function loadHangarConfig(env: NodeJS.ProcessEnv = process.env): HangarCo
     oidcJwksUrl,
     oidcAudience,
     oidcRequiredScope,
-    oidcRequiredRole,
+    oidcReaderRole: readerRole,
+    oidcWriterRole: writerRole,
+    oidcScopesSupported,
     oidcAllowedOrgId,
     oidcAllowedSubjects,
     resourceUrl,

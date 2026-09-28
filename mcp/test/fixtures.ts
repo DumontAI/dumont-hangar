@@ -1,4 +1,4 @@
-import type { HangarConfig } from "../src/types.js";
+import type { HangarConfig, Principal } from "../src/types.js";
 
 export const PROJECT_HGR = "1f4b7c4b-fe28-441d-a6ce-b3dfe87384b2";
 export const PROJECT_SEC = "ac913f1a-fa7f-4c98-848b-b0ae826f7117";
@@ -24,6 +24,8 @@ export function testConfig(overrides: Partial<HangarConfig> = {}): HangarConfig 
     apiKey: "plane_api_" + "a".repeat(32),
     workspaceSlug: "dumont",
     allowedProjects: ["HGR"],
+    writeProjects: [],
+    writeRateLimit: 20,
     timeoutMs: 200,
     maxResponseBytes: 100_000,
     maxSearchPages: 2,
@@ -36,7 +38,12 @@ export function testConfig(overrides: Partial<HangarConfig> = {}): HangarConfig 
     oidcJwksUrl: null,
     oidcAudience: "",
     oidcRequiredScope: "urn:zitadel:iam:org:project:role:hangar_reader",
-    oidcRequiredRole: "hangar_reader",
+    oidcReaderRole: "hangar_reader",
+    oidcWriterRole: "hangar_writer",
+    oidcScopesSupported: [
+      "urn:zitadel:iam:org:project:role:hangar_reader",
+      "urn:zitadel:iam:org:project:role:hangar_writer",
+    ],
     oidcAllowedOrgId: "",
     oidcAllowedSubjects: [],
     resourceUrl: null,
@@ -49,6 +56,13 @@ export function testConfig(overrides: Partial<HangarConfig> = {}): HangarConfig 
     ...overrides,
   };
 }
+
+export const READER: Principal = { sub: "user-reader", email: "reader@example.test", roles: ["hangar_reader"] };
+export const WRITER: Principal = {
+  sub: "user-writer",
+  email: "cristian@example.test",
+  roles: ["hangar_reader", "hangar_writer"],
+};
 
 export function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {

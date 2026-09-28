@@ -1,8 +1,13 @@
 import { InMemoryTransport, type JSONRPCMessage } from "@modelcontextprotocol/server";
 import { describe, expect, it } from "vitest";
 import { HangarClient } from "../src/client.js";
-import { createHangarServer, HANGAR_TOOL_NAMES } from "../src/tools.js";
-import { PROJECT_HGR, hangarFetch, testConfig } from "./fixtures.js";
+import {
+  createHangarServer,
+  HANGAR_READ_TOOL_NAMES,
+  HANGAR_TOOL_NAMES,
+  HANGAR_WRITE_TOOL_NAMES,
+} from "../src/tools.js";
+import { PROJECT_HGR, READER, hangarFetch, testConfig } from "./fixtures.js";
 
 function isResponse(message: JSONRPCMessage, id: number): message is JSONRPCMessage & { id: number } {
   return "id" in message && message.id === id;
@@ -33,11 +38,14 @@ const forbiddenUpstream: (input: string | URL, init?: RequestInit) => Promise<Re
   });
 
 describe("MCP protocol catalog and in-memory transport", () => {
-  it("lists exactly the deterministic read-only Hangar tools and calls one tool", async () => {
+  it("lists the deterministic Hangar tool catalog and calls one tool", async () => {
     const config = testConfig();
     const calls: URL[] = [];
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-    const server = createHangarServer(config, new HangarClient(config, hangarFetch(calls)));
+    const server = createHangarServer(config, new HangarClient(config, hangarFetch(calls)), {
+      principal: READER,
+      audit: () => {},
+    });
     try {
       await server.connect(serverTransport);
       await clientTransport.start();
@@ -60,13 +68,15 @@ describe("MCP protocol catalog and in-memory transport", () => {
       expect(tools.every((tool) => String(tool.name).startsWith("hangar_"))).toBe(true);
       expect(tools.every((tool) => (tool.inputSchema as Record<string, unknown>).type === "object")).toBe(true);
       expect(tools.every((tool) => (tool.outputSchema as Record<string, unknown>).type === "object")).toBe(true);
-      expect(
-        tools.every(
-          (tool) =>
-            (tool.annotations as Record<string, unknown>).readOnlyHint === true &&
-            (tool.annotations as Record<string, unknown>).destructiveHint === false
-        )
-      ).toBe(true);
+      const readOnly = new Set<string>(HANGAR_READ_TOOL_NAMES);
+      for (const tool of tools) {
+        const annotations = tool.annotations as Record<string, unknown>;
+        expect(annotations.destructiveHint).toBe(false);
+        expect(annotations.readOnlyHint).toBe(readOnly.has(String(tool.name)));
+      }
+      expect(tools.filter((tool) => !readOnly.has(String(tool.name))).map((tool) => tool.name)).toEqual([
+        ...HANGAR_WRITE_TOOL_NAMES,
+      ]);
 
       const result = await rpc(clientTransport, {
         jsonrpc: "2.0",
@@ -88,7 +98,10 @@ describe("MCP protocol catalog and in-memory transport", () => {
   it("returns a tool error without leaking upstream details when the read fails", async () => {
     const config = testConfig();
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-    const server = createHangarServer(config, new HangarClient(config, forbiddenUpstream));
+    const server = createHangarServer(config, new HangarClient(config, forbiddenUpstream), {
+      principal: READER,
+      audit: () => {},
+    });
     try {
       await server.connect(serverTransport);
       await clientTransport.start();

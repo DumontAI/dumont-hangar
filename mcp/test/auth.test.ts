@@ -58,7 +58,8 @@ async function setupOidc() {
     oidcJwksUrl: new URL(`http://127.0.0.1:${jwksPort}/jwks`),
     oidcAudience: "hangar-mcp-project",
     oidcRequiredScope: roleScope,
-    oidcRequiredRole: "hangar_reader",
+    oidcReaderRole: "hangar_reader",
+    oidcWriterRole: "hangar_writer",
     oidcAllowedOrgId: "dumont-org",
     oidcAllowedSubjects: [],
     resourceUrl: new URL("https://mcp-hangar.example.test/mcp"),
@@ -90,7 +91,10 @@ describe("OIDC authorization", () => {
     expect(protectedResourceMetadata(config)).toEqual({
       resource: "https://mcp-hangar.example.test/mcp",
       authorization_servers: ["https://issuer.example.test"],
-      scopes_supported: ["urn:zitadel:iam:org:project:role:hangar_reader"],
+      scopes_supported: [
+        "urn:zitadel:iam:org:project:role:hangar_reader",
+        "urn:zitadel:iam:org:project:role:hangar_writer",
+      ],
       bearer_methods_supported: ["header"],
     });
   });
@@ -137,11 +141,77 @@ describe("OIDC authorization", () => {
     expect(await authorize(request)).toMatchObject({ failure: null, subject: "user-1" });
   });
 
+  it("accepts reader-only and writer-only tokens and hands roles and email to the tools", async () => {
+    const { config, token } = await setupOidc();
+    const authorize = createAuthorizer(config);
+    const request = async (claims: Record<string, unknown>) =>
+      authorize({ headers: { host: "127.0.0.1", authorization: `Bearer ${await token(claims)}` } } as never);
+
+    expect(await request({})).toMatchObject({
+      failure: null,
+      principal: { sub: "user-1", email: null, roles: ["hangar_reader"] },
+    });
+    expect(
+      await request({
+        email: "Cristian@Example.test",
+        "urn:zitadel:iam:org:project:roles": { hangar_writer: { "dumont-org": "dumont.example.test" } },
+      })
+    ).toMatchObject({ failure: null, principal: { email: "cristian@example.test", roles: ["hangar_writer"] } });
+    expect(
+      await request({
+        email: "x@example.test",
+        email_verified: false,
+        "urn:zitadel:iam:org:project:roles": {
+          hangar_reader: { "dumont-org": "d" },
+          hangar_writer: { "dumont-org": "d" },
+        },
+      })
+    ).toMatchObject({ failure: null, principal: { email: null, roles: ["hangar_reader", "hangar_writer"] } });
+    expect(
+      (await request({ "urn:zitadel:iam:org:project:roles": { some_other_role: { "dumont-org": "d" } } })).failure
+    ).toBe("insufficient_scope");
+  });
+
+  it("answers a reader calling a write tool with a tool error, not an HTTP 401/403", async () => {
+    const { config: base, token } = await setupOidc();
+    const config = { ...base, writeProjects: ["HGR"] };
+    const calls: URL[] = [];
+    const server = createHangarHttpServer(config, (principal) =>
+      createHangarServer(config, new HangarClient(config, hangarFetch(calls)), { principal, audit: () => {} })
+    );
+    const port = await listen(server);
+    const unauthorized = await fetch(`http://127.0.0.1:${port}/mcp`, { method: "POST", body: "{}" });
+    expect(unauthorized.headers.get("www-authenticate")).toContain(
+      'scope="urn:zitadel:iam:org:project:role:hangar_reader urn:zitadel:iam:org:project:role:hangar_writer"'
+    );
+    const response = await fetch(`http://127.0.0.1:${port}/mcp`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${await token()}`,
+        accept: "application/json, text/event-stream",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "hangar_add_comment", arguments: { work_item: "HGR-5", body: "hi" } },
+      }),
+    });
+    expect(response.status).toBe(200);
+    const payload = (await response.json()) as { result: { isError: boolean; structuredContent: unknown } };
+    expect(payload.result.isError).toBe(true);
+    expect(payload.result.structuredContent).toMatchObject({ error: { code: "FORBIDDEN" } });
+    expect(calls).toHaveLength(0);
+  });
+
   it("returns 401 metadata challenge and 403 for a valid token without the role", async () => {
     const { config, token } = await setupOidc();
     const calls: URL[] = [];
     const hangar = new HangarClient(config, hangarFetch(calls));
-    const server = createHangarHttpServer(config, () => createHangarServer(config, hangar));
+    const server = createHangarHttpServer(config, (principal) =>
+      createHangarServer(config, hangar, { principal, audit: () => {} })
+    );
     const port = await listen(server);
     const baseUrl = `http://127.0.0.1:${port}`;
 
@@ -203,7 +273,7 @@ describe("OIDC authorization", () => {
       return (await response.json()) as Record<string, unknown>;
     };
     const listed = await call(3, "tools/list", {});
-    expect((listed.result as { tools: unknown[] }).tools).toHaveLength(9);
+    expect((listed.result as { tools: unknown[] }).tools).toHaveLength(12);
     const result = await call(4, "tools/call", {
       name: "hangar_list_projects",
       arguments: { limit: 10, response_format: "json" },

@@ -8,9 +8,11 @@ import {
   protectedResourceMetadata,
   protectedResourceMetadataPaths,
 } from "./auth.js";
+import { WriteRateLimiter } from "./access.js";
+import { HangarClient } from "./client.js";
 import { isMainModule } from "./runtime.js";
 import { createHangarServer } from "./tools.js";
-import { HangarError, type HangarConfig } from "./types.js";
+import { HangarError, type HangarConfig, type Principal } from "./types.js";
 
 const MAX_REQUEST_BYTES = 1024 * 1024;
 
@@ -58,12 +60,19 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   }
 }
 
+export type HangarServerFactory = (principal: Principal) => ReturnType<typeof createHangarServer>;
+
 export function createHangarHttpServer(
   config: HangarConfig = loadHangarConfig(),
-  serverFactory: () => ReturnType<typeof createHangarServer> = () => createHangarServer(config),
+  serverFactory?: HangarServerFactory,
   authorizerDependencies: AuthorizerDependencies = {}
 ): Server {
   assertHttpAuthConfigured(config);
+  // One limiter per process so the per-user write window spans requests (each
+  // request gets its own stateless McpServer).
+  const rateLimiter = new WriteRateLimiter(config.writeRateLimit);
+  const factory: HangarServerFactory =
+    serverFactory ?? ((principal) => createHangarServer(config, new HangarClient(config), { principal, rateLimiter }));
   const authorize = createAuthorizer(config, authorizerDependencies);
   const metadata = protectedResourceMetadata(config);
   const metadataPaths = protectedResourceMetadataPaths(config);
@@ -86,9 +95,10 @@ export function createHangarHttpServer(
       responseError(res, 503, "MCP authorization is temporarily unavailable", { "retry-after": "1" });
       return;
     }
-    if (authorization.failure) {
-      const status = authorization.failure === "insufficient_scope" ? 403 : 401;
-      const challenge = authorizationChallenge(config, authorization.failure);
+    if (authorization.failure || !authorization.principal) {
+      const failure = authorization.failure ?? "invalid_credentials";
+      const status = failure === "insufficient_scope" ? 403 : 401;
+      const challenge = authorizationChallenge(config, failure);
       responseError(
         res,
         status,
@@ -111,7 +121,7 @@ export function createHangarHttpServer(
 
     try {
       const body = req.method === "POST" ? await readJsonBody(req) : undefined;
-      const server = serverFactory();
+      const server = factory(authorization.principal);
       const transport = new NodeStreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
         enableJsonResponse: true,

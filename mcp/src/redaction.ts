@@ -80,6 +80,54 @@ export function redactText(value: string, maxLength = 4000): string {
   return redacted.slice(0, maxLength);
 }
 
+// Credential detectors for text that is about to be WRITTEN to Hangar. They
+// mirror the credential rules of redactText (authorization header, bearer,
+// connection strings with a password, URL userinfo, secret query parameters,
+// cookies, secret-looking assignments) plus well-known token shapes. Emails
+// and IP addresses are redacted on read but are not credentials, so they do
+// not block a write. Assignment values shorter than 8 characters or that look
+// like placeholders ([REDACTED], <token>, ***, ${VAR}) are ignored so prose
+// such as "password: see vault" still goes through.
+const CREDENTIAL_KEY = String.raw`[A-Za-z0-9_.-]*(?:password|passwd|secret|token|api[-_]?key|private[-_]?key|access[-_]?key|dsn)[A-Za-z0-9_.-]*`;
+const CREDENTIAL_PATTERNS: readonly RegExp[] = [
+  /\bauthorization\s*[:=]\s*(?:[A-Za-z][A-Za-z0-9_-]*\s+)?[A-Za-z0-9._~+/=-]{8,}/i,
+  /\bBearer\s+[A-Za-z0-9._~+/=-]{16,}/i,
+  /\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|rediss|amqps?):\/\/[^\s:@/]+:[^\s@/]+@/i,
+  /\bhttps?:\/\/[^/\s:@]+:[^/\s@]+@/i,
+  /[?&](?:token|secret|password|api[_-]?key|dsn)=[^&#\s]{8,}/i,
+  /\b(?:set-)?cookie\s*[:=]\s*[^\s=;]+=[^\s;]{8,}/i,
+  /\bplane_api_[0-9a-f]{32}\b/i,
+  /\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/,
+  /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----/,
+  /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/,
+  /\bgh[pousr]_[A-Za-z0-9]{36,}\b/,
+  /\bgithub_pat_[A-Za-z0-9_]{40,}\b/,
+  /\bglpat-[A-Za-z0-9_-]{20,}\b/,
+  /\bxox[abprs]-[A-Za-z0-9-]{10,}\b/,
+  /\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{20,}\b/,
+  /\bAC[0-9a-f]{32}:[0-9a-f]{32}\b/i,
+];
+const CREDENTIAL_ASSIGNMENT = new RegExp(String.raw`["']?(${CREDENTIAL_KEY})["']?\s*[:=]\s*["']?([^\s"',;}\]]+)`, "gi");
+// The value capture stops at "]", so "[REDACTED]" arrives as "[REDACTED".
+const PLACEHOLDER = /^(?:\[.*|<.*|\*+|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|x+|\.\.\.+)$/i;
+// Naming a secret is fine ("secret: HANGAR_API_KEY"); only values are refused.
+const ENV_VARIABLE_NAME = /^[A-Z][A-Z0-9_]{2,}$/;
+
+/**
+ * True when the text looks like it carries a credential. Used to refuse a
+ * write outright; the matched value is never returned or logged.
+ */
+export function containsCredential(value: string): boolean {
+  if (CREDENTIAL_PATTERNS.some((pattern) => pattern.test(value))) return true;
+  CREDENTIAL_ASSIGNMENT.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = CREDENTIAL_ASSIGNMENT.exec(value))) {
+    const candidate = match[2] ?? "";
+    if (candidate.length >= 8 && !PLACEHOLDER.test(candidate) && !ENV_VARIABLE_NAME.test(candidate)) return true;
+  }
+  return false;
+}
+
 function record(value: unknown): JsonRecord {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as JsonRecord) : {};
 }
