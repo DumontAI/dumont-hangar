@@ -29,6 +29,7 @@ from plane.app.views.base import BaseAPIView
 from plane.bgtasks.event_tracking_task import track_event
 from plane.bgtasks.workspace_invitation_task import workspace_invitation
 from plane.db.models import User, Workspace, WorkspaceMember, WorkspaceMemberInvite
+from plane.dumont.access.guard import lock_workspace_membership, workspace_slugs_of_invitations  # Dumont addition
 from plane.utils.cache import invalidate_cache, invalidate_cache_directly
 from plane.utils.host import base_host
 from plane.utils.analytics_events import USER_JOINED_WORKSPACE, USER_INVITED_TO_WORKSPACE
@@ -51,6 +52,7 @@ class WorkspaceInvitationsViewset(BaseViewSet):
             .select_related("workspace", "workspace__owner", "created_by")
         )
 
+    @lock_workspace_membership()
     def create(self, request, slug):
         emails = request.data.get("emails", [])
         # Check if email is provided
@@ -142,6 +144,11 @@ class WorkspaceInvitationsViewset(BaseViewSet):
 
         return Response({"message": "Emails sent successfully"}, status=status.HTTP_200_OK)
 
+    # Dumont addition: changing a pending invite's role is a membership change too.
+    @lock_workspace_membership()
+    def partial_update(self, request, *args, **kwargs):
+        return super().partial_update(request, *args, **kwargs)
+
     def destroy(self, request, slug, pk):
         workspace_member_invite = WorkspaceMemberInvite.objects.get(pk=pk, workspace__slug=slug)
         workspace_member_invite.delete()
@@ -161,6 +168,7 @@ class WorkspaceJoinEndpoint(BaseAPIView):
         url_params=True,
     )
     @invalidate_cache(path="/api/users/me/settings/", multiple=True)
+    @lock_workspace_membership()
     def post(self, request, slug, pk):
         workspace_invite = WorkspaceMemberInvite.objects.get(pk=pk, workspace__slug=slug)
 
@@ -271,6 +279,7 @@ class UserWorkspaceInvitationsViewSet(BaseViewSet):
 
     @invalidate_cache(path="/api/workspaces/", user=False)
     @invalidate_cache(path="/api/users/me/workspaces/", multiple=True)
+    @lock_workspace_membership(slugs_from=workspace_slugs_of_invitations)
     def create(self, request):
         invitations = request.data.get("invitations", [])
         workspace_invitations = WorkspaceMemberInvite.objects.filter(

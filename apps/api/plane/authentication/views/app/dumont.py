@@ -12,6 +12,7 @@ from django.views import View
 
 # Module imports
 from plane.authentication.provider.oauth.dumont import DumontOAuthProvider
+from plane.dumont.access.hooks import on_web_login
 from plane.authentication.utils.login import user_login
 from plane.authentication.utils.redirection_path import get_redirection_path
 from plane.authentication.utils.user_auth_workflow import post_user_auth_workflow
@@ -89,6 +90,8 @@ class DumontCallbackEndpoint(View):
             user = provider.authenticate()
             # Login the user and record his device info
             user_login(request=request, user=user, is_app=True)
+            # Memberships managed in ZITADEL: per-user sync before choosing where to land. Never raises.
+            on_web_login(user, provider.user_data.get("user", {}).get("provider_id"))
             # Get the redirection path
             if next_path:
                 path = next_path

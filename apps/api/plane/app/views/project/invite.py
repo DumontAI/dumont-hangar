@@ -34,6 +34,7 @@ from plane.db.models import (
     ProjectUserProperty,
 )
 from plane.db.models.project import ProjectNetwork
+from plane.dumont.access.guard import lock_project_membership, project_ids_in_body  # Dumont addition
 from plane.utils.host import base_host
 
 
@@ -54,6 +55,7 @@ class ProjectInvitationsViewset(BaseViewSet):
         )
 
     @allow_permission([ROLE.ADMIN])
+    @lock_project_membership()
     def create(self, request, slug, project_id):
         emails = request.data.get("emails", [])
 
@@ -129,6 +131,7 @@ class UserProjectInvitationsViewset(BaseViewSet):
         )
 
     @allow_permission([ROLE.ADMIN, ROLE.MEMBER], level="WORKSPACE")
+    @lock_project_membership(project_ids_from=project_ids_in_body)
     def create(self, request, slug):
         project_ids = request.data.get("project_ids", [])
 
@@ -192,6 +195,7 @@ class UserProjectInvitationsViewset(BaseViewSet):
 class ProjectJoinEndpoint(BaseAPIView):
     permission_classes = [AllowAny]
 
+    @lock_project_membership()
     def post(self, request, slug, project_id, pk):
         project_invite = ProjectMemberInvite.objects.get(pk=pk, project_id=project_id, workspace__slug=slug)
 

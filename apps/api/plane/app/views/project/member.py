@@ -22,6 +22,11 @@ from plane.db.models import Project, ProjectMember, ProjectUserProperty, Workspa
 from plane.bgtasks.project_add_user_email_task import project_add_user_email
 from plane.utils.host import base_host
 from plane.app.permissions.base import allow_permission, ROLE
+from plane.dumont.access.guard import (  # Dumont addition: ZITADEL-managed memberships
+    PROJECT_MEMBER_PREFERENCE_FIELDS,
+    lock_project_membership,
+    touches_fields_outside,
+)
 
 
 class ProjectMemberViewSet(BaseViewSet):
@@ -44,6 +49,7 @@ class ProjectMemberViewSet(BaseViewSet):
         )
 
     @allow_permission([ROLE.ADMIN])
+    @lock_project_membership()
     def create(self, request, slug, project_id):
         # Get the list of members to be added to the project and their roles i.e. the user_id and the role
         members = request.data.get("members", [])
@@ -203,6 +209,7 @@ class ProjectMemberViewSet(BaseViewSet):
         return Response(serializer.data, status=status.HTTP_200_OK)
 
     @allow_permission([ROLE.ADMIN, ROLE.MEMBER, ROLE.GUEST])
+    @lock_project_membership(only_if=touches_fields_outside(PROJECT_MEMBER_PREFERENCE_FIELDS))
     def partial_update(self, request, slug, project_id, pk):
         project_member = ProjectMember.objects.get(pk=pk, workspace__slug=slug, project_id=project_id, is_active=True)
 
@@ -288,6 +295,7 @@ class ProjectMemberViewSet(BaseViewSet):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
     @allow_permission([ROLE.ADMIN])
+    @lock_project_membership()
     def destroy(self, request, slug, project_id, pk):
         project_member = ProjectMember.objects.get(
             workspace__slug=slug,
@@ -321,6 +329,7 @@ class ProjectMemberViewSet(BaseViewSet):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
     @allow_permission([ROLE.ADMIN, ROLE.MEMBER, ROLE.GUEST])
+    @lock_project_membership()
     def leave(self, request, slug, project_id):
         project_member = ProjectMember.objects.get(
             workspace__slug=slug,
