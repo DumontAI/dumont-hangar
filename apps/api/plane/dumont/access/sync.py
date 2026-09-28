@@ -46,6 +46,7 @@ STATUS_BUSY = "busy"
 STATUS_SKIPPED = "skipped"
 
 ZERO_GRANTS_ERROR = "managed scopes but zero grants"
+ZERO_ROLE_KEYS_ERROR = "the ZITADEL project has no roles"
 
 
 def make_client(cfg):
@@ -289,6 +290,17 @@ def _full_sync(cfg, mode, override=False):
         workspace = load_workspace(cfg.workspace_slug)
         client = make_client(cfg)
         role_keys = client.list_project_role_keys(cfg.project_id)
+        if not role_keys and not override:
+            # An empty role list (now a legitimate "empty search" answer) almost always means the
+            # wrong project or a lost permission, not "Hangar has no roles". Stop before anything
+            # is derived from it: the managed-scope state is NOT stored, nothing is planned.
+            logger.critical(
+                "dumont access: %s; nothing was written. Check DUMONT_ACCESS_ZITADEL_PROJECT_ID and the "
+                "service user's permission. If it is real, run once with "
+                "`manage.py dumont_access_sync --max-removals N`.",
+                ZERO_ROLE_KEYS_ERROR,
+            )
+            return _report(STATUS_ERROR, mode, "full", error=ZERO_ROLE_KEYS_ERROR, reason="zero_role_keys")
         grants = client.list_user_grants(cfg.project_id)
     except (AccessConfigError, WorkspaceNotFound, ZitadelError) as exc:
         if isinstance(exc, ZitadelError):

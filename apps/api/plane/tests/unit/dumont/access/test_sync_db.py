@@ -9,6 +9,7 @@ from plane.db.models import ProjectMember, ProjectUserProperty, WorkspaceMember
 from plane.dumont.access import hooks
 from plane.dumont.access.sync import (
     MANAGED_STATE_KEY,
+    ZERO_ROLE_KEYS_ERROR,
     ZITADEL_BACKOFF_KEY,
     ZITADEL_BACKOFF_TTL,
     run_full_sync,
@@ -182,6 +183,26 @@ class TestFullSync:
         report = run_full_sync(max_removals=3)
         assert report["status"] == "applied", report
         assert ws_row(world["workspace"], world["users"]["alice"]).is_active is False
+
+    @pytest.mark.parametrize("mode", [None, "dry-run"])
+    def test_zero_role_keys_is_an_error_and_stores_no_managed_state(self, world, mode):
+        assert run_full_sync()["status"] == "applied"  # a good run stores the managed-scope state
+        stored = cache.get(MANAGED_STATE_KEY)
+        assert stored
+        world["fake"].roles = []  # e.g. ZITADEL's real empty search answer for the roles
+        before = state(world)
+        world["fake"].calls.clear()
+        report = run_full_sync(mode=mode)
+        assert report["status"] == "error" and report["reason"] == "zero_role_keys", report
+        assert report["error"] == ZERO_ROLE_KEYS_ERROR
+        assert cache.get(MANAGED_STATE_KEY) == stored  # not overwritten with "nothing managed"
+        assert world["fake"].api_calls("grants") == []  # stopped right after the roles search
+        assert state(world) == before
+
+    def test_zero_role_keys_needs_the_explicit_override(self, world):
+        world["fake"].roles = []
+        report = run_full_sync(max_removals=10)
+        assert report.get("reason") != "zero_role_keys", report
 
     def test_absolute_brake(self, world, monkeypatch):
         monkeypatch.setenv("DUMONT_ACCESS_MAX_REMOVALS", "0")
