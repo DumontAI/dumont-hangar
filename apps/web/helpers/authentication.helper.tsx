@@ -76,6 +76,10 @@ export enum EAuthenticationErrorCodes {
   GOOGLE_NOT_CONFIGURED = "5105",
   GITHUB_NOT_CONFIGURED = "5110",
   GITLAB_NOT_CONFIGURED = "5111",
+  // Dumont addition: Dumont Auth (ZITADEL) login
+  DUMONT_NOT_CONFIGURED = "5113",
+  DUMONT_OAUTH_PROVIDER_ERROR = "5114",
+  DUMONT_ORG_NOT_ALLOWED = "5116",
   GOOGLE_OAUTH_PROVIDER_ERROR = "5115",
   GITHUB_OAUTH_PROVIDER_ERROR = "5120",
   GITLAB_OAUTH_PROVIDER_ERROR = "5121",
@@ -287,6 +291,20 @@ const errorCodeMessages: {
     title: `GitLab OAuth provider error`,
     message: () => `GitLab OAuth provider error. Please try again.`,
   },
+  // Dumont addition: Dumont Auth (ZITADEL) login
+  [EAuthenticationErrorCodes.DUMONT_NOT_CONFIGURED]: {
+    title: `Dumont login unavailable`,
+    message: () => `Dumont login is not configured correctly on this instance. Please contact your administrator.`,
+  },
+  [EAuthenticationErrorCodes.DUMONT_OAUTH_PROVIDER_ERROR]: {
+    title: `Dumont login error`,
+    message: () => `Dumont Auth could not complete the sign in. Please try again.`,
+  },
+  [EAuthenticationErrorCodes.DUMONT_ORG_NOT_ALLOWED]: {
+    title: `Organization not allowed`,
+    message: () =>
+      `This Dumont account does not belong to the organization allowed on this instance. Sign in with your Dumont organization account.`,
+  },
 
   // Reset Password
   [EAuthenticationErrorCodes.INVALID_PASSWORD_TOKEN]: {
@@ -414,6 +432,9 @@ export const authErrorHandler = (errorCode: EAuthenticationErrorCodes, email?: s
     EAuthenticationErrorCodes.GOOGLE_OAUTH_PROVIDER_ERROR,
     EAuthenticationErrorCodes.GITHUB_OAUTH_PROVIDER_ERROR,
     EAuthenticationErrorCodes.GITLAB_OAUTH_PROVIDER_ERROR,
+    EAuthenticationErrorCodes.DUMONT_NOT_CONFIGURED,
+    EAuthenticationErrorCodes.DUMONT_OAUTH_PROVIDER_ERROR,
+    EAuthenticationErrorCodes.DUMONT_ORG_NOT_ALLOWED,
     EAuthenticationErrorCodes.INVALID_PASSWORD_TOKEN,
     EAuthenticationErrorCodes.EXPIRED_PASSWORD_TOKEN,
     EAuthenticationErrorCodes.INCORRECT_OLD_PASSWORD,
