@@ -213,6 +213,40 @@ class TestZitadelClient:
         )
         assert client.list_project_role_keys(PROJECT_ID) == ["a", "b", "c", "d"]
 
+    def test_row_moved_between_pages_is_an_error(self, client, fake_zitadel, monkeypatch):
+        # total 4: page 2 repeats "b" (it moved) and never serves "c"
+        monkeypatch.setattr(Z, "PAGE_SIZE", 2)
+        self._scripted(
+            monkeypatch,
+            fake_zitadel,
+            [
+                {"details": {"totalResult": "4"}, "result": [{"key": "a"}, {"key": "b"}]},
+                {"details": {"totalResult": "4"}, "result": [{"key": "b"}, {"key": "d"}]},
+            ],
+        )
+        with pytest.raises(Z.ZitadelError) as exc:
+            client.list_project_role_keys(PROJECT_ID)
+        assert "3 distinct rows for totalResult 4 (result shifted during pagination)" in str(exc.value)
+
+    def test_duplicates_are_served_once(self, client, fake_zitadel, monkeypatch):
+        # a repeated row that does not hide another one (the total is still reached by distinct ids)
+        monkeypatch.setattr(Z, "PAGE_SIZE", 2)
+        self._scripted(
+            monkeypatch,
+            fake_zitadel,
+            [
+                {"details": {"totalResult": "3"}, "result": [{"key": "a"}, {"key": "b"}]},
+                {"details": {"totalResult": "3"}, "result": [{"key": "b"}, {"key": "c"}]},
+            ],
+        )
+        assert client.list_project_role_keys(PROJECT_ID) == ["a", "b", "c"]
+
+    def test_row_without_id_is_an_error(self, client, fake_zitadel):
+        fake_zitadel.raw_body_on = ("grants", {"details": {"totalResult": "1"}, "result": [{"userId": "a"}]})
+        with pytest.raises(Z.ZitadelError) as exc:
+            client.list_user_grants(PROJECT_ID)
+        assert "row without 'id'" in str(exc.value)
+
     def test_empty_page_before_total_is_an_error(self, client, fake_zitadel):
         # 150 grants exist (totalResult 150) but the server stops handing rows out after 100
         for i in range(150):

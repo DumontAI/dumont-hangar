@@ -14,6 +14,7 @@
 import json
 
 from django.core.management import BaseCommand, CommandError
+from django.utils import timezone
 
 
 class Command(BaseCommand):
@@ -58,6 +59,7 @@ class Command(BaseCommand):
             )
 
         outsiders = []
+        now = timezone.now()
         users = {str(u.id): u for u in User.objects.filter(id__in=[uid for uid, _ in links])}
         for user_id, sub in sorted(links, key=lambda item: (str(item[0]), item[1] or "")):
             if sub in in_org:
@@ -71,7 +73,8 @@ class Command(BaseCommand):
                     "user_active": bool(user and user.is_active),
                     # the user may ALSO have a Dumont login inside the org
                     "has_login_in_org": any(s in in_org for uid, s in links if str(uid) == str(user_id)),
-                    "sessions": Session.objects.filter(user_id=str(user_id)).count(),
+                    # expired rows stay in the table until clearsessions runs; they are not live sessions
+                    "sessions": Session.objects.filter(user_id=str(user_id), expire_date__gt=now).count(),
                     "active_api_tokens": APIToken.objects.filter(user_id=user_id, is_active=True).count(),
                 }
             )

@@ -92,8 +92,8 @@ class Zitadel:
         except ValueError:
             raise BootstrapError(f"{method} {path}: response is not JSON") from None
 
-    def search(self, path, queries=None):
-        rows, offset, expected = [], 0, None
+    def search(self, path, queries=None, id_field="id"):
+        rows, seen, offset, expected = [], set(), 0, None
         for _ in range(MAX_PAGES):
             body = {"query": {"offset": str(offset), "limit": PAGE_SIZE, "asc": True}}
             if queries:
@@ -102,7 +102,9 @@ class Zitadel:
             # Same rules as plane/dumont/access/zitadel.py:
             # - a missing `result` is an empty list only when details.totalResult is present and 0;
             # - the largest totalResult any page announced must be reached; an empty page before it is a
-            #   truncated answer; only when no page ever carried a total does a short page end the list.
+            #   truncated answer; only when no page ever carried a total does a short page end the list;
+            # - rows are de-duplicated by id (a row that moved between pages is served twice and another
+            #   never), and the distinct count must reach totalResult.
             if not isinstance(data, dict):
                 raise BootstrapError(f"POST {path}: response is not a JSON object")
             total = _total_result(data, path)
@@ -116,10 +118,21 @@ class Zitadel:
                 raise BootstrapError(f"POST {path}: 'result' is not a list")
             if total is not None:
                 expected = total if expected is None else max(expected, total)
-            rows.extend(page)
+            for row in page:
+                row_id = row.get(id_field) if isinstance(row, dict) else None
+                if not isinstance(row_id, str) or not row_id:
+                    raise BootstrapError(f"POST {path}: row without '{id_field}'")
+                if row_id not in seen:
+                    seen.add(row_id)
+                    rows.append(row)
             offset += len(page)
             if expected is not None:
                 if offset >= expected:
+                    if len(seen) < expected:
+                        raise BootstrapError(
+                            f"POST {path}: {len(seen)} distinct rows for totalResult {expected} "
+                            "(result shifted during pagination)"
+                        )
                     return rows
                 if not page:
                     raise BootstrapError(f"POST {path}: empty page at offset {offset} of totalResult {expected}")
@@ -195,7 +208,9 @@ def users_in_org(zitadel, user_ids):
 def build_plan(export, zitadel, project_id, projects=None, skip_workspace=False):
     """Read ZITADEL and compute what is missing. Performs no writes."""
     roles = [r for r in export["roles"] if _selected(r["key"], projects, skip_workspace)]
-    existing_roles = {row.get("key") for row in zitadel.search(f"/management/v1/projects/{project_id}/roles/_search")}
+    existing_roles = {
+        row.get("key") for row in zitadel.search(f"/management/v1/projects/{project_id}/roles/_search", id_field="key")
+    }
     grants_by_user = {}
     for row in zitadel.search("/management/v1/users/grants/_search", [{"projectIdQuery": {"projectId": project_id}}]):
         if row.get("projectId") not in (None, project_id) or _grant_outside_org(row, zitadel.org_id):

@@ -706,6 +706,24 @@ class TestNoSilentWipe:
             assert report["status"] == "error", report
         assert _small_state(small_world) == [(True, True, True)] * 4
 
+    def test_row_moved_between_pages_is_an_error(self, small_world, monkeypatch):
+        # third-round probe: unordered pagination, a grant moves after page 1; totalResult stays the
+        # same, page 2 repeats a served row and never serves the one that slid into page 1's range
+        from plane.dumont.access import zitadel as Z
+
+        monkeypatch.setattr(Z, "PAGE_SIZE", 3)
+        real_page = small_world["fake"]._page
+
+        def page(request, parsed, rows):
+            if "grants" in request.url and int(parsed.get("query", {}).get("offset", "0")) > 0:
+                rows = rows[:1] + rows[2:] + rows[1:2]
+            return real_page(request, parsed, rows)
+
+        monkeypatch.setattr(small_world["fake"], "_page", page)
+        report = run_full_sync()
+        assert report["status"] == "error" and "result shifted during pagination" in report["error"]
+        assert _small_state(small_world) == [(True, True, True)] * 4
+
     def test_second_page_empty_before_total_is_an_error(self, small_world, monkeypatch):
         from plane.dumont.access import zitadel as Z
 

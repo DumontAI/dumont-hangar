@@ -178,9 +178,16 @@ class ZitadelClient:
             raise ZitadelError(f"{method} {path}: response is not a JSON object")
         return data
 
-    def _search(self, path, queries=None):
-        """Run a paginated _search and return all `result` rows."""
+    def _search(self, path, queries=None, id_field="id"):
+        """Run a paginated _search and return all `result` rows, each distinct `id_field` once.
+
+        ZITADEL pages with offset/limit over a list that can change between pages (a grant updated
+        in the meantime moves). A moved row is served twice and another one never: rows are
+        de-duplicated by id, and when the pages are done the distinct count must reach the announced
+        totalResult, or the answer is refused (a missing row would read as a revocation).
+        """
         rows = []
+        seen = set()
         offset = 0
         expected = None  # the largest totalResult any page announced
         for _ in range(MAX_PAGES):
@@ -203,13 +210,24 @@ class ZitadelClient:
                 raise ZitadelError(f"POST {path}: 'result' is not a list")
             if total is not None:
                 expected = total if expected is None else max(expected, total)
-            rows.extend(page)
+            for row in page:
+                row_id = row.get(id_field) if isinstance(row, dict) else None
+                if not isinstance(row_id, str) or not row_id:
+                    raise ZitadelError(f"POST {path}: row without '{id_field}'")
+                if row_id not in seen:
+                    seen.add(row_id)
+                    rows.append(row)
             offset += len(page)
             if expected is not None:
                 # Once any page announced a total, it is the only way to end: a page that brings
                 # nothing new while rows are still owed is a truncated answer. A short but non-empty
                 # page (a server-side limit below PAGE_SIZE) keeps paging.
                 if offset >= expected:
+                    if len(seen) < expected:
+                        raise ZitadelError(
+                            f"POST {path}: {len(seen)} distinct rows for totalResult {expected} "
+                            "(result shifted during pagination)"
+                        )
                     return rows
                 if not page:
                     raise ZitadelError(f"POST {path}: empty page at offset {offset} of totalResult {expected}")
@@ -221,7 +239,8 @@ class ZitadelClient:
     # --- API ---------------------------------------------------------------------------------
 
     def list_project_role_keys(self, project_id):
-        rows = self._search(ROLES_SEARCH_PATH.format(project_id=project_id))
+        # project roles have no id: the role key is unique within the project
+        rows = self._search(ROLES_SEARCH_PATH.format(project_id=project_id), id_field="key")
         keys = []
         for row in rows:
             key = row.get("key") if isinstance(row, dict) else None

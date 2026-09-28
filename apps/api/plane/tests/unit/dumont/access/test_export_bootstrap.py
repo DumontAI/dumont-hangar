@@ -351,6 +351,24 @@ class TestBootstrapScript:
         assert code == 0, text
         assert "hangar.workspace.member" in {r["key"] for r in json.loads(text)["roles_to_create"]}
 
+    def test_row_moved_between_pages_is_an_error(self, plane_world, fake_zitadel, bootstrap, tmp_path, monkeypatch):
+        fake_zitadel.issued.add(PAT)
+        monkeypatch.setattr(bootstrap, "PAGE_SIZE", 2)
+        for i in range(4):
+            fake_zitadel.grant(f"g{i}", "hangar_reader")
+        real_page = fake_zitadel._page
+
+        def page(request, parsed, rows):
+            if "grants" in request.url and int(parsed["query"]["offset"]) > 0:
+                rows = rows[:1] + rows[2:] + rows[1:2]  # row 1 moved to the end after page 1
+            return real_page(request, parsed, rows)
+
+        monkeypatch.setattr(fake_zitadel, "_page", page)
+        export_path, _ = _export(tmp_path)
+        code, text = _run_script(bootstrap, fake_zitadel, export_path)
+        assert code == 1 and "3 distinct rows for totalResult 4" in text
+        assert fake_zitadel.writes == []
+
     def test_total_is_remembered_across_pages(self, plane_world, fake_zitadel, bootstrap, tmp_path, monkeypatch):
         # page 1 of the grants search announces 5 rows; page 2 is empty without a total
         fake_zitadel.issued.add(PAT)
@@ -422,6 +440,10 @@ class TestLoginOrgAudit:
         fake_zitadel.org_users["sub-linked"] = "999999999999999999"
         Session.objects.create(
             session_key="k" * 40, session_data="x", expire_date="2099-01-01T00:00:00Z", user_id=str(linked.id)
+        )
+        # an expired row stays in the table until clearsessions; it is not a live session
+        Session.objects.create(
+            session_key="e" * 40, session_data="x", expire_date="2020-01-01T00:00:00Z", user_id=str(linked.id)
         )
         APIToken.objects.create(user=linked, label="t")
         out = io.StringIO()
