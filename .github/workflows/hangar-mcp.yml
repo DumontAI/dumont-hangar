@@ -1,54 +1,30 @@
-name: Hangar MCP CI/CD
+name: Hangar MCP CI
 
-# DumontAI/dumont-hangar is a PUBLIC repository.
-#
-# - CI (typecheck, test, build) runs on GitHub-hosted `ubuntu-latest` for every
-#   PR/push that touches the MCP. It never runs on a self-hosted runner, so
-#   code from a pull request cannot reach the hel1 runner.
-# - The deploy job is the ONLY self-hosted job. Its `if` requires
-#   event_name == 'workflow_dispatch' (only users with write access can
-#   dispatch), ref == refs/heads/dumont, deploy=true and confirmation
-#   DEPLOY_HANGAR_MCP; it runs in the `production` environment. It builds the
-#   release tarball itself from the dispatched `dumont` commit, so no artifact
-#   from another event is ever installed.
-#
-# Deploy runner labels default to [self-hosted, linux, x64, hangar-mcp]. The
-# owner must register that label on the hel1 runner, or point the repository
-# variable HANGAR_MCP_DEPLOY_RUNS_ON (JSON array) at an existing hel1 runner,
-# e.g. '["self-hosted","linux","x64","bugit-mcp"]'. See mcp/README.md.
+# DumontAI/dumont-hangar is a PUBLIC repository, so this workflow is CI only:
+# typecheck, test and build on GitHub-hosted `ubuntu-latest`, with read-only
+# repository permissions and no secrets. There is no deploy job and no
+# self-hosted runner here; the MCP is deployed by hand (mcp/README.md,
+# "Manual deploy"). Automated deploy belongs in a later ticket, driven from a
+# private repository.
 
 on:
   pull_request:
     paths:
       - ".github/workflows/hangar-mcp.yml"
       - "mcp/**"
-      - "scripts/deploy-mcp-hel1.sh"
   push:
     branches:
       - dumont
     paths:
       - ".github/workflows/hangar-mcp.yml"
       - "mcp/**"
-      - "scripts/deploy-mcp-hel1.sh"
-  workflow_dispatch:
-    inputs:
-      deploy:
-        description: Deploy the Hangar MCP service on airbase-hel1
-        required: true
-        type: boolean
-        default: false
-      confirmation:
-        description: Type DEPLOY_HANGAR_MCP to authorize the hel1 deploy
-        required: true
-        type: string
-        default: ""
 
 permissions:
   contents: read
 
 concurrency:
   group: hangar-mcp-ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 env:
   NODE_VERSION: "22"
@@ -87,136 +63,3 @@ jobs:
 
       - name: Build
         run: pnpm --dir mcp run build
-
-      - name: Deploy script syntax
-        run: bash -n scripts/deploy-mcp-hel1.sh
-
-  deploy:
-    name: Deploy and smoke test hel1
-    needs: ci
-    if: github.event_name == 'workflow_dispatch' && inputs.deploy == true && inputs.confirmation == 'DEPLOY_HANGAR_MCP' && github.ref == 'refs/heads/dumont'
-    runs-on: ${{ fromJSON(vars.HANGAR_MCP_DEPLOY_RUNS_ON || '["self-hosted","linux","x64","hangar-mcp"]') }}
-    timeout-minutes: 20
-    environment:
-      name: production
-    concurrency:
-      group: airbase-hel1-dumont-hangar-mcp
-      cancel-in-progress: false
-    steps:
-      # Checks out the dispatched commit on `dumont` (github.sha).
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Use Node.js
-        uses: actions/setup-node@v7
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-
-      - name: Use pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: ${{ env.PNPM_VERSION }}
-
-      - name: Build release tarball from this commit
-        run: |
-          set -euo pipefail
-          pnpm --dir mcp install --frozen-lockfile --ignore-workspace
-          pnpm --dir mcp run typecheck
-          pnpm --dir mcp test
-          rm -rf mcp/dist
-          pnpm --dir mcp run build
-          mkdir -p "$RUNNER_TEMP/hangar-mcp-artifact"
-          tar -czf "$RUNNER_TEMP/hangar-mcp-artifact/hangar-mcp-release.tar.gz" mcp/dist mcp/package.json mcp/pnpm-lock.yaml
-
-      - name: Install release on hel1
-        env:
-          HANGAR_MCP_API_KEY: ${{ secrets.HANGAR_MCP_API_KEY }}
-          HANGAR_MCP_OIDC_INTROSPECTION_CLIENT_SECRET: ${{ secrets.HANGAR_MCP_OIDC_INTROSPECTION_CLIENT_SECRET }}
-          HANGAR_MCP_OIDC_INTROSPECTION_PRIVATE_KEY_JSON: ${{ secrets.HANGAR_MCP_OIDC_INTROSPECTION_PRIVATE_KEY_JSON }}
-          HANGAR_MCP_BASE_URL: ${{ vars.HANGAR_MCP_BASE_URL || 'https://hangar.getdumont.ai' }}
-          HANGAR_MCP_WORKSPACE_SLUG: ${{ vars.HANGAR_MCP_WORKSPACE_SLUG || '' }}
-          HANGAR_MCP_ALLOWED_PROJECTS: ${{ vars.HANGAR_MCP_ALLOWED_PROJECTS || '' }}
-          HANGAR_MCP_WRITE_PROJECTS: ${{ vars.HANGAR_MCP_WRITE_PROJECTS || '' }}
-          HANGAR_MCP_WRITE_RATE_LIMIT: ${{ vars.HANGAR_MCP_WRITE_RATE_LIMIT || '' }}
-          HANGAR_MCP_TIMEOUT_MS: ${{ vars.HANGAR_MCP_TIMEOUT_MS || '' }}
-          HANGAR_MCP_MAX_RESPONSE_BYTES: ${{ vars.HANGAR_MCP_MAX_RESPONSE_BYTES || '' }}
-          HANGAR_MCP_MAX_SEARCH_PAGES: ${{ vars.HANGAR_MCP_MAX_SEARCH_PAGES || '' }}
-          HANGAR_MCP_PROJECT_CACHE_SECONDS: ${{ vars.HANGAR_MCP_PROJECT_CACHE_SECONDS || '' }}
-          HANGAR_MCP_HTTP_PORT: ${{ vars.HANGAR_MCP_HTTP_PORT || '3014' }}
-          HANGAR_MCP_ALLOWED_HOSTS: ${{ vars.HANGAR_MCP_ALLOWED_HOSTS || '' }}
-          HANGAR_MCP_ALLOWED_ORIGINS: ${{ vars.HANGAR_MCP_ALLOWED_ORIGINS || '' }}
-          HANGAR_MCP_RESOURCE_URL: ${{ vars.HANGAR_MCP_RESOURCE_URL || '' }}
-          HANGAR_MCP_OIDC_ISSUER: ${{ vars.HANGAR_MCP_OIDC_ISSUER || '' }}
-          HANGAR_MCP_OIDC_JWKS_URL: ${{ vars.HANGAR_MCP_OIDC_JWKS_URL || '' }}
-          HANGAR_MCP_OIDC_AUDIENCE: ${{ vars.HANGAR_MCP_OIDC_AUDIENCE || '' }}
-          HANGAR_MCP_OIDC_READER_ROLE: ${{ vars.HANGAR_MCP_OIDC_READER_ROLE || 'hangar_reader' }}
-          HANGAR_MCP_OIDC_WRITER_ROLE: ${{ vars.HANGAR_MCP_OIDC_WRITER_ROLE || 'hangar_writer' }}
-          HANGAR_MCP_OIDC_REQUIRED_SCOPE: ${{ vars.HANGAR_MCP_OIDC_REQUIRED_SCOPE || '' }}
-          HANGAR_MCP_OIDC_ALLOWED_ORG_ID: ${{ vars.HANGAR_MCP_OIDC_ALLOWED_ORG_ID || '' }}
-          HANGAR_MCP_OIDC_ALLOWED_SUBJECTS: ${{ vars.HANGAR_MCP_OIDC_ALLOWED_SUBJECTS || '' }}
-          HANGAR_MCP_OIDC_USERINFO_URL: ${{ vars.HANGAR_MCP_OIDC_USERINFO_URL || '' }}
-          HANGAR_MCP_OIDC_INTROSPECTION_URL: ${{ vars.HANGAR_MCP_OIDC_INTROSPECTION_URL || '' }}
-          HANGAR_MCP_OIDC_INTROSPECTION_CLIENT_ID: ${{ vars.HANGAR_MCP_OIDC_INTROSPECTION_CLIENT_ID || '' }}
-          HANGAR_MCP_OIDC_INTROSPECTION_TIMEOUT_MS: ${{ vars.HANGAR_MCP_OIDC_INTROSPECTION_TIMEOUT_MS || '' }}
-          HANGAR_MCP_OIDC_INTROSPECTION_CACHE_SECONDS: ${{ vars.HANGAR_MCP_OIDC_INTROSPECTION_CACHE_SECONDS || '' }}
-          HANGAR_MCP_OIDC_INTROSPECTION_MAX_IN_FLIGHT: ${{ vars.HANGAR_MCP_OIDC_INTROSPECTION_MAX_IN_FLIGHT || '' }}
-          HANGAR_MCP_OIDC_INTROSPECTION_RATE_PER_SECOND: ${{ vars.HANGAR_MCP_OIDC_INTROSPECTION_RATE_PER_SECOND || '' }}
-          HANGAR_MCP_ALLOW_ENV_KEY_DROP: ${{ vars.HANGAR_MCP_ALLOW_ENV_KEY_DROP || 'false' }}
-        run: >-
-          bash scripts/deploy-mcp-hel1.sh
-          "${{ runner.temp }}/hangar-mcp-artifact/hangar-mcp-release.tar.gz"
-          "${{ github.sha }}-${{ github.run_id }}"
-
-      - name: OIDC metadata smoke
-        env:
-          MCP_METADATA_URL: http://127.0.0.1:${{ vars.HANGAR_MCP_HTTP_PORT || '3014' }}/.well-known/oauth-protected-resource
-          MCP_RESOURCE_URL: ${{ vars.HANGAR_MCP_RESOURCE_URL }}
-          MCP_OIDC_ISSUER: ${{ vars.HANGAR_MCP_OIDC_ISSUER || 'https://auth.getdumont.ai' }}
-          MCP_OIDC_READER_ROLE: ${{ vars.HANGAR_MCP_OIDC_READER_ROLE || 'hangar_reader' }}
-          MCP_OIDC_WRITER_ROLE: ${{ vars.HANGAR_MCP_OIDC_WRITER_ROLE || 'hangar_writer' }}
-        run: node mcp/scripts/metadata-smoke.mjs
-
-      # Optional authenticated READ smoke. Enable with the repository variable
-      # HANGAR_MCP_OIDC_SMOKE=true once a ZITADEL service user with
-      # hangar_reader (never hangar_writer) and client credentials exists.
-      - name: Mint short-lived OIDC smoke token
-        if: vars.HANGAR_MCP_OIDC_SMOKE == 'true'
-        id: mint-oidc-smoke
-        env:
-          OIDC_CLIENT_ID: ${{ secrets.HANGAR_MCP_OIDC_SMOKE_CLIENT_ID }}
-          OIDC_CLIENT_SECRET: ${{ secrets.HANGAR_MCP_OIDC_SMOKE_CLIENT_SECRET }}
-          OIDC_ISSUER: ${{ vars.HANGAR_MCP_OIDC_ISSUER || 'https://auth.getdumont.ai' }}
-          OIDC_AUDIENCE: ${{ vars.HANGAR_MCP_OIDC_AUDIENCE || '' }}
-          OIDC_READER_ROLE: ${{ vars.HANGAR_MCP_OIDC_READER_ROLE || 'hangar_reader' }}
-        run: |
-          set -euo pipefail
-          [[ -n "$OIDC_CLIENT_ID" && -n "$OIDC_CLIENT_SECRET" ]] || {
-            echo 'OIDC smoke client credentials are not configured' >&2
-            exit 1
-          }
-          [[ -n "$OIDC_AUDIENCE" ]] || {
-            echo 'HANGAR_MCP_OIDC_AUDIENCE is not configured' >&2
-            exit 1
-          }
-          role_scope="urn:zitadel:iam:org:project:role:${OIDC_READER_ROLE}"
-          audience_scope="urn:zitadel:iam:org:project:id:${OIDC_AUDIENCE}:aud"
-          token_response="$(curl --fail --silent --show-error \
-            --user "$OIDC_CLIENT_ID:$OIDC_CLIENT_SECRET" \
-            --header 'Content-Type: application/x-www-form-urlencoded' \
-            --data-urlencode 'grant_type=client_credentials' \
-            --data-urlencode "scope=openid ${audience_scope} ${role_scope} urn:zitadel:iam:user:resourceowner" \
-            "${OIDC_ISSUER%/}/oauth/v2/token")"
-          token="$(node -e 'let input=""; process.stdin.on("data", chunk => input += chunk); process.stdin.on("end", () => process.stdout.write(JSON.parse(input).access_token || ""));' <<<"$token_response")"
-          [[ -n "$token" ]] || {
-            echo 'ZITADEL did not return an OIDC access token' >&2
-            exit 1
-          }
-          echo "::add-mask::$token"
-          printf 'token=%s\n' "$token" >> "$GITHUB_OUTPUT"
-
-      - name: Authenticated OIDC MCP read smoke
-        if: vars.HANGAR_MCP_OIDC_SMOKE == 'true'
-        env:
-          MCP_URL: http://127.0.0.1:${{ vars.HANGAR_MCP_HTTP_PORT || '3014' }}/mcp
-          MCP_AUTH_TOKEN: ${{ steps.mint-oidc-smoke.outputs.token }}
-        run: node mcp/scripts/live-smoke.mjs
