@@ -48,9 +48,10 @@ Text fields are credential-scrubbed before they leave the server.
 Behavior common to all writes:
 
 - **Attribution**: descriptions (on create, and on update when a description is
-  given) and comments end with `— via MCP por <email>` (token `sub` when the
-  token has no verified email). A footer copied back into the input is removed
-  first, so footers never stack.
+  given) and comments end with `— via MCP por <email>`. A footer copied back
+  into the input is removed first, so footers never stack. The email comes
+  from the caller (see "Caller email" below); if none is found the footer
+  names the token `sub`.
 - **Safe HTML**: input is escaped completely and converted from a small
   Markdown subset (paragraphs, headings, lists, quotes, code, bold/italic,
   http/https/mailto links) to `description_html`/`comment_html`. Plane then
@@ -62,9 +63,8 @@ Behavior common to all writes:
   nothing is written and the value is not echoed. Naming a secret
   (`secret: HANGAR_API_KEY`) is fine.
 - **`"me"`** resolves to the Hangar workspace member whose email equals the
-  token's verified `email` claim. ZITADEL only puts `email` in the access token
-  when the client requests the `email` scope; without it `"me"` fails with
-  `FORBIDDEN`.
+  caller email (below). Without an email, or without exactly one matching
+  member, `"me"` fails with `FORBIDDEN`.
 - **Idempotency**: `idempotency_key` becomes Plane `external_id`
   (`<sha256(sub)[:16]>:<key>`, so keys are per user) with
   `external_source=dumont-hangar-mcp`. Plane answers a repeat with 409 and the
@@ -74,6 +74,24 @@ Behavior common to all writes:
 - **Rate limit**: `HANGAR_WRITE_RATE_LIMIT` write calls per user (`sub`) per
   fixed 60 s window, shared across requests of the process; over the limit the
   tool returns `RATE_LIMITED` with `retryable: true`.
+
+### Caller email
+
+ZITADEL JWT access tokens usually carry no `email`. The server resolves it
+only when a write needs it (footer or `"me"`), never for reads:
+
+1. the token's `email` claim, unless `email_verified` is false;
+2. otherwise the issuer's userinfo endpoint, called with the caller's own
+   bearer (`MCP_OIDC_USERINFO_URL`, default `${MCP_OIDC_ISSUER}/oidc/v1/userinfo`,
+   must be on the issuer's origin; 2 s timeout, no redirects, 64 KiB cap, the
+   returned `sub` must match). It takes `email` (unless `email_verified` is
+   false), else `preferred_username` when it looks like an email. Results are
+   cached per `sub` (10 min when found, 60 s when not, at most 1000 entries).
+
+Any failure falls back to the `sub` and never fails the tool call; stderr gets
+one line per failure class per minute (`hangar-mcp userinfo-email outcome=…`,
+no token). ZITADEL returns `email` from userinfo only when the token was issued
+with the `openid email` scopes, which is why the server advertises them.
 
 ### Error codes (tool errors, HTTP 200)
 
@@ -101,10 +119,13 @@ been applied. Use `idempotency_key` for safe retries of creates.
   neither role is `403 insufficient_scope`. A reader calling a write tool gets a
   `FORBIDDEN` tool error, not an HTTP 401/403, so clients do not restart login.
 - Protected-resource metadata `scopes_supported` and the `WWW-Authenticate`
-  `scope=` list both `urn:zitadel:iam:org:project:role:hangar_reader` and
+  `scope=` list, in order: `openid`, `email`,
+  `urn:zitadel:iam:org:project:role:hangar_reader`,
   `urn:zitadel:iam:org:project:role:hangar_writer`. ZITADEL only asserts roles
-  the client requested, so clients must request both; a token with only
-  `hangar_reader` is still accepted for reads.
+  the client requested, so clients must request both role scopes; `openid` and
+  `email` let userinfo return the caller's email. None of these has to be
+  present in the token: a token with only `hangar_reader` is still accepted for
+  reads.
 - `MCP_OIDC_REQUIRED_ROLE` (pre-HGR-6) is still read as the reader role.
 
 ## Audit log
@@ -154,6 +175,7 @@ See [.env.example](.env.example). The important ones:
 | `MCP_OIDC_AUDIENCE`        | ZITADEL project audience (the `ZITADEL DCR` project)                    |
 | `MCP_OIDC_READER_ROLE`     | `hangar_reader` (legacy name: `MCP_OIDC_REQUIRED_ROLE`)                 |
 | `MCP_OIDC_WRITER_ROLE`     | `hangar_writer`                                                         |
+| `MCP_OIDC_USERINFO_URL`    | Optional; default `${MCP_OIDC_ISSUER}/oidc/v1/userinfo`, same origin    |
 | `MCP_OIDC_INTROSPECTION_*` | Optional RFC 7662 introspection for opaque tokens                       |
 
 `HANGAR_WRITE_PROJECTS` is checked at startup against
@@ -176,8 +198,8 @@ credentials are configured.
 After `hangar_writer` is granted, a client must **log in again** so the new
 token requests and carries the role (Claude Code: `/mcp`, pick the Hangar
 server, re-authenticate; dumont-code: expire/remove the stored Hangar token so
-the next call opens the login). For `"me"` the client must also request the
-`email` scope.
+the next call opens the login). Clients that request the advertised scopes
+also get `openid email`, which the email lookup needs.
 
 dumont-code example:
 
@@ -207,23 +229,29 @@ dumont-code example:
 
 `.github/workflows/hangar-mcp.yml`:
 
-- **CI** on every PR and on pushes to `dumont` that touch `mcp/**`, the
-  workflow, or `scripts/deploy-mcp-hel1.sh`: install (`--ignore-workspace`,
-  `mcp/` is not in the root pnpm workspace), typecheck, test, build, package
-  `mcp/dist` + manifest + lockfile.
-- **Deploy** only on `workflow_dispatch` from `dumont` with `deploy=true` and
-  `confirmation=DEPLOY_HANGAR_MCP`, in the GitHub environment `production`,
-  on a self-hosted runner on airbase-hel1. It runs
-  `scripts/deploy-mcp-hel1.sh`, then the metadata smoke, then (optionally) a
+This repository is **public**, so code from pull requests must never reach a
+self-hosted runner:
+
+- **CI** runs on GitHub-hosted `ubuntu-latest` for every PR and for pushes to
+  `dumont` that touch `mcp/**`, the workflow, or `scripts/deploy-mcp-hel1.sh`:
+  install (`--ignore-workspace`, `mcp/` is not in the root pnpm workspace),
+  typecheck, test, build, `bash -n` on the deploy script. It uploads nothing.
+- **Deploy** is the only self-hosted job. It runs only on `workflow_dispatch`
+  (write access required) from `refs/heads/dumont` with `deploy=true` and
+  `confirmation=DEPLOY_HANGAR_MCP`, in the GitHub environment `production`, and
+  after CI passed in the same run. It checks out the dispatched commit, installs,
+  typechecks, tests, builds and packages the tarball itself, runs
+  `scripts/deploy-mcp-hel1.sh`, then the metadata smoke and (optionally) a
   read-only OIDC smoke.
 
-Runner: both jobs default to the labels `[self-hosted, linux, x64, hangar-mcp]`.
-Either add the `hangar-mcp` label to the existing hel1 runner (the one serving
-`bugit-mcp`), or set the repository variables `HANGAR_MCP_CI_RUNS_ON` and
-`HANGAR_MCP_DEPLOY_RUNS_ON` to a JSON label array such as
-`["self-hosted","linux","x64","bugit-mcp"]`. The deploy runner must be on
-hel1 and its user (`deploy`) needs `sudo` for `install`, `test`, `sed`,
-`systemctl` and `journalctl`, like the Bugit MCP deploy.
+Deploy runner: labels `[self-hosted, linux, x64, hangar-mcp]` by default. Either
+add the `hangar-mcp` label to the existing hel1 runner (the one serving
+`bugit-mcp`), or set the repository variable `HANGAR_MCP_DEPLOY_RUNS_ON` to a
+JSON label array such as `["self-hosted","linux","x64","bugit-mcp"]`. The
+runner must be on hel1 and its user (`deploy`) needs `sudo` for `install`,
+`test`, `sed`, `systemctl` and `journalctl`, like the Bugit MCP deploy. Protect
+the `dumont` branch and require reviewers on the `production` environment:
+anyone who can push to `dumont` and dispatch can run code on that runner.
 
 `scripts/deploy-mcp-hel1.sh` (never prints values, only key names and status):
 
@@ -244,14 +272,14 @@ hel1 and its user (`deploy`) needs `sudo` for `install`, `test`, `sed`,
 
 GitHub `production` environment (names only):
 
-| Kind     | Name                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| secret   | `HANGAR_MCP_API_KEY`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| secret   | `HANGAR_MCP_OIDC_INTROSPECTION_CLIENT_SECRET` or `HANGAR_MCP_OIDC_INTROSPECTION_PRIVATE_KEY_JSON` (only with introspection)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| secret   | `HANGAR_MCP_OIDC_SMOKE_CLIENT_ID`, `HANGAR_MCP_OIDC_SMOKE_CLIENT_SECRET` (only with `HANGAR_MCP_OIDC_SMOKE=true`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| required | `HANGAR_MCP_WORKSPACE_SLUG`, `HANGAR_MCP_ALLOWED_PROJECTS`, `HANGAR_MCP_ALLOWED_HOSTS`, `HANGAR_MCP_RESOURCE_URL`, `HANGAR_MCP_OIDC_ISSUER`, `HANGAR_MCP_OIDC_JWKS_URL`, `HANGAR_MCP_OIDC_AUDIENCE`                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| optional | `HANGAR_MCP_WRITE_PROJECTS`, `HANGAR_MCP_WRITE_RATE_LIMIT`, `HANGAR_MCP_BASE_URL`, `HANGAR_MCP_HTTP_PORT` (3014), `HANGAR_MCP_ALLOWED_ORIGINS`, `HANGAR_MCP_OIDC_READER_ROLE`, `HANGAR_MCP_OIDC_WRITER_ROLE`, `HANGAR_MCP_OIDC_REQUIRED_SCOPE`, `HANGAR_MCP_OIDC_ALLOWED_ORG_ID`, `HANGAR_MCP_OIDC_ALLOWED_SUBJECTS`, `HANGAR_MCP_OIDC_INTROSPECTION_URL`, `HANGAR_MCP_OIDC_INTROSPECTION_CLIENT_ID`, `HANGAR_MCP_OIDC_INTROSPECTION_{TIMEOUT_MS,CACHE_SECONDS,MAX_IN_FLIGHT,RATE_PER_SECOND}`, `HANGAR_MCP_{TIMEOUT_MS,MAX_RESPONSE_BYTES,MAX_SEARCH_PAGES,PROJECT_CACHE_SECONDS}`, `HANGAR_MCP_ALLOW_ENV_KEY_DROP` |
-| repo var | `HANGAR_MCP_CI_RUNS_ON`, `HANGAR_MCP_DEPLOY_RUNS_ON`, `HANGAR_MCP_OIDC_SMOKE`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| Kind     | Name                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| secret   | `HANGAR_MCP_API_KEY`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| secret   | `HANGAR_MCP_OIDC_INTROSPECTION_CLIENT_SECRET` or `HANGAR_MCP_OIDC_INTROSPECTION_PRIVATE_KEY_JSON` (only with introspection)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| secret   | `HANGAR_MCP_OIDC_SMOKE_CLIENT_ID`, `HANGAR_MCP_OIDC_SMOKE_CLIENT_SECRET` (only with `HANGAR_MCP_OIDC_SMOKE=true`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| required | `HANGAR_MCP_WORKSPACE_SLUG`, `HANGAR_MCP_ALLOWED_PROJECTS`, `HANGAR_MCP_ALLOWED_HOSTS`, `HANGAR_MCP_RESOURCE_URL`, `HANGAR_MCP_OIDC_ISSUER`, `HANGAR_MCP_OIDC_JWKS_URL`, `HANGAR_MCP_OIDC_AUDIENCE`                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| optional | `HANGAR_MCP_WRITE_PROJECTS`, `HANGAR_MCP_WRITE_RATE_LIMIT`, `HANGAR_MCP_BASE_URL`, `HANGAR_MCP_HTTP_PORT` (3014), `HANGAR_MCP_ALLOWED_ORIGINS`, `HANGAR_MCP_OIDC_READER_ROLE`, `HANGAR_MCP_OIDC_WRITER_ROLE`, `HANGAR_MCP_OIDC_REQUIRED_SCOPE`, `HANGAR_MCP_OIDC_ALLOWED_ORG_ID`, `HANGAR_MCP_OIDC_ALLOWED_SUBJECTS`, `HANGAR_MCP_OIDC_USERINFO_URL`, `HANGAR_MCP_OIDC_INTROSPECTION_URL`, `HANGAR_MCP_OIDC_INTROSPECTION_CLIENT_ID`, `HANGAR_MCP_OIDC_INTROSPECTION_{TIMEOUT_MS,CACHE_SECONDS,MAX_IN_FLIGHT,RATE_PER_SECOND}`, `HANGAR_MCP_{TIMEOUT_MS,MAX_RESPONSE_BYTES,MAX_SEARCH_PAGES,PROJECT_CACHE_SECONDS}`, `HANGAR_MCP_ALLOW_ENV_KEY_DROP` |
+| repo var | `HANGAR_MCP_DEPLOY_RUNS_ON`, `HANGAR_MCP_OIDC_SMOKE`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 
 `HANGAR_MCP_ALLOWED_HOSTS` must include the public host and `127.0.0.1`
 (current value in `.env.example`: `hangar.getdumont.ai,127.0.0.1,localhost`);
@@ -261,6 +289,101 @@ Rollback on purpose: re-run the workflow from the earlier `dumont` commit, or on
 the host point `current` at the previous `releases/<id>`, copy
 `/etc/dumont-hangar-mcp.env.previous` back if the config changed, and restart
 only `dumont-hangar-mcp.service`.
+
+### Manual deploy (keeps the existing env file)
+
+Use this until the workflow and its GitHub environment are set up. It keeps
+`/etc/dumont-hangar-mcp.env` as is and only appends the new non-secret keys.
+Never `cat` that file: it holds the API key.
+
+1. **Build locally** from the commit being released (repo root):
+
+   ```bash
+   (cd mcp && pnpm install --frozen-lockfile --ignore-workspace \
+     && pnpm run typecheck && pnpm test && rm -rf dist && pnpm run build)
+   SHA=$(git rev-parse --short=12 HEAD)
+   tar -czf "hangar-mcp-$SHA.tar.gz" mcp/dist mcp/package.json mcp/pnpm-lock.yaml
+   scp "hangar-mcp-$SHA.tar.gz" airbase-hel1:/tmp/
+   ```
+
+2. **Stage the release** on airbase-hel1 as `deploy`:
+
+   ```bash
+   SHA=<same sha>; REL=/opt/dumont-hangar-mcp/releases/$SHA-manual
+   readlink -f /opt/dumont-hangar-mcp/current | tee /tmp/hangar-mcp-previous-release
+   mkdir "$REL" && tar -xzf "/tmp/hangar-mcp-$SHA.tar.gz" -C "$REL"
+   (cd "$REL/mcp" && pnpm install --prod --frozen-lockfile --ignore-scripts --ignore-workspace)
+   printf 'release_id=%s\nsource_commit=%s\nsource_ref=manual\n' "$SHA-manual" "$SHA" > "$REL/RELEASE"
+   ```
+
+3. **Add only the new non-secret keys** (back up first; print key names only):
+
+   ```bash
+   sudo cp -p /etc/dumont-hangar-mcp.env /etc/dumont-hangar-mcp.env.bak-$SHA
+   sudo sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' /etc/dumont-hangar-mcp.env   # names only
+   printf '%s\n' 'HANGAR_WRITE_PROJECTS=""' 'HANGAR_WRITE_RATE_LIMIT="20"' \
+     'MCP_OIDC_WRITER_ROLE="hangar_writer"' | sudo tee -a /etc/dumont-hangar-mcp.env >/dev/null
+   ```
+
+   Leave `MCP_OIDC_REQUIRED_ROLE` as it is (it is read as the reader role; do
+   not add `MCP_OIDC_READER_ROLE` with a different value). Leave
+   `MCP_OIDC_USERINFO_URL` unset to use `${issuer}/oidc/v1/userinfo`. Start
+   with `HANGAR_WRITE_PROJECTS=""` (writes off); set it to `"HGR"` with
+   `sudoedit` later and restart. `MCP_ALLOWED_HOSTS` must include `127.0.0.1`
+   for the loopback checks below.
+
+4. **Validate the config with the new release** before switching (secrets stay
+   in the environment, never in argv or output). This sources the systemd env
+   file with bash, which works for `KEY="value"` lines; if the file uses
+   syntax bash reads differently, skip this step and rely on step 6:
+
+   ```bash
+   sudo bash -c 'set -a; . /etc/dumont-hangar-mcp.env; set +a; cd "$0" && node --input-type=module -e "
+     const m = await import(\"./mcp/dist/config.js\");
+     try { const c = m.loadHangarConfig(); m.assertHttpAuthConfigured(c);
+       console.log(\"OK write projects=\" + c.writeProjects.length); }
+     catch (e) { console.error(\"ERROR \" + e.message); process.exit(1); }"' "$REL"
+   ```
+
+5. **Switch and restart**:
+
+   ```bash
+   ln -s "$REL" /opt/dumont-hangar-mcp/.current.new
+   mv -Tf /opt/dumont-hangar-mcp/.current.new /opt/dumont-hangar-mcp/current
+   sudo systemctl restart dumont-hangar-mcp.service
+   systemctl is-active dumont-hangar-mcp.service
+   ```
+
+6. **Check** (loopback 401, challenge scopes, metadata, logs):
+
+   ```bash
+   curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:3014/mcp          # 401
+   curl -s -D - -o /dev/null -X POST http://127.0.0.1:3014/mcp | grep -i www-authenticate
+   # expect scope="openid email ...:hangar_reader ...:hangar_writer"
+   curl -s http://127.0.0.1:3014/.well-known/oauth-protected-resource                  # scopes_supported
+   sudo journalctl -u dumont-hangar-mcp -n 20 --no-pager
+   ```
+
+   The scripted metadata check (copy `mcp/scripts/metadata-smoke.mjs` to the
+   host, or run it from a checkout through an SSH tunnel to port 3014):
+
+   ```bash
+   MCP_METADATA_URL=http://127.0.0.1:3014/.well-known/oauth-protected-resource \
+   MCP_RESOURCE_URL=https://hangar.getdumont.ai/mcp \
+   MCP_OIDC_ISSUER=https://auth.getdumont.ai \
+     node metadata-smoke.mjs
+   ```
+
+7. **Rollback**: switch the symlink back and restart; restore the env backup
+   only if you changed keys other than the appended ones.
+
+   ```bash
+   ln -s "$(cat /tmp/hangar-mcp-previous-release)" /opt/dumont-hangar-mcp/.current.new
+   mv -Tf /opt/dumont-hangar-mcp/.current.new /opt/dumont-hangar-mcp/current
+   sudo systemctl restart dumont-hangar-mcp.service
+   ```
+
+   The appended keys are harmless for the previous release (it ignores them).
 
 The historical downloadable `/hangar-mcp` launcher is disabled. Older local
 copies cannot be disabled by a server release: remove their MCP registrations
