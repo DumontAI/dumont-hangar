@@ -139,23 +139,29 @@ Behavior common to all writes:
   Only if a call outlives that margin (or the clocks disagree) and Hangar
   answers 401 within 30 s of `exp` does the tool answer `TOKEN_EXPIRED`, not
   retryable with the same token; the client's next request gets the 401
-  challenge and refreshes, so this cannot loop.
+  challenge and refreshes, so this cannot loop. Hangar's 401 challenge
+  (`error="invalid_token"`) is read only through its `error_code`, never
+  passed on. Hangar's 403 `DUMONT_USER_NOT_ALLOWED` and 503
+  `DUMONT_AUTH_UNAVAILABLE` are tool errors as well (`USER_NOT_ALLOWED`,
+  `UPSTREAM_AUTH_UNAVAILABLE`), so neither starts a new login.
 
 ### Error codes (tool errors, HTTP 200)
 
-| Code                    | Meaning                                                                                                       |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------- |
-| `FORBIDDEN`             | Token lacks the role for this tool (write tools need `hangar_writer`)                                         |
-| `ACCOUNT_NOT_LINKED`    | Hangar has no account linked to this Dumont login: sign in once at https://hangar.getdumont.ai (Dumont login) |
-| `TOKEN_NOT_FORWARDABLE` | Opaque token; connect with the pinned public client (JWT) and log in again                                    |
-| `TOKEN_EXPIRED`         | Token expired during the call; nothing changed; the next request gets a 401 and the client refreshes          |
-| `WRITER_ROLE_REQUIRED`  | Hangar requires `hangar_writer` for this change                                                               |
-| `PROJECT_ACCESS_DENIED` | Hangar denied access to project X; ask for role `hangar.project.x.member` in Dumont Auth                      |
-| `PROJECT_NOT_FOUND`     | Not among the projects you can see (the message names the role to ask for)                                    |
-| `PROJECT_NOT_ALLOWED`   | Project is outside this server's `HANGAR_ALLOWED_PROJECTS` ceiling                                            |
-| `SECRET_DETECTED`       | Input looked like a credential; nothing written                                                               |
-| `RATE_LIMITED`          | Per-user write limit reached; retry after the window                                                          |
-| `UPSTREAM_*`            | Hangar refused or failed; `UPSTREAM_VALIDATION_FAILED` lists fields                                           |
+| Code                        | Meaning                                                                                                       |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `FORBIDDEN`                 | Token lacks the role for this tool (write tools need `hangar_writer`)                                         |
+| `ACCOUNT_NOT_LINKED`        | Hangar has no account linked to this Dumont login: sign in once at https://hangar.getdumont.ai (Dumont login) |
+| `TOKEN_NOT_FORWARDABLE`     | Opaque token; connect with the pinned public client (JWT) and log in again                                    |
+| `TOKEN_EXPIRED`             | Token expired during the call; nothing changed; the next request gets a 401 and the client refreshes          |
+| `WRITER_ROLE_REQUIRED`      | Hangar requires `hangar_writer` for this change                                                               |
+| `USER_NOT_ALLOWED`          | The linked Hangar user is deactivated, a bot or linked twice; not retryable, a new login will not help        |
+| `UPSTREAM_AUTH_UNAVAILABLE` | Hangar could not check the token (Dumont Auth unreachable); nothing changed; retryable, no new login          |
+| `PROJECT_ACCESS_DENIED`     | Hangar denied access to project X; ask for role `hangar.project.x.member` in Dumont Auth                      |
+| `PROJECT_NOT_FOUND`         | Not among the projects you can see (the message names the role to ask for)                                    |
+| `PROJECT_NOT_ALLOWED`       | Project is outside this server's `HANGAR_ALLOWED_PROJECTS` ceiling                                            |
+| `SECRET_DETECTED`           | Input looked like a credential; nothing written                                                               |
+| `RATE_LIMITED`              | Per-user write limit reached; retry after the window                                                          |
+| `UPSTREAM_*`                | Hangar refused or failed; `UPSTREAM_VALIDATION_FAILED` lists fields                                           |
 
 A write that times out or gets a 5xx is **not** marked retryable: it may have
 been applied. Use `idempotency_key` for safe retries of creates.
@@ -188,15 +194,27 @@ Two separate layers:
   `email` stay advertised so existing client logins do not change; none of
   these has to be present in the token.
 - `MCP_OIDC_REQUIRED_ROLE` (pre-HGR-6) is still read as the reader role.
-- Where roles are read from (token already bound to issuer and audience):
-  `urn:zitadel:iam:org:project:<audience>:roles` (only the audience project's
-  roles); `urn:zitadel:iam:org:project:roles` and `roles` (roles of the
-  requesting application's project: our clients live in the audience project,
-  but a client of another project that also requests our audience would carry
-  that project's roles here, so no other ZITADEL project may define roles named
-  `hangar_reader`/`hangar_writer`); `my:zitadel:grants` only as the exact
-  `<audience>:<role>` string. Hangar applies the same rules to the forwarded
-  token.
+- **Every role is bound to our organization** (`MCP_OIDC_ALLOWED_ORG_ID`,
+  required). The ZITADEL instance is shared with other products'
+  organizations: any of them can define a project role named `hangar_writer`,
+  and any organization's Actions can set the legacy claims. So a role name
+  alone never counts. Where roles are read from (token already bound to issuer
+  and audience):
+  - `urn:zitadel:iam:org:project:<audience>:roles` and
+    `urn:zitadel:iam:org:project:roles`, in ZITADEL's object form
+    `{ "<role>": { "<orgId>": "<org domain>" } }`: the role counts only when
+    `claim[role]` is an object that has the allowed org id as a key, i.e. the
+    role was granted in our organization. A grant of some other role in our
+    org (for example `hangar.project.hgr.guest`) never vouches for a
+    `hangar_writer` granted in another org.
+  - Any other form (these claims as an array, the legacy flat `roles` claim,
+    `my:zitadel:grants` as the exact `<audience>:<role>` string): counts only
+    when `urn:zitadel:iam:user:resourceowner:id` equals the allowed org id.
+    `org_id` / `urn:zitadel:iam:org:id` are never used.
+  - There is no separate organization check: a token whose Hangar roles are
+    not bound to our org has no Hangar role and gets `403 insufficient_scope`.
+    Opaque (introspected) tokens go through the same function. Hangar applies
+    the same rules to the forwarded token.
 
 ## Audit log
 
@@ -248,6 +266,7 @@ See [.env.example](.env.example). The important ones:
 | `MCP_AUTH_MODE`                | `oidc` only                                                                         |
 | `MCP_RESOURCE_URL`             | Public MCP URL, `https://hangar.getdumont.ai/mcp`                                   |
 | `MCP_OIDC_AUDIENCE`            | ZITADEL project audience (the `ZITADEL DCR` project); Hangar must accept it as well |
+| `MCP_OIDC_ALLOWED_ORG_ID`      | **Required**: ZITADEL org id whose role grants count (see "Roles and access")       |
 | `MCP_OIDC_READER_ROLE`         | `hangar_reader` (legacy name: `MCP_OIDC_REQUIRED_ROLE`)                             |
 | `MCP_OIDC_WRITER_ROLE`         | `hangar_writer`                                                                     |
 | `MCP_OIDC_INTROSPECTION_*`     | Optional RFC 7662 introspection for opaque tokens (never forwarded to Hangar)       |
@@ -276,6 +295,9 @@ For a new teammate, in this order:
 1. **Dumont Auth (ZITADEL)**: grant `hangar_reader` (or `hangar_writer`) in
    the `ZITADEL DCR` project, plus the Hangar project roles they need (e.g.
    `hangar.project.hgr.member`) where projects are managed by Dumont Auth.
+   The grant must be made **in our organization** (`MCP_OIDC_ALLOWED_ORG_ID`):
+   a `hangar_*` role granted in any other organization of the shared ZITADEL
+   instance is ignored, and the login then gets `403 insufficient_scope`.
 2. **Hangar web, once**: they sign in at https://hangar.getdumont.ai with
    **Dumont login**. That links their ZITADEL user to a Hangar account; until
    then every tool answers `ACCOUNT_NOT_LINKED`.
@@ -413,7 +435,11 @@ Never `cat` the env file: it holds secrets. Print key names only.
    ```
 
    `ERROR HANGAR_API_KEY is retired, remove it…` means step 3 did not remove
-   it; `ERROR MCP_CURSOR_SECRET is required…` means the secret is missing.
+   it; `ERROR MCP_CURSOR_SECRET is required…` means the secret is missing;
+   `ERROR MCP_OIDC_ALLOWED_ORG_ID is required…` means the org id is missing
+   or empty. It is not a secret: add the line
+   `MCP_OIDC_ALLOWED_ORG_ID=<org id>` (our ZITADEL organization) to
+   `$ENV.new`.
 
 5. **Put the new env in place, switch and restart**, back to back (the old
    release keeps running on the environment it read at start until the

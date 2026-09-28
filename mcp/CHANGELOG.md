@@ -53,6 +53,26 @@ Needs the Hangar (Plane fork) side first: API v1 accepting
   present (even empty), with a "retired, remove it" message.
 - `scripts/live-smoke.mjs` expects 12 tools, lists up to 50 projects and
   prints the tool error code on a failed read.
+- **Roles are bound to our ZITADEL organization** (security fix; the ZITADEL
+  instance is shared with other products' organizations). A project role
+  claim (`urn:zitadel:iam:org:project:<aud>:roles` or
+  `urn:zitadel:iam:org:project:roles`) counts only when `claim[role]` is an
+  object keyed by `MCP_OIDC_ALLOWED_ORG_ID`. Array forms, the legacy `roles`
+  claim and `my:zitadel:grants` count only when
+  `urn:zitadel:iam:user:resourceowner:id` equals that org (`org_id` is never
+  used). The old organization check, which matched the org id anywhere in any
+  `*:roles` claim (so our-org guest plus a foreign `hangar_writer` passed as
+  writer), is removed: the role gate is the organization gate, for JWS and
+  introspected tokens alike. Matches the Hangar (Plane) side.
+- `MCP_OIDC_ALLOWED_ORG_ID` is now **required**: startup error when missing or
+  empty.
+- New Hangar answers mapped: 403 `DUMONT_USER_NOT_ALLOWED` (also the older
+  401 form) becomes `USER_NOT_ALLOWED` (not retryable, a new login will not
+  help); 503 `DUMONT_AUTH_UNAVAILABLE` becomes `UPSTREAM_AUTH_UNAVAILABLE`
+  (retryable, also for writes since Hangar refused before running the view;
+  never a new login). Hangar's 401 challenge now carries
+  `error="invalid_token"`; it is still mapped by `error_code` and never
+  becomes an MCP 401.
 
 ### Owner steps
 
@@ -61,7 +81,9 @@ and verify the Hangar side first; then prepare `/etc/dumont-hangar-mcp.env.new`
 as a copy without `HANGAR_API_KEY` and `HANGAR_WRITE_PROJECTS` and with
 `MCP_CURSOR_SECRET` (compare the two project lists first: writes now reach
 every project in `HANGAR_ALLOWED_PROJECTS` where the user is a Hangar Member),
-validate the copy, then move it into place, switch and restart back to back. Every user must sign in once
+make sure it has a non-empty `MCP_OIDC_ALLOWED_ORG_ID` (our ZITADEL org id;
+the release refuses to start without it) and that every MCP user's
+`hangar_*` grant was made in that org, validate the copy, then move it into place, switch and restart back to back. Every user must sign in once
 to Hangar web with Dumont login. Revoke the bot token only after the release
 is stable.
 
