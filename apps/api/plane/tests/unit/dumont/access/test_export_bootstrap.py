@@ -23,7 +23,17 @@ from plane.tests.unit.dumont.access.conftest import (
     ws_member,
 )
 
-SCRIPT = Path(__file__).resolve().parents[7] / "scripts" / "dumont" / "zitadel_access_bootstrap.py"
+
+def _find_script():
+    # Repo root in a checkout; `/` inside the API container when scripts/ is mounted at /scripts.
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / "scripts" / "dumont" / "zitadel_access_bootstrap.py"
+        if candidate.exists():
+            return candidate
+    return Path("/nonexistent/scripts/dumont/zitadel_access_bootstrap.py")
+
+
+SCRIPT = _find_script()
 PAT = "fake-admin-pat-do-not-print"
 
 
@@ -38,7 +48,7 @@ def bootstrap():
 
 
 @pytest.fixture
-def plane_world(db, workspace, create_user, access_env, create_bot_user):
+def plane_world(db, workspace, create_user, access_env, create_bot_user, fake_zitadel):
     mo = make_project(workspace, "MO", create_user)
     odd = make_project(workspace, "A B", create_user)  # cannot be a role key
     pr_member(mo, create_user, 20)
@@ -54,6 +64,8 @@ def plane_world(db, workspace, create_user, access_env, create_bot_user):
     from plane.db.models import Account
 
     Account.objects.create(user=create_user, provider="dumont", provider_account_id="sub-owner", access_token="x")
+    # both Dumont logins belong to the Dumont organisation in ZITADEL
+    fake_zitadel.org_users.update({"sub-linked": ORG_ID, "sub-owner": ORG_ID})
     access_env("dry-run")
     return {"mo": mo, "linked": linked, "legacy": legacy, "set_mode": access_env}
 
@@ -223,6 +235,25 @@ class TestBootstrapScript:
         }
         assert all(k.startswith("hangar.project.mo.") for g in plan["grants_to_create"] for k in g["role_keys"])
         assert any(s["reason"] == "not found in ZITADEL" for s in plan["skipped"])  # legacy not in fake users
+
+    def test_org_boundary(self, plane_world, fake_zitadel, bootstrap, tmp_path):
+        """A Dumont login from another org gets nothing; a grant owned by another org is never updated."""
+        fake_zitadel.issued.add(PAT)
+        fake_zitadel.org_users["sub-linked"] = "999999999999999999"  # linked user lives in another org
+        fake_zitadel.grant("sub-owner", "hangar_reader", grant_org="888", project_grant_id="pg-1")
+        export_path, _ = _export(tmp_path)
+        code, text = _run_script(bootstrap, fake_zitadel, export_path, "--json")
+        assert code == 0, text
+        plan = json.loads(text)
+        assert {"user": "linked@example.test", "reason": "Dumont login belongs to another ZITADEL organisation"} in (
+            plan["skipped"]
+        )
+        assert all(g["user_id"] != "sub-linked" for g in plan["grants_to_create"] + plan["grants_to_update"])
+        # the owner's only grant is foreign: a new grant in the Dumont org is planned instead of an update
+        assert [g["user_id"] for g in plan["grants_to_update"]] == []
+        assert "sub-owner" in [g["user_id"] for g in plan["grants_to_create"]]
+        user_searches = [c for c in fake_zitadel.api_calls("users/_search") if "inUserIdsQuery" in str(c[2])]
+        assert user_searches, "linked users must be checked against the org"
 
     def test_zitadel_error_is_reported_without_pat(self, plane_world, fake_zitadel, bootstrap, tmp_path):
         export_path, _ = _export(tmp_path)

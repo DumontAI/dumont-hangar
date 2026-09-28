@@ -331,3 +331,83 @@ class TestLock:
         assert response.status_code == 403
         assert "error_code" not in response.data  # Plane's own permission answer, not the lock
         assert setup["fake"].calls == []
+
+    def test_enforce_without_org_id_fails_closed(self, setup, monkeypatch):
+        # DUMONT_ACCESS_ZITADEL_ORG_ID is required: without it the lock cannot learn the managed scopes
+        # and answers 503 instead of letting a change through; ZITADEL is never called.
+        cache.delete(MANAGED_STATE_KEY)
+        monkeypatch.delenv("DUMONT_ACCESS_ZITADEL_ORG_ID")
+        response = _call(setup, *LOCKED_CASES[1][1:])
+        assert response.status_code == 503
+        assert setup["fake"].calls == []
+
+
+NEW_ROLES = ["hangar.project.new.admin", "hangar.project.new.member"]
+
+
+@pytest.fixture
+def queued(monkeypatch):
+    from plane.dumont.access import tasks
+
+    calls = []
+    monkeypatch.setattr(tasks.dumont_access_full_sync, "delay", lambda *a, **k: calls.append(1))
+    return calls
+
+
+def _create(setup, client, body):
+    url = f"/api/v1/workspaces/{SLUG}/projects/" if client == "v1" else f"/api/workspaces/{SLUG}/projects/"
+    return setup["clients"][client].post(url, body, format="json")
+
+
+@pytest.mark.unit
+@pytest.mark.django_db
+class TestProjectCreateSideEffects:
+    """Plane makes the creator (and a different project lead) admin of a new project."""
+
+    @pytest.mark.parametrize("client", ["session", "v1"])
+    def test_different_lead_refused_for_managed_identifier(self, setup, queued, client):
+        from plane.db.models import Project
+
+        setup["fake"].roles = ROLES + NEW_ROLES
+        response = _create(setup, client, {"name": "New", "identifier": "NEW", "project_lead": str(setup["alice"].id)})
+        assert response.status_code == 403, response.data
+        assert response.data["error_code"] == ERROR_CODE
+        assert "hangar.project.new.admin" in response.data["error"]
+        assert not Project.objects.filter(identifier="NEW").exists()
+        assert queued == []
+
+    @pytest.mark.parametrize("client", ["session", "v1"])
+    def test_create_managed_identifier_queues_a_full_sync(
+        self, setup, queued, client, django_capture_on_commit_callbacks
+    ):
+        setup["fake"].roles = ROLES + NEW_ROLES
+        with django_capture_on_commit_callbacks(execute=True):
+            response = _create(setup, client, {"name": "New", "identifier": "NEW"})
+        assert response.status_code == 201, response.data
+        assert queued == [1]
+
+    def test_lead_allowed_for_unmanaged_identifier(self, setup, queued, django_capture_on_commit_callbacks):
+        with django_capture_on_commit_callbacks(execute=True):
+            response = _create(
+                setup, "session", {"name": "Free", "identifier": "FREE", "project_lead": str(setup["alice"].id)}
+            )
+        assert response.status_code == 201, response.data
+
+    def test_lead_with_zitadel_down_is_503(self, setup, queued):
+        cache.delete(MANAGED_STATE_KEY)
+        setup["fake"].fail = 500
+        response = _create(
+            setup, "session", {"name": "New", "identifier": "NEW", "project_lead": str(setup["alice"].id)}
+        )
+        assert response.status_code == 503
+
+    @pytest.mark.parametrize("mode", ["off", "dry-run"])
+    def test_nothing_outside_enforce(self, setup, queued, mode, django_capture_on_commit_callbacks):
+        setup["set_mode"](mode)
+        setup["fake"].roles = ROLES + NEW_ROLES
+        with django_capture_on_commit_callbacks(execute=True):
+            response = _create(
+                setup, "session", {"name": "New", "identifier": "NEW", "project_lead": str(setup["alice"].id)}
+            )
+        assert response.status_code == 201, response.data
+        assert queued == [] and setup["fake"].calls == []

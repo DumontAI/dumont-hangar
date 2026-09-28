@@ -108,10 +108,12 @@ def _report(status, mode, scope, plan=None, snapshot=None, result=None, error=No
                 "notes": plan.notes,
                 "unknown_project_roles": plan.unknown_project_roles,
                 "invalid_role_keys": plan.invalid_role_keys,
+                "ignored_grants": plan.ignored_grants,
                 "counts": {
                     "changes": len(plan.changes),
                     "deactivations": len(plan.deactivations),
                     "pending": len(plan.pending),
+                    "ignored_grants": len(plan.ignored_grants),
                 },
             }
         )
@@ -121,6 +123,18 @@ def _report(status, mode, scope, plan=None, snapshot=None, result=None, error=No
         report["failed_scopes"] = result["failed_scopes"]
     report.update(extra)
     return report
+
+
+def _ignored_grants(client):
+    """Grants the client dropped at the ZITADEL organisation boundary; logged as a warning (ids only)."""
+    ignored = list(getattr(client, "ignored_grants", None) or [])
+    if ignored:
+        logger.warning(
+            "dumont access: ignored %d grant(s) outside the Dumont organisation (DUMONT_ACCESS_ZITADEL_ORG_ID): %s",
+            len(ignored),
+            ignored[:50],
+        )
+    return ignored
 
 
 def _log_plan(report):
@@ -207,6 +221,7 @@ def _full_sync(cfg, mode):
     _store_managed_state(cfg, role_keys, workspace)
     snapshot = build_snapshot(workspace, role_keys, grants)
     plan = compute_plan(snapshot)
+    plan.ignored_grants = _ignored_grants(client)
 
     if mode == MODE_DRY_RUN:
         report = _report(STATUS_DRY_RUN, mode, "full", plan, snapshot)
@@ -272,6 +287,7 @@ def _user_sync(cfg, mode, user, sub):
         logger.error("dumont access: sub is linked to another Plane user; per-user sync skipped")
         return _report(STATUS_ERROR, mode, "user", error="sub linked to another user")
     plan = compute_plan(snapshot)
+    plan.ignored_grants = [item for item in _ignored_grants(client) if item["user_id"] == sub]
     if mode == MODE_DRY_RUN:
         report = _report(STATUS_DRY_RUN, mode, "user", plan, snapshot)
         _log_plan(report)

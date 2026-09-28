@@ -14,8 +14,20 @@
 #       https://zitadel.com/docs/apis/resources/mgmt/management-service-list-user-grants
 #   - Organisation context header: x-zitadel-orgid
 #       https://zitadel.com/docs/apis/introduction#organization-context
+#   - Search users (org-scoped by x-zitadel-orgid), query inUserIdsQuery {"userIds": [...]}:
+#       POST /management/v1/users/_search
+#       https://zitadel.com/docs/apis/resources/mgmt/management-service-list-users
 #   - List query shape {"query": {"offset", "limit", "asc"}} and response {"details": {"totalResult"}, "result": []}
 #       https://zitadel.com/docs/apis/resources/mgmt  (ListQuery / ListDetails)
+#   - UserGrant fields used: userId, projectId, roleKeys, state, orgId, projectGrantId, details.resourceOwner,
+#       email, preferredLoginName, displayName. User fields used: id, details.resourceOwner.
+#
+# Organisation boundary: the ZITADEL instance is shared with other products' production, so only
+# grants AND users of the configured Dumont organisation (DUMONT_ACCESS_ZITADEL_ORG_ID) count. A
+# grant is ignored when it came through a project grant (projectGrantId set), when its orgId or
+# details.resourceOwner names another org, or when its user is not a user of the Dumont org (checked
+# with an org-scoped users/_search). Absent fields are not treated as foreign (older/newer versions
+# may omit them); the org-scoped user check still applies.
 #
 # The client never writes to ZITADEL, never logs tokens or the private key, and raises
 # ZitadelError for every failure so callers can fail safe (change nothing).
@@ -40,6 +52,8 @@ JWT_BEARER_GRANT = "urn:ietf:params:oauth:grant-type:jwt-bearer"
 TOKEN_SCOPE = "openid urn:zitadel:iam:org:project:id:zitadel:aud"
 ROLES_SEARCH_PATH = "/management/v1/projects/{project_id}/roles/_search"
 GRANTS_SEARCH_PATH = "/management/v1/users/grants/_search"
+USERS_SEARCH_PATH = "/management/v1/users/_search"
+USER_IDS_PER_QUERY = 100
 ORG_HEADER = "x-zitadel-orgid"
 GRANT_STATE_ACTIVE = "USER_GRANT_STATE_ACTIVE"
 # ZITADEL omits zero-value enums in JSON; an absent/unspecified state therefore means "active".
@@ -86,6 +100,7 @@ class ZitadelClient:
         self.service_key = service_key
         self.session = session or new_session()
         self.timeout = timeout
+        self.ignored_grants = []
 
     # --- token -------------------------------------------------------------------------------
 
@@ -197,8 +212,28 @@ class ZitadelClient:
             keys.append(key)
         return keys
 
+    def user_ids_in_org(self, user_ids):
+        """The subset of `user_ids` that are users of the configured organisation."""
+        wanted = sorted({uid for uid in user_ids if uid})
+        found = set()
+        for start in range(0, len(wanted), USER_IDS_PER_QUERY):
+            chunk = wanted[start : start + USER_IDS_PER_QUERY]
+            for row in self._search(USERS_SEARCH_PATH, queries=[{"inUserIdsQuery": {"userIds": chunk}}]):
+                if not isinstance(row, dict):
+                    raise ZitadelError("user is not an object")
+                row_id = row.get("id")
+                # Defence in depth: the org header scopes the search, and the owner must match when present.
+                if row_id in chunk and _resource_owner(row) in (None, self.org_id):
+                    found.add(row_id)
+        return found
+
     def list_user_grants(self, project_id, user_id=None):
-        """Active user grants of the project (optionally of one user)."""
+        """Active user grants of the project (optionally of one user), inside the configured org only.
+
+        Grants dropped because of the organisation boundary are recorded in `self.ignored_grants`
+        as {"user_id", "reason"} (ids only, no e-mails).
+        """
+        self.ignored_grants = []
         queries = [{"projectIdQuery": {"projectId": project_id}}]
         if user_id:
             queries.append({"userIdQuery": {"userId": user_id}})
@@ -217,6 +252,10 @@ class ZitadelClient:
             role_keys = row.get("roleKeys") or []
             if not isinstance(grant_user_id, str) or not grant_user_id or not isinstance(role_keys, list):
                 raise ZitadelError("user grant without userId/roleKeys")
+            reason = _grant_outside_org(row, self.org_id)
+            if reason:
+                self.ignored_grants.append({"user_id": grant_user_id, "reason": reason})
+                continue
             grants.append(
                 ZitadelGrant(
                     user_id=grant_user_id,
@@ -226,7 +265,33 @@ class ZitadelClient:
                     display_name=row.get("displayName") or None,
                 )
             )
-        return grants
+        if not grants:
+            return grants
+        in_org = self.user_ids_in_org(grant.user_id for grant in grants)
+        kept = []
+        for grant in grants:
+            if grant.user_id in in_org:
+                kept.append(grant)
+            else:
+                self.ignored_grants.append({"user_id": grant.user_id, "reason": "user_outside_org"})
+        return kept
+
+
+def _resource_owner(row):
+    details = row.get("details")
+    owner = details.get("resourceOwner") if isinstance(details, dict) else None
+    return owner or None
+
+
+def _grant_outside_org(row, org_id):
+    """Why a grant row is outside the configured organisation, or None when it is inside."""
+    if row.get("projectGrantId"):
+        return "project_grant"
+    if row.get("orgId") not in (None, "", org_id):
+        return "grant_org"
+    if _resource_owner(row) not in (None, org_id):
+        return "grant_resource_owner"
+    return None
 
 
 def _total_result(data):

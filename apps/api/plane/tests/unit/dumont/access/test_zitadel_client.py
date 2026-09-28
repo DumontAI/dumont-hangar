@@ -60,6 +60,58 @@ class TestZitadelClient:
         assert {"userIdQuery": {"userId": "a"}} in body["queries"]
         assert {"projectIdQuery": {"projectId": PROJECT_ID}} in body["queries"]
 
+    def test_only_grants_and_users_of_the_dumont_org(self, client, fake_zitadel):
+        other = "999999999999999999"
+        fake_zitadel.grant("in-org", "hangar.workspace.member")
+        fake_zitadel.grant("via-project-grant", "hangar.workspace.admin", project_grant_id="pg-1")
+        fake_zitadel.grant("grant-other-org", "hangar.workspace.admin", grant_org=other)
+        fake_zitadel.grant("user-other-org", "hangar.workspace.admin", user_org=other)
+        row = fake_zitadel.grant("owner-only-other", "hangar.workspace.admin")
+        row.pop("orgId")
+        row["details"]["resourceOwner"] = other
+        grants = client.list_user_grants(PROJECT_ID)
+        assert [g.user_id for g in grants] == ["in-org"]
+        assert sorted((i["user_id"], i["reason"]) for i in client.ignored_grants) == [
+            ("grant-other-org", "grant_org"),
+            ("owner-only-other", "grant_resource_owner"),
+            ("user-other-org", "user_outside_org"),
+            ("via-project-grant", "project_grant"),
+        ]
+        user_search = fake_zitadel.api_calls("users/_search")[-1][2]
+        assert user_search["queries"] == [{"inUserIdsQuery": {"userIds": ["in-org", "user-other-org"]}}]
+
+    def test_org_fields_absent_still_needs_user_in_org(self, client, fake_zitadel):
+        for user_id, org in (("a", ORG_ID), ("b", "999")):
+            row = fake_zitadel.grant(user_id, "hangar.workspace.member", user_org=org)
+            row.pop("orgId")
+            row.pop("details")
+        assert [g.user_id for g in client.list_user_grants(PROJECT_ID)] == ["a"]
+
+    def test_user_check_ignores_rows_of_other_orgs_even_if_returned(self, client, fake_zitadel, monkeypatch):
+        fake_zitadel.grant("a", "hangar.workspace.member")
+        fake_zitadel.grant("b", "hangar.workspace.member", user_org="999")
+        real_search = Z.ZitadelClient._search
+
+        def leaky(self, path, queries=None):
+            rows = real_search(self, path, queries)
+            if path == Z.USERS_SEARCH_PATH:  # a server that ignores the org scope
+                rows = rows + [{"id": "b", "details": {"resourceOwner": "999"}}]
+            return rows
+
+        monkeypatch.setattr(Z.ZitadelClient, "_search", leaky)
+        assert [g.user_id for g in client.list_user_grants(PROJECT_ID)] == ["a"]
+
+    def test_user_ids_are_checked_in_chunks(self, client, fake_zitadel):
+        for i in range(Z.USER_IDS_PER_QUERY + 5):
+            fake_zitadel.grant(f"u{i:03d}", "hangar.workspace.member")
+        assert len(client.list_user_grants(PROJECT_ID)) == Z.USER_IDS_PER_QUERY + 5
+        chunks = [len(c[2]["queries"][0]["inUserIdsQuery"]["userIds"]) for c in fake_zitadel.api_calls("users/_search")]
+        assert chunks == [Z.USER_IDS_PER_QUERY, 5]
+
+    def test_no_grants_no_user_lookup(self, client, fake_zitadel):
+        assert client.list_user_grants(PROJECT_ID) == []
+        assert fake_zitadel.api_calls("users/_search") == []
+
     @pytest.mark.parametrize("failure", [500, 403, 404, "timeout", "badjson"])
     def test_failures_raise_zitadel_error(self, client, fake_zitadel, failure):
         fake_zitadel.fail = failure

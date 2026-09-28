@@ -190,6 +190,47 @@ class TestFullSync:
         assert report["status"] == "error" and "DUMONT_ACCESS_ZITADEL_KEY_JSON" in report["error"]
         assert world["fake"].calls == []
 
+    @pytest.mark.parametrize("mode", ["dry-run", "enforce"])
+    def test_org_id_is_required_before_any_call(self, world, monkeypatch, mode):
+        world["set_mode"](mode)
+        monkeypatch.delenv("DUMONT_ACCESS_ZITADEL_ORG_ID")
+        before = state(world)
+        report = run_full_sync()
+        assert report["status"] == "error" and "DUMONT_ACCESS_ZITADEL_ORG_ID" in report["error"]
+        report = run_user_sync(world["users"]["carol"], "sub-carol")
+        assert report["status"] == "error" and "DUMONT_ACCESS_ZITADEL_ORG_ID" in report["error"]
+        assert world["fake"].calls == []
+        assert state(world) == before
+
+    def test_grants_outside_the_dumont_org_are_ignored(self, world):
+        fake = world["fake"]
+        # bob's only grant came through a project grant to another org: he is removed as without a grant
+        fake.grant(
+            "sub-bob", "hangar.workspace.admin", "hangar.project.mo.admin", grant_org="999", project_grant_id="pg"
+        )
+        # erin signed in to Hangar with a user of another org; a grant in the Dumont project gives nothing
+        make_user("erin@example.test", sub="sub-erin")
+        fake.grant("sub-erin", "hangar.workspace.admin", user_org="999")
+        report = run_full_sync()
+        assert report["status"] == "applied", report
+        s = state(world)
+        assert s[("ws", "bob@example.test")] == (15, False)
+        assert ("ws", "erin@example.test") not in s
+        assert {(i["user_id"], i["reason"]) for i in report["ignored_grants"]} == {
+            ("sub-bob", "project_grant"),
+            ("sub-erin", "user_outside_org"),
+        }
+        assert report["counts"]["ignored_grants"] == 2
+        assert all(p["zitadel_user_id"] not in ("sub-erin", "sub-bob") for p in report["pending"])
+
+    def test_user_lookup_failure_changes_nothing(self, world):
+        world["fake"].fail = 403  # e.g. the service user may read grants but not users
+        world["fake"].fail_on = "users/_search"
+        before = state(world)
+        report = run_full_sync()
+        assert report["status"] == "error" and "users/_search" in report["error"]
+        assert state(world) == before
+
     def test_missing_workspace(self, world, monkeypatch):
         monkeypatch.setenv("DUMONT_ACCESS_WORKSPACE_SLUG", "nope")
         assert run_full_sync()["status"] == "error"
@@ -288,6 +329,14 @@ class TestPerUserSyncAndHooks:
         monkeypatch.setattr(Z.ZitadelClient, "list_user_grants", leaky)
         report = run_user_sync(world["users"]["carol"], "sub-carol")
         assert {c["email"] for c in report["changes"]} == {"carol@example.test"}
+
+    def test_user_sync_of_a_user_from_another_org_grants_nothing(self, world):
+        world["fake"].org_users["sub-alice"] = "999"  # alice's ZITADEL user is owned by another org
+        report = run_user_sync(world["users"]["alice"], "sub-alice")
+        assert report["status"] == "applied", report
+        assert report["ignored_grants"] == [{"user_id": "sub-alice", "reason": "user_outside_org"}]
+        assert ws_row(world["workspace"], world["users"]["alice"]).is_active is False
+        assert pr_row(world["mo"], world["users"]["alice"]).is_active is False
 
     def test_bearer_hook_is_cached_60s_per_sub(self, world):
         carol = world["users"]["carol"]

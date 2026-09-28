@@ -227,6 +227,83 @@ def lock_workspace_membership(slugs_from=None, only_if=None):
     return decorator
 
 
+PROJECT_LEAD_LOCK_MESSAGE = (
+    "Access to project {identifier} is managed in Dumont Auth (ZITADEL). A project lead other than you "
+    "would become its admin here; create the project without a different lead and ask for role "
+    "hangar.project.{part}.admin for that person."
+)
+
+
+def _body_value(request, key):
+    data = getattr(request, "data", None)
+    return data.get(key) if hasattr(data, "get") else None
+
+
+def _queue_full_sync():
+    """Queue one full sync after the current transaction commits. Never raises into the view."""
+
+    def enqueue():
+        try:
+            from plane.dumont.access.tasks import dumont_access_full_sync
+
+            dumont_access_full_sync.delay()
+        except Exception:
+            logger.warning("dumont access: could not queue a full sync after project create; the beat will run it")
+
+    try:
+        from django.db import transaction
+
+        transaction.on_commit(enqueue)
+    except Exception:
+        logger.warning("dumont access: could not schedule a full sync after project create")
+
+
+def lock_project_create():
+    """Decorator for project create endpoints (workspace slug in kwarg `slug`).
+
+    Plane makes the creator admin of a new project, and a `project_lead` other than the creator too.
+    When the new identifier already has roles in ZITADEL, the project is managed from birth, so in
+    enforce mode:
+      - naming a different project lead is refused (it would grant admin to someone ZITADEL did not);
+      - after a successful create a full sync is queued, so the creator's provisional admin row is
+        reconciled with the grants right away (the last-admin rule keeps it while ZITADEL has no admin).
+    Creating the project itself stays allowed: roles may be prepared in ZITADEL before the project exists.
+    """
+
+    def decorator(view_func):
+        @functools.wraps(view_func)
+        def wrapped(instance, request, *args, **kwargs):
+            cfg = _enforce_config()
+            if cfg is None or kwargs.get("slug") != cfg.workspace_slug:
+                return view_func(instance, request, *args, **kwargs)
+            identifier = _body_value(request, "identifier")
+            part = R.identifier_to_key_part(str(identifier)) if identifier else None
+            lead = _body_value(request, "project_lead")
+            user_id = str(getattr(request.user, "id", ""))
+            if part and lead and str(lead) != user_id:
+                try:
+                    state = _state(cfg)
+                except Exception as exc:
+                    logger.error("dumont access: lock cannot read the managed state (%s)", exc.__class__.__name__)
+                    return _unavailable()
+                if part in set(state.get("identifiers") or []):
+                    return Response(
+                        {
+                            "error_code": ERROR_CODE,
+                            "error": PROJECT_LEAD_LOCK_MESSAGE.format(identifier=str(identifier).upper(), part=part),
+                        },
+                        status=status.HTTP_403_FORBIDDEN,
+                    )
+            response = view_func(instance, request, *args, **kwargs)
+            if getattr(response, "status_code", None) == status.HTTP_201_CREATED:
+                _queue_full_sync()
+            return response
+
+        return wrapped
+
+    return decorator
+
+
 # --- extractors for endpoints whose targets are in the body ------------------------------------
 
 

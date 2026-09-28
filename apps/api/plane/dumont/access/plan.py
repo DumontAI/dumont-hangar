@@ -117,6 +117,8 @@ class Plan:
     changes: list = field(default_factory=list)
     pending: list = field(default_factory=list)
     notes: list = field(default_factory=list)
+    # grants dropped at the ZITADEL organisation boundary (set by the sync, not by compute_plan)
+    ignored_grants: list = field(default_factory=list)
 
     @property
     def deactivations(self):

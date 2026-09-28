@@ -30,7 +30,12 @@
 #     https://zitadel.com/docs/apis/resources/mgmt/management-service-update-user-grant
 #   search users   POST /management/v1/users/_search  (emailQuery, TEXT_QUERY_METHOD_EQUALS_IGNORE_CASE)
 #     https://zitadel.com/docs/apis/resources/mgmt/management-service-list-users
+#   search users   POST /management/v1/users/_search  (inUserIdsQuery {userIds}), org-scoped
 #   org context    header x-zitadel-orgid
+#
+# Organisation boundary (the ZITADEL instance is shared with other products): only users of --org-id
+# get grants, and only grants owned by --org-id are updated. A Dumont login of a user from another
+# org, or a grant that came through a project grant, is skipped and listed, never written.
 
 import argparse
 import json
@@ -121,15 +126,37 @@ def _selected(key, projects, skip_workspace):
     return False
 
 
+def _grant_outside_org(row, org_id):
+    """Same rule as plane/dumont/access/zitadel.py: a project grant or another owner org is foreign."""
+    details = row.get("details") if isinstance(row.get("details"), dict) else {}
+    if row.get("projectGrantId"):
+        return True
+    return row.get("orgId") not in (None, "", org_id) or details.get("resourceOwner") not in (None, "", org_id)
+
+
+def users_in_org(zitadel, user_ids):
+    """The subset of `user_ids` owned by the org in x-zitadel-orgid (org-scoped users/_search)."""
+    wanted = sorted({uid for uid in user_ids if uid})
+    found = set()
+    for start in range(0, len(wanted), PAGE_SIZE):
+        chunk = wanted[start : start + PAGE_SIZE]
+        for row in zitadel.search("/management/v1/users/_search", [{"inUserIdsQuery": {"userIds": chunk}}]):
+            owner = (row.get("details") or {}).get("resourceOwner")
+            if row.get("id") in chunk and owner in (None, "", zitadel.org_id):
+                found.add(row["id"])
+    return found
+
+
 def build_plan(export, zitadel, project_id, projects=None, skip_workspace=False):
     """Read ZITADEL and compute what is missing. Performs no writes."""
     roles = [r for r in export["roles"] if _selected(r["key"], projects, skip_workspace)]
     existing_roles = {row.get("key") for row in zitadel.search(f"/management/v1/projects/{project_id}/roles/_search")}
     grants_by_user = {}
     for row in zitadel.search("/management/v1/users/grants/_search", [{"projectIdQuery": {"projectId": project_id}}]):
-        if row.get("projectId") not in (None, project_id):
+        if row.get("projectId") not in (None, project_id) or _grant_outside_org(row, zitadel.org_id):
             continue
         grants_by_user.setdefault(row.get("userId"), []).append(row)
+    linked_in_org = users_in_org(zitadel, [u.get("zitadel_user_id") for u in export["users"]])
 
     plan = {
         "roles_to_create": [r for r in roles if r["key"] not in existing_roles],
@@ -145,6 +172,9 @@ def build_plan(export, zitadel, project_id, projects=None, skip_workspace=False)
         who = user.get("email") or user.get("zitadel_user_id")
         user_id = user.get("zitadel_user_id")
         resolved_by = "dumont login"
+        if user_id and user_id not in linked_in_org:
+            plan["skipped"].append({"user": who, "reason": "Dumont login belongs to another ZITADEL organisation"})
+            continue
         if not user_id:
             matches = zitadel.search(
                 "/management/v1/users/_search",

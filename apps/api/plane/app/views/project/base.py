@@ -40,7 +40,7 @@ from plane.db.models import (
     WorkspaceMember,
 )
 from plane.db.models.intake import IntakeIssueStatus
-from plane.dumont.access.guard import lock_project_identifier_change  # Dumont addition
+from plane.dumont.access.guard import lock_project_create, lock_project_identifier_change  # Dumont addition
 from plane.utils.host import base_host
 from plane.utils.order_queryset import PROJECT_ORDER_BY_ALLOWLIST, sanitize_order_by
 
@@ -256,6 +256,7 @@ class ProjectViewSet(BaseViewSet):
         return Response(serializer.data, status=status.HTTP_200_OK)
 
     @allow_permission([ROLE.ADMIN, ROLE.MEMBER], level="WORKSPACE")
+    @lock_project_create()
     def create(self, request, slug):
         workspace = Workspace.objects.get(slug=slug)
 

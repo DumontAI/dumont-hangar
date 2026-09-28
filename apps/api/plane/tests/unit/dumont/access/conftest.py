@@ -56,7 +56,8 @@ class FakeZitadel(requests.adapters.BaseAdapter):
         self.public_key = public_key
         self.roles = []  # role keys
         self.grants = []  # raw grant rows as ZITADEL returns them
-        self.users = []  # raw user rows (users/_search)
+        self.users = []  # raw user rows (users/_search by e-mail, bootstrap tests)
+        self.org_users = {}  # user id -> owning org id (users/_search by id, org-scoped)
         self.writes = []  # write calls received (bootstrap script tests)
         self.calls = []  # (method, path, parsed body)
         self.timeouts = []
@@ -69,17 +70,33 @@ class FakeZitadel(requests.adapters.BaseAdapter):
         self.expires_in = 43199
 
     # helpers for tests
-    def grant(self, user_id, *role_keys, email=None, state="USER_GRANT_STATE_ACTIVE", project_id=PROJECT_ID):
+    def grant(
+        self,
+        user_id,
+        *role_keys,
+        email=None,
+        state="USER_GRANT_STATE_ACTIVE",
+        project_id=PROJECT_ID,
+        grant_org=ORG_ID,
+        user_org=ORG_ID,
+        project_grant_id=None,
+    ):
+        """Add a grant row. `user_org` registers the user in that org's directory (users/_search)."""
         row = {
             "id": uuid.uuid4().hex,
+            "details": {"resourceOwner": grant_org},
             "userId": user_id,
             "projectId": project_id,
             "roleKeys": list(role_keys),
             "email": email,
             "displayName": email or user_id,
+            "orgId": grant_org,
         }
+        if project_grant_id:
+            row["projectGrantId"] = project_grant_id
         if state is not None:
             row["state"] = state
+        self.org_users.setdefault(user_id, user_org)
         self.grants.append(row)
         return row
 
@@ -126,6 +143,17 @@ class FakeZitadel(requests.adapters.BaseAdapter):
                     rows = [r for r in rows if r["userId"] == query["userIdQuery"]["userId"]]
             return self._page(request, parsed, rows)
         # --- write/admin endpoints, used by the bootstrap script tests only --------------------
+        if path == "/management/v1/users/_search" and any("inUserIdsQuery" in q for q in parsed.get("queries", [])):
+            # Org-scoped like ZITADEL: only users owned by the org in x-zitadel-orgid are returned.
+            wanted = set()
+            for query in parsed["queries"]:
+                wanted |= set(query.get("inUserIdsQuery", {}).get("userIds", []))
+            rows = [
+                {"id": uid, "details": {"resourceOwner": org}, "state": "USER_STATE_ACTIVE"}
+                for uid, org in sorted(self.org_users.items())
+                if uid in wanted and org == ORG_ID
+            ]
+            return self._page(request, parsed, rows)
         if path == "/management/v1/users/_search":
             rows = self.users
             for query in parsed.get("queries", []):
@@ -157,8 +185,10 @@ class FakeZitadel(requests.adapters.BaseAdapter):
             return _response(request, 404, {"code": 5, "message": "grant not found"})
         return _response(request, 404, {"code": 5, "message": "not found"})
 
-    def add_user(self, user_id, email):
-        self.users.append({"id": user_id, "state": "USER_STATE_ACTIVE", "human": {"email": {"email": email}}})
+    def add_user(self, user_id, email, org=ORG_ID):
+        self.org_users[user_id] = org
+        if org == ORG_ID:  # e-mail search is org-scoped too
+            self.users.append({"id": user_id, "state": "USER_STATE_ACTIVE", "human": {"email": {"email": email}}})
 
     def _token(self, request, form):
         assert form.get("grant_type") == "urn:ietf:params:oauth:grant-type:jwt-bearer"
