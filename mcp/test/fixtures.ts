@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { HangarConfig, Principal, UpstreamCaller } from "../src/types.js";
 
 export const PROJECT_HGR = "1f4b7c4b-fe28-441d-a6ce-b3dfe87384b2";
@@ -74,8 +75,19 @@ export function callerFor(
   return { sub: principal.sub, accessToken, expiresAt };
 }
 
-/** Plane user id returned by GET /api/v1/users/me/ in hangarFetch. */
-export const ME_USER_ID = "0d2b1f7a-3c4e-4f5a-8b6c-7d8e9f0a1b2c";
+/**
+ * Plane user id the fake GET /api/v1/users/me/ returns: derived from the
+ * bearer, so different callers get different Hangar users.
+ */
+export function meUserIdFor(authorization: string | undefined): string {
+  const hex = createHash("sha256")
+    .update(authorization ?? "")
+    .digest("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-8${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+}
+
+/** users/me id for TEST_ACCESS_TOKEN. */
+export const ME_USER_ID = meUserIdFor(`Bearer ${TEST_ACCESS_TOKEN}`);
 
 export function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -95,7 +107,8 @@ export function hangarFetch(calls: URL[]): (input: string | URL, init?: RequestI
     if (init?.method !== "GET") return jsonResponse({ error: "method" }, 405);
     const path = url.pathname;
     if (path === "/api/v1/users/me/") {
-      return jsonResponse({ id: ME_USER_ID, display_name: "Me", first_name: "Me", last_name: "" });
+      const authorization = ((init?.headers ?? {}) as Record<string, string>).Authorization;
+      return jsonResponse({ id: meUserIdFor(authorization), display_name: "Me", first_name: "Me", last_name: "" });
     }
     if (path.endsWith("/projects/")) return page([HGR_PROJECT, SECRET_PROJECT]);
     if (/\/projects\/[0-9a-f-]+\/$/.test(path)) return jsonResponse(HGR_PROJECT);

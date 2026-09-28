@@ -8,7 +8,7 @@ import {
   protectedResourceMetadata,
   protectedResourceMetadataPaths,
 } from "./auth.js";
-import { WriteRateLimiter } from "./access.js";
+import { WriteRateLimiter, type AuditSink } from "./access.js";
 import { SubjectCache } from "./cache.js";
 import { HangarClient, type FetchLike } from "./client.js";
 import { isMainModule } from "./runtime.js";
@@ -76,6 +76,8 @@ export interface HttpServerDependencies {
   readonly fetch?: FetchLike;
   /** Per-subject cache for the default factory (tests). */
   readonly cache?: SubjectCache;
+  /** Audit sink for the default factory (tests); stderr otherwise. */
+  readonly audit?: AuditSink;
 }
 
 export function createHangarHttpServer(
@@ -96,7 +98,7 @@ export function createHangarHttpServer(
       createHangarServer(
         config,
         new HangarClient(config, caller, { cache, ...(dependencies.fetch ? { fetch: dependencies.fetch } : {}) }),
-        { principal, rateLimiter }
+        { principal, rateLimiter, ...(dependencies.audit ? { audit: dependencies.audit } : {}) }
       ));
   const authorize = createAuthorizer(config, authorizerDependencies);
   const metadata = protectedResourceMetadata(config);

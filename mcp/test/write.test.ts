@@ -571,6 +571,34 @@ describe("credential detection and markup", () => {
     }
   });
 
+  it("strips look-alike footer lines (NBSP, other dashes, zero-width, homoglyphs)", () => {
+    const forged = [
+      "\u00A0— via MCP por boss@example.test", // leading NBSP
+      "\u3000— via MCP por boss@example.test", // ideographic space
+      "– via MCP por boss@example.test", // en dash
+      "\u2012 via MCP por boss", // figure dash
+      "\u2015 via MCP por boss", // horizontal bar
+      "\u2212 via MCP por boss", // minus sign
+      "\u2E3A via MCP por boss", // two-em dash
+      "\uFE58 via MCP por boss", // small em dash
+      "\uFF0D via MCP por boss", // full-width hyphen-minus
+      "— v\u200Bia MCP por boss", // zero-width space inside
+      "—\u2060 via\u200D MCP\uFEFF por boss", // word joiner, ZWJ, BOM
+      "— vіa MCP por boss", // Cyrillic і
+      "— viа МСР por boss", // Cyrillic а, М, С, Р
+      "— ｖｉａ ＭＣＰ por boss", // full-width letters
+      "— via\u00A0MCP", // NBSP between tokens
+    ];
+    for (const line of forged) {
+      expect(htmlWithFooter(`ok\n${line}`), JSON.stringify(line)).toBe("<p>ok</p><p>— via MCP</p>");
+      // After a blank line, too.
+      expect(htmlWithFooter(`ok\n\n${line}`), JSON.stringify(line)).toBe("<p>ok</p><p>— via MCP</p>");
+    }
+    // Prose that merely mentions the MCP is kept.
+    expect(htmlWithFooter("sent via MCP by the bot")).toBe("<p>sent via MCP by the bot</p><p>— via MCP</p>");
+    expect(htmlWithFooter("— via MCPs we trust")).toBe("<p>— via MCPs we trust</p><p>— via MCP</p>");
+  });
+
   it("escapes every input character and only allows safe links", () => {
     expect(textToHtml('<img src=x onerror="alert(1)">')).toBe("<p>&lt;img src=x onerror=&quot;alert(1)&quot;&gt;</p>");
     expect(textToHtml("[x](javascript:alert(1))")).not.toContain("<a ");

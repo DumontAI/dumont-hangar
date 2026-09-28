@@ -11,6 +11,7 @@ import {
   SECRET_PROJECT,
   TEST_ACCESS_TOKEN,
   callerFor,
+  meUserIdFor,
   hangarFetch,
   jsonResponse,
   testConfig,
@@ -243,6 +244,44 @@ describe("Hangar client acts as the caller", () => {
     expect(aliceCalls.every((line) => line.endsWith("|Bearer alice-token"))).toBe(true);
   });
 
+  it("keeps each caller's Hangar user id apart in the shared cache", async () => {
+    const cache = new SubjectCache(60_000);
+    const alice = client({}, undefined, { cache, caller: callerFor(ALICE, "alice-token") }).client;
+    const bob = client({}, undefined, { cache, caller: callerFor(BOB, "bob-token") }).client;
+    const aliceId = await alice.currentUserId();
+    const bobId = await bob.currentUserId();
+    expect(aliceId).toBe(meUserIdFor("Bearer alice-token"));
+    expect(bobId).toBe(meUserIdFor("Bearer bob-token"));
+    expect(aliceId).not.toBe(bobId);
+    // Served from the cache afterwards, still per caller.
+    expect(await alice.currentUserId()).toBe(aliceId);
+    expect(bob.cachedUserId()).toBe(bobId);
+  });
+
+  it("reloads the caller's cached project list once before reporting a project as not found", async () => {
+    const cache = new SubjectCache(60_000);
+    let projects: unknown[] = [HGR_PROJECT];
+    let loads = 0;
+    const fetcher: Fetcher = async () => {
+      loads += 1;
+      return projectsPage(...projects);
+    };
+    const hangar = client({ allowedProjects: [] }, fetcher, { cache }).client;
+    await expect(hangar.resolveProject("HGR")).resolves.toMatchObject({ id: PROJECT_HGR });
+    expect(loads).toBe(1);
+    // Membership granted meanwhile: the stale cached list is refreshed once.
+    projects = [HGR_PROJECT, SECRET_PROJECT];
+    await expect(hangar.resolveProject("SEC")).resolves.toMatchObject({ id: PROJECT_SEC });
+    expect(loads).toBe(2);
+    // A project that really does not exist: one reload, then PROJECT_NOT_FOUND.
+    await expect(hangar.resolveProject("NOPE")).rejects.toMatchObject({ code: "PROJECT_NOT_FOUND" });
+    expect(loads).toBe(3);
+    // A fresh (uncached) miss does not reload twice.
+    const other = client({ allowedProjects: [] }, fetcher, { caller: callerFor(BOB) }).client;
+    await expect(other.resolveProject("NOPE")).rejects.toMatchObject({ code: "PROJECT_NOT_FOUND" });
+    expect(loads).toBe(4);
+  });
+
   it("binds pagination cursors to the caller subject", async () => {
     const cache = new SubjectCache(60_000);
     const twoProjects: Fetcher = async () => projectsPage(HGR_PROJECT, SECRET_PROJECT);
@@ -293,7 +332,8 @@ describe("Hangar client maps Hangar errors for the user", () => {
       caller: callerFor(ALICE, TEST_ACCESS_TOKEN, nowMs / 1000 + 5),
       now: () => nowMs,
     }).client;
-    await expect(expiring.listProjects(10)).rejects.toMatchObject({ code: "TOKEN_EXPIRED", retryable: true });
+    // Not retryable with the same token: the authorizer 401s it on the next request.
+    await expect(expiring.listProjects(10)).rejects.toMatchObject({ code: "TOKEN_EXPIRED", retryable: false });
   });
 
   it("maps writer-role, project and managed 403s", async () => {
@@ -355,6 +395,10 @@ describe("per-subject cache", () => {
     cache.set("c", "me", "3");
     expect(cache.size).toBe(2);
     expect(cache.get("a", "me")).toBeUndefined();
+    expect(cache.get("c", "me")).toBe("3");
+    cache.set("c", "projects", ["C"]);
+    cache.forget("c", "projects");
+    expect(cache.get("c", "projects")).toBeUndefined();
     expect(cache.get("c", "me")).toBe("3");
     const off = new SubjectCache(0);
     off.set("a", "me", "1");

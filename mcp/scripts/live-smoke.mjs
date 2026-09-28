@@ -4,8 +4,9 @@
 //
 // The MCP forwards this token to Hangar and acts as its user, so it must be a
 // JWT from the pinned public client, and that user must have signed in once
-// to Hangar web with Dumont login. The project list is what THAT user sees
-// (0 is a valid answer for a user without projects). A tool error prints its
+// to Hangar web with Dumont login. project_count is how many projects THAT
+// user sees, capped at 50 (the tool's page limit; 0 is a valid answer for a
+// user without projects). A tool error prints its
 // code, e.g. HANGAR_PROJECTS_READ_FAILED:ACCOUNT_NOT_LINKED.
 const endpoint = process.env.MCP_URL?.trim() || `http://127.0.0.1:${process.env.MCP_HTTP_PORT || "3014"}/mcp`;
 const token = process.env.MCP_AUTH_TOKEN?.trim() || "";
@@ -98,7 +99,7 @@ const call = await rpc({
   jsonrpc: "2.0",
   id: 3,
   method: "tools/call",
-  params: { name: "hangar_list_projects", arguments: { limit: 1, response_format: "json" } },
+  params: { name: "hangar_list_projects", arguments: { limit: 50, response_format: "json" } },
 });
 const structured = call?.body?.result?.structuredContent;
 if (call?.body?.result?.isError === true) {

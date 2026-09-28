@@ -53,9 +53,12 @@ export class SubjectCache {
     this.subjects.set(subject, entries);
   }
 
-  /** Drops everything cached for one subject (for example after Hangar refused it). */
-  forget(subject: string): void {
-    this.subjects.delete(subject);
+  /** Drops one cached entry of one subject (e.g. a project list that missed). */
+  forget(subject: string, key: SubjectCacheKey): void {
+    const entries = this.subjects.get(subject);
+    if (!entries) return;
+    entries.delete(key);
+    if (entries.size === 0) this.subjects.delete(subject);
   }
 
   get size(): number {

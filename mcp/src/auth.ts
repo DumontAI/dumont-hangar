@@ -7,6 +7,13 @@ import type { HangarConfig, Principal } from "./types.js";
 const MAX_BEARER_BYTES = 16 * 1024;
 // Small allowance for clock skew between this host and the issuer on `nbf`.
 const NOT_BEFORE_TOLERANCE_SECONDS = 30;
+/**
+ * A JWS access token is forwarded to Hangar, so it must still be valid there
+ * for the whole tool call: a token with at most this many seconds left is
+ * answered with the regular 401 challenge (the client refreshes) instead of
+ * being forwarded and failing upstream.
+ */
+export const MIN_TOKEN_LIFETIME_SECONDS = 30;
 const BASE64URL_SEGMENT = /^[A-Za-z0-9_-]*$/;
 const ACCESS_TOKEN_TYPES = new Set(["bearer", "access_token", "urn:ietf:params:oauth:token-type:access_token"]);
 
@@ -268,7 +275,12 @@ function createOidcVerifier(config: HangarConfig, dependencies: AuthorizerDepend
       });
       // `nonce`/`at_hash` only appear in ID tokens; never accept one as an access token.
       if (payload.nonce !== undefined || payload.at_hash !== undefined) return invalidCredentials();
-      const result = evaluateAccessClaims(payload, config, Math.floor(now() / 1000));
+      const nowSeconds = Math.floor(now() / 1000);
+      // About to expire: 401 now, so the client refreshes before anything is forwarded.
+      if (typeof payload.exp !== "number" || payload.exp <= nowSeconds + MIN_TOKEN_LIFETIME_SECONDS) {
+        return invalidCredentials();
+      }
+      const result = evaluateAccessClaims(payload, config, nowSeconds);
       // Only a locally verified RS256 JWS access token is ever forwarded to Hangar.
       return result.failure ? result : { ...result, upstreamToken: token };
     } catch {

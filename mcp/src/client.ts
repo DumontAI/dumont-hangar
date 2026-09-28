@@ -1,4 +1,5 @@
 import { createHmac } from "node:crypto";
+import { MIN_TOKEN_LIFETIME_SECONDS } from "./auth.js";
 import { SubjectCache } from "./cache.js";
 import { decodeCursor, encodeCursor, type CursorState } from "./cursor.js";
 import type { HangarConfig, UpstreamCaller } from "./types.js";
@@ -13,9 +14,11 @@ export type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Res
 const PLANE_ACCOUNT_NOT_LINKED = "DUMONT_ACCOUNT_NOT_LINKED";
 const PLANE_WRITER_ROLE_REQUIRED = "DUMONT_WRITER_ROLE_REQUIRED";
 const PLANE_MANAGED_BY_ZITADEL = "DUMONT_MANAGED_BY_ZITADEL";
-// A Plane 401 this close to (or past) the token `exp` is treated as expiry:
-// Plane and this host may disagree by a few seconds.
-const EXPIRY_MARGIN_SECONDS = 60;
+// A Plane 401 this close to (or past) the token `exp` is treated as expiry.
+// The authorizer already refuses (HTTP 401) tokens with this little lifetime
+// left, so this only triggers when a call outlives that margin or the clocks
+// of Hangar and this host disagree.
+const EXPIRY_MARGIN_SECONDS = MIN_TOKEN_LIFETIME_SECONDS;
 const PROJECT_IDENTIFIER = /^[A-Z][A-Z0-9]{1,9}$/;
 
 type Operation = "read" | "write";
@@ -121,13 +124,17 @@ export class HangarClient {
     if (!value || value.length > 64) {
       throw new HangarError("INVALID_ARGUMENT", "project has an invalid format");
     }
-    const projects = await this.loadProjects();
-    let project: ProjectRecord | undefined;
-    if (PROJECT_UUID.test(value)) {
-      project = projects.find((item) => item.id.toLowerCase() === value.toLowerCase());
-    } else {
-      const identifier = value.toUpperCase();
-      project = projects.find((item) => item.identifier === identifier);
+    const find = (projects: readonly ProjectRecord[]) =>
+      PROJECT_UUID.test(value)
+        ? projects.find((item) => item.id.toLowerCase() === value.toLowerCase())
+        : projects.find((item) => item.identifier === value.toUpperCase());
+    const cached = this.cache.get<ProjectRecord[]>(this.caller.sub, "projects") !== undefined;
+    let project = find(await this.loadProjects());
+    if (!project && cached) {
+      // The cached list may predate a new membership (e.g. a role just granted
+      // in Dumont Auth): drop this caller's entry and ask Hangar once more.
+      this.cache.forget(this.caller.sub, "projects");
+      project = find(await this.loadProjects());
     }
     if (!project) {
       const identifier = value.toUpperCase();
@@ -658,8 +665,10 @@ export class HangarClient {
   /**
    * Maps a Hangar error to a tool error. None of these becomes an HTTP 401 of
    * this MCP (that would restart the client's login loop for a problem a new
-   * login cannot fix); an expired token is reported as retryable TOKEN_EXPIRED
-   * and the next MCP request with it gets the regular 401 challenge.
+   * login cannot fix). A token at (or within the margin of) its `exp` is
+   * reported as TOKEN_EXPIRED, not retryable with the same token: the next MCP
+   * request with it gets the regular 401 challenge from the authorizer, which
+   * makes the client refresh, so this cannot loop.
    * `projectIdentifier` names the project the call was scoped to, if any.
    */
   private upstreamError(
@@ -679,8 +688,7 @@ export class HangarClient {
       if (this.tokenExpiring()) {
         return new HangarError(
           "TOKEN_EXPIRED",
-          "Your Dumont access token expired; retry and your MCP client will be asked to refresh the login",
-          true
+          "Your Dumont access token expired during this call and Hangar refused it (nothing was changed). Your MCP client will be asked to refresh the login on its next request"
         );
       }
       return new HangarError(

@@ -5,7 +5,8 @@ import { createAuthorizer, protectedResourceMetadata } from "../src/auth.js";
 import { HangarClient } from "../src/client.js";
 import { createHangarHttpServer } from "../src/http.js";
 import { createHangarServer } from "../src/tools.js";
-import { hangarFetch, jsonResponse, PROJECT_HGR, testConfig } from "./fixtures.js";
+import type { AuditRecord } from "../src/access.js";
+import { hangarFetch, jsonResponse, meUserIdFor, PROJECT_HGR, testConfig } from "./fixtures.js";
 
 const openServers: Server[] = [];
 
@@ -118,6 +119,15 @@ describe("OIDC authorization", () => {
     const expired = await token({}, "hangar-mcp-project", "https://issuer.example.test", "0s");
     const expiredRequest = { headers: { host: "127.0.0.1", authorization: `Bearer ${expired}` } } as never;
     expect((await authorize(expiredRequest)).failure).toBe("invalid_credentials");
+
+    // Valid but with 30 s or less left: 401 now, so the client refreshes
+    // before the token is forwarded to Hangar.
+    const expiring = await token({}, "hangar-mcp-project", "https://issuer.example.test", "20s");
+    const expiringRequest = { headers: { host: "127.0.0.1", authorization: `Bearer ${expiring}` } } as never;
+    expect((await authorize(expiringRequest)).failure).toBe("invalid_credentials");
+    const fresh = await token({}, "hangar-mcp-project", "https://issuer.example.test", "45s");
+    const freshRequest = { headers: { host: "127.0.0.1", authorization: `Bearer ${fresh}` } } as never;
+    expect((await authorize(freshRequest)).failure).toBeNull();
   });
 
   it("rejects ID tokens (nonce or at_hash) on the JWS path", async () => {
@@ -274,7 +284,8 @@ describe("OIDC authorization", () => {
       }
       return reads(input, init);
     };
-    const server = createHangarHttpServer(config, undefined, {}, { fetch });
+    const audit: AuditRecord[] = [];
+    const server = createHangarHttpServer(config, undefined, {}, { fetch, audit: (record) => audit.push(record) });
     const port = await listen(server);
     const post = (bearer: string, id: number, name: string, args: Record<string, unknown>) =>
       globalThis.fetch(`http://127.0.0.1:${port}/mcp`, {
@@ -302,6 +313,13 @@ describe("OIDC authorization", () => {
     expect(bobCalls.every((call) => call.authorization === `Bearer ${bobToken}`)).toBe(true);
     expect(bobCalls.map((call) => call.path)).toContain("/api/v1/workspaces/dumont/projects/");
     expect(upstream.some((call) => /x-api-key/i.test(call.authorization))).toBe(false);
+    // Each audit line names the Hangar user behind that request's own token,
+    // even though both requests share the process-wide per-subject cache.
+    expect(audit.map((record) => [record.sub, record.plane_user_id])).toEqual([
+      ["alice", meUserIdFor(`Bearer ${aliceToken}`)],
+      ["bob", meUserIdFor(`Bearer ${bobToken}`)],
+    ]);
+    expect(meUserIdFor(`Bearer ${aliceToken}`)).not.toBe(meUserIdFor(`Bearer ${bobToken}`));
   });
 
   it("turns Hangar's 'account not linked' 401 into a tool error, not an MCP 401", async () => {
