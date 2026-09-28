@@ -225,3 +225,18 @@ class TestIntrospectionConfig:
         )
         assert config.enabled is False
         assert config.introspection_enabled is False
+
+
+@pytest.mark.unit
+class TestIntrospectionBudgetConfig:
+    def test_default(self):
+        assert load_bearer_config(WITH_INTROSPECTION).introspection_budget_per_minute == 300
+
+    def test_override(self):
+        config = load_bearer_config({**WITH_INTROSPECTION, "DUMONT_API_INTROSPECTION_BUDGET_PER_MINUTE": " 50 "})
+        assert config.introspection_budget_per_minute == 50
+
+    @pytest.mark.parametrize("value", ["0", "-1", "1.5", "lots", "100001", "²"])
+    def test_invalid(self, value):
+        with pytest.raises(BearerConfigError, match="DUMONT_API_INTROSPECTION_BUDGET_PER_MINUTE"):
+            load_bearer_config({**WITH_INTROSPECTION, "DUMONT_API_INTROSPECTION_BUDGET_PER_MINUTE": value})

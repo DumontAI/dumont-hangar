@@ -14,6 +14,8 @@ from django.core.exceptions import ImproperlyConfigured
 DEFAULT_AUTH_HOST = "https://auth.getdumont.ai"
 DEFAULT_READER_ROLE = "hangar_reader"
 DEFAULT_WRITER_ROLE = "hangar_writer"
+DEFAULT_INTROSPECTION_BUDGET_PER_MINUTE = 300
+MAX_INTROSPECTION_BUDGET_PER_MINUTE = 100_000
 LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 # Sent on every request to Dumont Auth (ZITADEL): JWKS, introspection, the access sync client.
 # auth.getdumont.ai sits behind Cloudflare, which answers 403 to the default `Python-urllib/3.x`
@@ -45,6 +47,8 @@ class BearerConfig:
     introspection_url: str = ""
     introspection_client_id: str = ""
     introspection_client_secret: str = field(default="", repr=False)
+    # Issuer calls (cache misses) allowed per minute across all processes; past it, 503.
+    introspection_budget_per_minute: int = DEFAULT_INTROSPECTION_BUDGET_PER_MINUTE
 
     @property
     def introspection_enabled(self):
@@ -183,6 +187,16 @@ def load_bearer_config(environ, default_rate="60/minute"):
     web_url = (environ.get("WEB_URL") or environ.get("APP_BASE_URL") or "").strip().rstrip("/")
 
     introspection_url, introspection_client_id, introspection_client_secret = _introspection(environ, auth_host, issuer)
+    budget_raw = (environ.get("DUMONT_API_INTROSPECTION_BUDGET_PER_MINUTE") or "").strip()
+    if not budget_raw:
+        introspection_budget = DEFAULT_INTROSPECTION_BUDGET_PER_MINUTE
+    elif budget_raw.isascii() and budget_raw.isdigit() and 0 < int(budget_raw) <= MAX_INTROSPECTION_BUDGET_PER_MINUTE:
+        introspection_budget = int(budget_raw)
+    else:
+        raise BearerConfigError(
+            "DUMONT_API_INTROSPECTION_BUDGET_PER_MINUTE must be a whole number from 1 to "
+            f"{MAX_INTROSPECTION_BUDGET_PER_MINUTE}"
+        )
 
     return BearerConfig(
         enabled=True,
@@ -197,4 +211,5 @@ def load_bearer_config(environ, default_rate="60/minute"):
         introspection_url=introspection_url,
         introspection_client_id=introspection_client_id,
         introspection_client_secret=introspection_client_secret,
+        introspection_budget_per_minute=introspection_budget,
     )

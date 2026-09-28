@@ -276,11 +276,11 @@ class TestIntrospectionRejected:
         assert_invalid(bearer_client(token).get(ME), token)
         assert len(fake_introspection.calls) == 1
 
-    @pytest.mark.parametrize("active", [DROP, False, "true", 1, None])
+    @pytest.mark.parametrize("active", [False, "true", 1, None])
     def test_only_active_true_counts(self, introspection_enabled, linked_account, fake_introspection, active):
+        # (A 200 without `active` at all is not an answer: 503, see TestIntrospectionUnavailable.)
         claims = introspection_claims()
-        if active is not DROP:
-            claims["active"] = active
+        claims["active"] = active
         fake_introspection.raw = json.dumps(claims).encode()
         token = opaque_token()
         assert_invalid(bearer_client(token).get(ME), token)
@@ -427,8 +427,11 @@ class TestIntrospectionUnavailable:
         [
             {"fail": True},
             {"status": 500},
-            {"status": 401},
-            {"status": 400},
+            {"status": 502},
+            {"status": 401},  # our client credentials are wrong: never read as "token inactive"
+            {"status": 403},
+            {"status": 408},
+            {"status": 429},
             {"status": 302},
             {"status": 201},
             {"raw": b"<html>garbage</html>"},
@@ -437,12 +440,19 @@ class TestIntrospectionUnavailable:
             {"raw": b'"active"'},
             {"raw": b"\xff\xfe"},
             {"raw": b"{" + b" " * (64 * 1024 + 1) + b"}"},
+            {"raw": b"[" * 40000},  # nesting deep enough for RecursionError, well inside the size cap
+            {"raw": b'{"token_type": "Bearer"}'},  # 200 without `active`
+            {"raw": b'{"error": "invalid_client"}'},
+            {"raw": b'{"active": true, "error": "server_error"}'},
         ],
         ids=[
             "down",
             "500",
+            "502",
             "401",
-            "400",
+            "403",
+            "408",
+            "429",
             "302",
             "201",
             "html",
@@ -451,20 +461,101 @@ class TestIntrospectionUnavailable:
             "string",
             "not-utf8",
             "too-large",
+            "deep-nesting",
+            "no-active",
+            "error-object",
+            "active-with-error",
         ],
     )
-    def test_is_503_and_not_cached(self, introspection_enabled, linked_account, issue, fake_introspection, setup):
+    def test_is_503_not_cached_and_backs_off(
+        self, introspection_enabled, linked_account, issue, fake_introspection, setup
+    ):
         token = issue()
         for name, value in setup.items():
             setattr(fake_introspection, name, value)
         assert_unavailable(bearer_client(token).get(ME), token)
+        assert cache.get(introspection_module._cache_key(token)) is None  # never cached
+        # Backoff: the next miss answers 503 without calling the issuer again.
         assert_unavailable(bearer_client(token).get(ME), token)
-        # Never cached: each request asked the issuer again.
-        assert len(fake_introspection.calls) == 2
-        assert cache.get(introspection_module._cache_key(token)) is None
-        # Issuer back: the same token works at once.
+        assert len(fake_introspection.calls) == 1
+        # Backoff over (its cache key expired) and issuer back: the same token works at once.
+        cache.delete(introspection_module.BACKOFF_KEY)
         fake_introspection.fail, fake_introspection.status, fake_introspection.raw = False, 200, None
         assert bearer_client(token).get(ME).status_code == status.HTTP_200_OK
+        assert len(fake_introspection.calls) == 2
+
+    def test_backoff_lasts_10_seconds(self, introspection_enabled, linked_account, issue, fake_introspection):
+        fake_introspection.fail = True
+        token = issue()
+        assert_unavailable(bearer_client(token).get(ME), token)
+        assert 0 < cache.ttl(introspection_module.BACKOFF_KEY) <= 10
+
+    def test_cache_hits_still_work_during_backoff(
+        self, introspection_enabled, linked_account, issue, fake_introspection
+    ):
+        good = issue()
+        dead = opaque_token()
+        assert bearer_client(good).get(ME).status_code == status.HTTP_200_OK
+        assert_invalid(bearer_client(dead).get(ME), dead)
+        fake_introspection.fail = True
+        failing = issue()
+        assert_unavailable(bearer_client(failing).get(ME), failing)
+        calls = len(fake_introspection.calls)
+        # Cached answers keep working (positive and negative) and cost no issuer call.
+        assert bearer_client(good).get(ME).status_code == status.HTTP_200_OK
+        assert_invalid(bearer_client(dead).get(ME), dead)
+        assert len(fake_introspection.calls) == calls
+
+    @pytest.mark.parametrize("http_status", [400, 404, 422])
+    def test_other_4xx_is_inactive_and_cached(
+        self, introspection_enabled, linked_account, issue, fake_introspection, http_status
+    ):
+        fake_introspection.status = http_status
+        token = issue()
+        assert_invalid(bearer_client(token).get(ME), token)
+        assert_invalid(bearer_client(token).get(ME), token)
+        assert len(fake_introspection.calls) == 1
+        assert cache.get(introspection_module._cache_key(token)) == {"active": False}
+        assert cache.get(introspection_module.BACKOFF_KEY) is None  # not an issuer failure
+
+    def test_budget_exhaustion_is_503_without_issuer_call(
+        self, introspection_enabled, linked_account, issue, fake_introspection, settings, monkeypatch
+    ):
+        settings.DUMONT_API_BEARER = introspection_config(introspection_budget_per_minute=2)
+        monkeypatch.setattr(introspection_module, "_budget_window", lambda: 1000)
+        good = issue()
+        dead = opaque_token()
+        assert bearer_client(good).get(ME).status_code == status.HTTP_200_OK
+        assert_invalid(bearer_client(dead).get(ME), dead)
+        third = issue()
+        assert_unavailable(bearer_client(third).get(ME), third)
+        assert len(fake_introspection.calls) == 2
+        assert cache.get(introspection_module._cache_key(third)) is None
+        # Budget spent is not an issuer failure: no backoff.
+        assert cache.get(introspection_module.BACKOFF_KEY) is None
+        # Cache hits keep working while the budget is spent.
+        assert bearer_client(good).get(ME).status_code == status.HTTP_200_OK
+        assert_invalid(bearer_client(dead).get(ME), dead)
+        assert len(fake_introspection.calls) == 2
+        # Next minute: a fresh budget.
+        monkeypatch.setattr(introspection_module, "_budget_window", lambda: 1001)
+        assert bearer_client(third).get(ME).status_code == status.HTTP_200_OK
+        assert len(fake_introspection.calls) == 3
+
+    def test_budget_is_logged_once_per_window(
+        self, introspection_enabled, linked_account, fake_introspection, settings, monkeypatch, log_records
+    ):
+        settings.DUMONT_API_BEARER = introspection_config(introspection_budget_per_minute=1)
+        monkeypatch.setattr(introspection_module, "_budget_window", lambda: 2000)
+        for _ in range(4):
+            bearer_client(opaque_token()).get(ME)
+        assert len(fake_introspection.calls) == 1
+        # Distinct records: the capture handler sits on the logger and on root, so a propagated
+        # record is seen twice.
+        exhausted = {
+            id(r) for r in log_records.records if r.getMessage() == "dumont bearer: introspection budget exhausted"
+        }
+        assert len(exhausted) == 1
 
     def test_real_http_client_refuses_redirects_and_errors(self):
         """_http_post itself against a loopback server: redirects are not followed, errors keep their status."""

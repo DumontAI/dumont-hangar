@@ -37,6 +37,16 @@ POSITIVE_CACHE_SECONDS = 60
 # every retry into a call to the issuer.
 NEGATIVE_CACHE_SECONDS = 30
 CACHE_KEY_PREFIX = "dumont_bearer:introspection:v1:"
+# Process-shared (Django cache) guards on calls to the issuer. Cache hits never consume them.
+# - A per-minute budget of cache misses (DUMONT_API_INTROSPECTION_BUDGET_PER_MINUTE): past it,
+#   misses answer 503 until the next minute, so a flood of fresh tokens cannot hammer the issuer.
+# - After a failed call, misses answer 503 for FAILURE_BACKOFF_SECONDS without calling it again.
+BUDGET_KEY_PREFIX = "dumont_bearer:introspection:budget:"
+BACKOFF_KEY = "dumont_bearer:introspection:backoff"
+FAILURE_BACKOFF_SECONDS = 10
+# A 4xx answer is about the token (cached as inactive, 401) except these, which are about our call:
+# 401/403 mean our client credentials are wrong, 408/429 mean "try later". Those are 503.
+_CALL_PROBLEM_STATUSES = frozenset({401, 403, 408, 429})
 
 _INACTIVE = {"active": False}
 
@@ -161,17 +171,69 @@ def _call_issuer(token, config):
     except Exception:
         # Deliberately no exc_info: frame locals hold the token and the Basic credentials.
         raise IntrospectionUnavailable("request_failed") from None
+    if 400 <= status < 500 and status not in _CALL_PROBLEM_STATUSES:
+        # The issuer refused this token (e.g. 400 for a token it cannot parse): an inactive answer.
+        return dict(_INACTIVE)
     if status != 200:
         raise IntrospectionUnavailable("http_error", status)
     if len(raw) > MAX_INTROSPECTION_BYTES:
         raise IntrospectionUnavailable("too_large", status)
     try:
         payload = json.loads(raw)
-    except (ValueError, UnicodeDecodeError):
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        # RecursionError: deeply nested JSON (e.g. 40k "[") well inside the size cap.
         raise IntrospectionUnavailable("invalid_response", status) from None
     if not isinstance(payload, dict):
         raise IntrospectionUnavailable("invalid_response", status)
+    if "active" not in payload or "error" in payload:
+        # RFC 7662 requires `active`; an OAuth error object on a 200 is not an answer either.
+        raise IntrospectionUnavailable("invalid_response", status)
     return payload
+
+
+def _budget_window():
+    """The current budget window (one per wall-clock minute). Tests replace this."""
+    return int(time.time() // 60)
+
+
+def _take_budget(config):
+    """Count one issuer call against this minute's budget. True when it is within the budget.
+
+    A cache outage lets the call through (fail open to the issuer, never to acceptance): the
+    token is still fully checked, and ZITADEL's own rate limits remain.
+    """
+    window = _budget_window()
+    key = f"{BUDGET_KEY_PREFIX}{window}"
+    try:
+        cache.add(key, 0, 120)
+        count = cache.incr(key)
+    except Exception:
+        logger.warning("dumont bearer: introspection budget unavailable (cache error)")
+        return True
+    if count <= config.introspection_budget_per_minute:
+        return True
+    try:
+        # One log line per window, not one per refused request.
+        first = cache.add(f"{BUDGET_KEY_PREFIX}logged:{window}", 1, 120)
+    except Exception:
+        first = False
+    if first:
+        logger.warning(
+            "dumont bearer: introspection budget exhausted",
+            extra={"reason": "budget_exhausted", "budget_per_minute": config.introspection_budget_per_minute},
+        )
+    return False
+
+
+def _in_backoff():
+    try:
+        return bool(cache.get(BACKOFF_KEY))
+    except Exception:
+        return False
+
+
+def _start_backoff():
+    _cache_set(BACKOFF_KEY, 1, FAILURE_BACKOFF_SECONDS)
 
 
 def _positive_ttl(claims, now):
@@ -185,18 +247,25 @@ def _positive_ttl(claims, now):
 def introspect(token, config):
     """The introspection claims when ZITADEL says the token is active, None when it is not.
 
-    Raises IntrospectionUnavailable when the issuer could not answer usably; that outcome is
-    never cached. The caller still runs every claim check on the returned claims (issuer,
-    audience, lifetime, subject, org-bound roles), on a cache hit too.
+    Raises IntrospectionUnavailable when the issuer could not answer usably, during the backoff
+    after such a failure, or when this minute's call budget is spent; that outcome is never
+    cached. Cache hits are answered in all three cases. The caller still runs every claim check
+    on the returned claims (issuer, audience, lifetime, subject, org-bound roles), on a hit too.
     """
     key = _cache_key(token)
     cached = _cache_get(key)
     if isinstance(cached, dict):
         return cached if cached.get("active") is True else None
 
+    if _in_backoff():
+        raise IntrospectionUnavailable("backoff")
+    if not _take_budget(config):
+        raise IntrospectionUnavailable("budget_exhausted")
+
     try:
         payload = _call_issuer(token, config)
     except IntrospectionUnavailable as error:
+        _start_backoff()
         logger.warning(
             "dumont bearer: introspection unavailable",
             extra={"reason": error.reason, "http_status": error.http_status},
