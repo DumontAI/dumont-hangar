@@ -58,8 +58,9 @@ that other organization would pass. So a role counts only when:
 
 - Fetched from `DUMONT_AUTH_JWKS_URL` (same origin as the issuer, no redirects, 5 s timeout,
   256 KiB cap), refreshed every 5 minutes.
-- Every request to Dumont Auth (JWKS, introspection, and the membership sync's ZITADEL client and
-  bootstrap script) sends `User-Agent: dumont-hangar-api (+https://hangar.getdumont.ai)`
+- Every request Hangar makes to Dumont Auth (JWKS, introspection, the web login's token and
+  userinfo calls via `DumontOAuthProvider.request_headers`, and the membership sync's ZITADEL
+  client and bootstrap script) sends `User-Agent: dumont-hangar-api (+https://hangar.getdumont.ai)`
   (`USER_AGENT` in `config.py`). `auth.getdumont.ai` sits behind Cloudflare, which answers 403 to
   urllib's default `Python-urllib/3.x`: without the explicit header every JWKS fetch failed and
   every bearer request got 503 `DUMONT_AUTH_UNAVAILABLE`. Never rely on a library's default.

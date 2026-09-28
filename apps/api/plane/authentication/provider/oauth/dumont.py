@@ -11,6 +11,7 @@ import pytz
 
 # Module imports
 from plane.authentication.adapter.oauth import OauthAdapter
+from plane.dumont.auth.config import USER_AGENT
 from plane.license.utils.instance_value import get_configuration_value
 from plane.authentication.adapter.error import (
     AUTHENTICATION_ERROR_CODES,
@@ -70,6 +71,9 @@ class DumontOAuthProvider(OauthAdapter):
     # With the org check off (default) the request is exactly what it was before the check existed.
     scope = BASE_SCOPE
     provider = "dumont"
+    # Explicit User-Agent on the token and userinfo calls: Cloudflare in front of Dumont Auth
+    # blocks some library-default User-Agents (plane/dumont/auth/README.md).
+    request_headers = {"User-Agent": USER_AGENT}
 
     def __init__(self, request, code=None, state=None, callback=None):
         # Per instance: the resourceowner scope only when the org check is on (raises 5113 when misconfigured).

@@ -228,3 +228,51 @@ class TestDumontOrgBoundaryBeforeAnyUser:
     def test_unset_reaches_the_login_without_the_claim(self, monkeypatch):
         provider, reached = self._authenticate(_userinfo(), monkeypatch)
         assert provider.authenticate() == "logged-in" and reached == [True]
+
+
+class _FakeResponse:
+    def __init__(self, body):
+        self._body = body
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._body
+
+
+@pytest.mark.unit
+class TestDumontUserAgent:
+    """Cloudflare in front of Dumont Auth blocks some library-default User-Agents."""
+
+    def test_token_and_userinfo_requests_send_the_explicit_user_agent(self, monkeypatch):
+        from plane.authentication.adapter import oauth as oauth_module
+        from plane.dumont.auth.config import USER_AGENT
+
+        seen = []
+        monkeypatch.setattr(
+            oauth_module.requests,
+            "post",
+            lambda url, data=None, headers=None: seen.append(("post", url, dict(headers))) or _FakeResponse({}),
+        )
+        monkeypatch.setattr(
+            oauth_module.requests,
+            "get",
+            lambda url, headers=None: seen.append(("get", url, dict(headers))) or _FakeResponse({}),
+        )
+        provider = object.__new__(DumontOAuthProvider)
+        provider.get_user_token(data={"code": "x"})
+        provider.token_data = {"access_token": "at"}
+        provider.get_user_response()
+        assert [(method, headers.get("User-Agent")) for method, _, headers in seen] == [
+            ("post", USER_AGENT),
+            ("get", USER_AGENT),
+        ]
+        assert seen[1][2]["Authorization"] == "Bearer at"
+
+    def test_upstream_providers_are_unchanged(self):
+        from plane.authentication.adapter.oauth import OauthAdapter
+        from plane.authentication.provider.oauth.github import GitHubOAuthProvider
+
+        assert OauthAdapter.request_headers == {}
+        assert GitHubOAuthProvider.request_headers == {}
