@@ -1,5 +1,5 @@
 [Unit]
-Description=Dumont Hangar read-only MCP server
+Description=Dumont Hangar MCP server (reads + role-gated writes)
 Documentation=https://github.com/DumontAI/dumont-hangar/tree/dumont/mcp
 After=network-online.target
 Wants=network-online.target
