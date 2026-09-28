@@ -22,7 +22,7 @@ from rest_framework import status
 from rest_framework.response import Response
 
 from plane.dumont.access import roles as R
-from plane.dumont.access.config import MODE_ENFORCE, AccessConfigError, load_access_config
+from plane.dumont.access.config import MODE_DRY_RUN, MODE_ENFORCE, MODE_OFF, AccessConfigError, load_access_config
 
 logger = logging.getLogger("plane.dumont.access")
 
@@ -46,7 +46,8 @@ WORKSPACE_MEMBER_PREFERENCE_FIELDS = frozenset(
 
 
 class _InvalidConfig:
-    """DUMONT_ACCESS_SYNC (or another DUMONT_ACCESS_* value) cannot be parsed. The lock fails closed:
+    """The configuration cannot be parsed and the mode is enforce or itself invalid (a typo in
+    DUMONT_ACCESS_SYNC, or enforce with a bad DUMONT_ACCESS_MAX_REMOVALS). The lock fails closed:
     membership changes in the configured workspace (every workspace when even the slug is unknown)
     answer 503 until the value is fixed, instead of silently reading as `off`."""
 
@@ -64,6 +65,12 @@ def _enforce_config():
     try:
         cfg = load_access_config()
     except AccessConfigError as exc:
+        raw_mode = (os.environ.get("DUMONT_ACCESS_SYNC") or MODE_OFF).strip().lower()
+        if raw_mode in (MODE_OFF, MODE_DRY_RUN):
+            # The mode itself says "do not lock": another bad value (e.g. DUMONT_ACCESS_MAX_REMOVALS)
+            # is logged, but it must not lock anything.
+            logger.error("dumont access: invalid configuration (mode %s, endpoints not locked): %s", raw_mode, exc)
+            return None
         logger.error("dumont access: invalid configuration, membership changes fail closed (503): %s", exc)
         return _InvalidConfig(str(exc))
     if cfg.mode != MODE_ENFORCE or not cfg.workspace_slug:

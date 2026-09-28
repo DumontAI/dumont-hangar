@@ -348,6 +348,23 @@ class TestLock:
         response = _call(setup, *LOCKED_CASES[0][1:])
         assert response.status_code != 503
 
+    @pytest.mark.parametrize("mode", ["off", "dry-run"])
+    def test_bad_other_value_does_not_lock_when_mode_says_no_lock(self, setup, monkeypatch, caplog, mode):
+        # reviewer probe: a valid off/dry-run mode with a bad DUMONT_ACCESS_MAX_REMOVALS used to 503
+        # every membership change (in every workspace when the slug was unset)
+        from types import SimpleNamespace
+
+        from plane.dumont.access import guard as G
+
+        monkeypatch.setenv("DUMONT_ACCESS_SYNC", mode)
+        monkeypatch.setenv("DUMONT_ACCESS_MAX_REMOVALS", "five")
+        caplog.set_level("ERROR", logger="plane.dumont.access")
+        response = _call(setup, *LOCKED_CASES[0][1:])
+        assert response.status_code != 503
+        monkeypatch.delenv("DUMONT_ACCESS_WORKSPACE_SLUG")
+        assert G.workspace_lock_response(SimpleNamespace(data={}), ["some-other-workspace"]) is None
+        assert any("invalid configuration" in r.getMessage() for r in caplog.records)  # still loud
+
     def test_enforce_without_org_id_fails_closed(self, setup, monkeypatch):
         # DUMONT_ZITADEL_ORG_ID is required: without it the lock cannot learn the managed scopes
         # and answers 503 instead of letting a change through; ZITADEL is never called.
