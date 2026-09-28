@@ -70,6 +70,7 @@ class FakeZitadel(requests.adapters.BaseAdapter):
         self.drop_result_on = None  # path substring: answer 200 without the `result` key
         self.truncate_after = None  # rows served before pages come back empty (totalResult stays honest)
         self.filter_users = False  # users/_search by id answers 200 with no rows (permission-filtered)
+        self.raw_body_on = None  # (path substring, body): answer 200 with exactly this JSON body
         self.expires_in = 43199
 
     # helpers for tests
@@ -226,6 +227,8 @@ class FakeZitadel(requests.adapters.BaseAdapter):
             body["details"] = {"totalResult": str(len(rows))}
         if self.drop_result_on and self.drop_result_on in urlparse(request.url).path:
             body.pop("result")
+        if self.raw_body_on and self.raw_body_on[0] in urlparse(request.url).path:
+            body = self.raw_body_on[1]  # an exact response body, for response-shape tests
         return _response(request, 200, body)
 
     def close(self):

@@ -123,6 +123,35 @@ class TestZitadelClient:
             client.list_user_grants(PROJECT_ID)
         assert "no 'result'" in str(exc.value)
 
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {"details": {"viewTimestamp": "2026-09-28T00:00:00Z"}},  # no totalResult at all
+            {"details": {"totalResult": "0"}},  # uint64 as a string
+            {"details": {"totalResult": 0}},
+        ],
+    )
+    def test_omitted_result_with_zero_total_is_empty(self, client, fake_zitadel, body):
+        # proto3 JSON without EmitUnpopulated omits an empty `result` (and a zero totalResult)
+        fake_zitadel.raw_body_on = ("roles", body)
+        assert client.list_project_role_keys(PROJECT_ID) == []
+
+    @pytest.mark.parametrize(
+        "body,message",
+        [
+            ({"details": {"totalResult": "3"}}, "no 'result'"),  # rows exist but none were sent
+            ({}, "no 'result'"),  # no details at all
+            ({"details": "x"}, "no 'result'"),
+            ({"details": {"totalResult": "0"}, "result": {"a": 1}}, "'result' is not a list"),
+            ({"details": {"totalResult": "1"}, "result": None}, "'result' is not a list"),
+        ],
+    )
+    def test_other_shapes_without_a_result_list_are_errors(self, client, fake_zitadel, body, message):
+        fake_zitadel.raw_body_on = ("roles", body)
+        with pytest.raises(Z.ZitadelError) as exc:
+            client.list_project_role_keys(PROJECT_ID)
+        assert message in str(exc.value)
+
     def test_short_page_with_total_keeps_paging(self, client, fake_zitadel):
         # the server hands out 30 rows per page although we asked for 100; totalResult says 75
         fake_zitadel.page_cap = 30

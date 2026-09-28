@@ -322,7 +322,13 @@ class TestBootstrapScript:
         }
 
     @pytest.mark.parametrize(
-        "attr,value,message", [("drop_result_on", "roles", "no 'result'"), ("truncate_after", 0, "empty page")]
+        "attr,value,message",
+        [
+            ("drop_result_on", "roles", "no 'result'"),
+            ("truncate_after", 0, "empty page"),
+            ("raw_body_on", ("roles", {"details": {"totalResult": "3"}}), "no 'result'"),
+            ("raw_body_on", ("roles", {}), "no 'result'"),
+        ],
     )
     def test_incomplete_answers_are_errors(self, plane_world, fake_zitadel, bootstrap, tmp_path, attr, value, message):
         fake_zitadel.issued.add(PAT)
@@ -332,6 +338,16 @@ class TestBootstrapScript:
         code, text = _run_script(bootstrap, fake_zitadel, export_path)
         assert code == 1 and message in text
         assert fake_zitadel.writes == []
+
+    @pytest.mark.parametrize("details", [{}, {"totalResult": "0"}, {"totalResult": 0}])
+    def test_omitted_result_with_zero_total_is_empty(self, plane_world, fake_zitadel, bootstrap, tmp_path, details):
+        # proto3 JSON omits an empty `result`: no roles yet means "create them all"
+        fake_zitadel.issued.add(PAT)
+        fake_zitadel.raw_body_on = ("roles", {"details": details})
+        export_path, _ = _export(tmp_path)
+        code, text = _run_script(bootstrap, fake_zitadel, export_path, "--json")
+        assert code == 0, text
+        assert "hangar.workspace.member" in {r["key"] for r in json.loads(text)["roles_to_create"]}
 
     @pytest.mark.parametrize("org", ["2000:1", "2000 1"])
     def test_org_id_must_be_bare(self, plane_world, fake_zitadel, bootstrap, tmp_path, org):

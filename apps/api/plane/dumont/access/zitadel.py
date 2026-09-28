@@ -31,7 +31,8 @@
 #
 # The client never writes to ZITADEL, never logs tokens or the private key, and raises
 # ZitadelError for every failure so callers can fail safe (change nothing). Answers that look like
-# success but are incomplete are failures too: a search answer without `result`, an empty page while
+# success but are incomplete are failures too: a search answer without `result` (unless `details` says
+# there are no rows: totalResult absent or 0, how proto3 JSON renders an empty list), an empty page while
 # `totalResult` says more rows exist, and grants whose users the org-scoped users/_search does not
 # return at all (a silently filtered HTTP 200).
 
@@ -186,11 +187,16 @@ class ZitadelClient:
             if queries:
                 body["queries"] = queries
             data = self._request("POST", path, json_body=body)
-            # Only an explicit `"result": []` means "nothing". A missing key is a changed or partial
-            # answer, and reading it as empty would look exactly like a mass revocation.
             if "result" not in data:
-                raise ZitadelError(f"POST {path}: response has no 'result' (API shape changed?)")
-            page = data["result"]
+                # ZITADEL's gateway may omit empty repeated fields and zero numbers (proto3 JSON without
+                # EmitUnpopulated), so an empty list can arrive as {"details": {...}} with no `result` and
+                # no (or zero) totalResult. Anything else without `result` is a changed or partial answer,
+                # and reading it as empty would look exactly like a mass revocation.
+                if not _omitted_result_means_empty(data):
+                    raise ZitadelError(f"POST {path}: response has no 'result' (API shape changed?)")
+                page = []
+            else:
+                page = data["result"]
             if not isinstance(page, list):
                 raise ZitadelError(f"POST {path}: 'result' is not a list")
             rows.extend(page)
@@ -310,6 +316,15 @@ def _grant_outside_org(row, org_id):
     if _resource_owner(row) not in (None, org_id):
         return "grant_resource_owner"
     return None
+
+
+def _omitted_result_means_empty(data):
+    """A response without `result` is an empty list only when `details` is an object whose
+    totalResult is absent or zero ("0" or 0)."""
+    details = data.get("details")
+    if not isinstance(details, dict):
+        return False
+    return details.get("totalResult", 0) in (0, "0")
 
 
 def _total_result(data):

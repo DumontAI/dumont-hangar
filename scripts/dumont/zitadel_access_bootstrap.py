@@ -99,11 +99,18 @@ class Zitadel:
             if queries:
                 body["queries"] = queries
             data = self.request("POST", path, body)
-            # Same rules as plane/dumont/access/zitadel.py: only an explicit "result": [] is empty,
-            # and an empty page before totalResult is reached is a truncated answer.
-            if not isinstance(data, dict) or "result" not in data:
-                raise BootstrapError(f"POST {path}: response has no 'result' (API shape changed?)")
-            page = data["result"]
+            # Same rules as plane/dumont/access/zitadel.py: a missing `result` is an empty list only when
+            # `details` is an object with totalResult absent or 0 (proto3 JSON omits empty/zero fields);
+            # an empty page before totalResult is reached is a truncated answer.
+            if not isinstance(data, dict):
+                raise BootstrapError(f"POST {path}: response is not a JSON object")
+            if "result" not in data:
+                details = data.get("details")
+                if not isinstance(details, dict) or details.get("totalResult", 0) not in (0, "0"):
+                    raise BootstrapError(f"POST {path}: response has no 'result' (API shape changed?)")
+                page = []
+            else:
+                page = data["result"]
             if not isinstance(page, list):
                 raise BootstrapError(f"POST {path}: 'result' is not a list")
             rows.extend(page)
