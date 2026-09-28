@@ -126,6 +126,11 @@ export interface HangarServerContext {
   /** Shared across requests by the HTTP server; a private one is created otherwise. */
   readonly rateLimiter?: WriteRateLimiter;
   readonly audit?: AuditSink;
+  /**
+   * Lazy email lookup (userinfo) for callers whose token has no email claim.
+   * Called only for attribution footers and assignee "me"; must not throw.
+   */
+  readonly resolveEmail?: () => Promise<string | null>;
 }
 
 interface CallAudit {
@@ -143,7 +148,22 @@ export function createHangarServer(
   const rateLimiter = context.rateLimiter ?? new WriteRateLimiter(config.writeRateLimit);
   const audit = context.audit ?? stderrAuditSink;
   const writesEnabled = config.writeProjects.length > 0;
-  const actor = principal?.email ?? principal?.sub ?? "unknown";
+  // Email from the token claim, else (lazily, once per request) from userinfo.
+  let resolvedEmail: Promise<string | null> | null = null;
+  let knownEmail: string | null = principal?.email ?? null;
+  function callerEmail(): Promise<string | null> {
+    if (knownEmail || !principal) return Promise.resolve(knownEmail);
+    resolvedEmail ??= (context.resolveEmail?.() ?? Promise.resolve(null))
+      .catch(() => null)
+      .then((email) => {
+        knownEmail = email;
+        return email;
+      });
+    return resolvedEmail;
+  }
+  async function actor(): Promise<string> {
+    return (await callerEmail()) ?? principal?.sub ?? "unknown";
+  }
 
   const server = new McpServer(
     { name: "hangar-mcp-server", version: "0.2.0" },
@@ -203,7 +223,7 @@ export function createHangarServer(
         event: "hangar.mcp.tool",
         tool,
         sub: principal?.sub ?? null,
-        email: principal?.email ?? null,
+        email: knownEmail,
         roles_used: rolesUsed,
         project: call.project,
         work_item: call.work_item,
@@ -471,10 +491,10 @@ export function createHangarServer(
       fields.push("name");
     }
     if (input.description !== undefined) {
-      body.description_html = htmlWithFooter(input.description, actor);
+      body.description_html = htmlWithFooter(input.description, await actor());
       fields.push("description");
     } else if (withFooterOnEmptyDescription) {
-      body.description_html = htmlWithFooter("", actor);
+      body.description_html = htmlWithFooter("", await actor());
     }
     if (input.state !== undefined) {
       body.state = await client.resolveStateId(project, input.state);
@@ -489,7 +509,8 @@ export function createHangarServer(
       fields.push("labels");
     }
     if (input.assignees !== undefined) {
-      body.assignees = await client.resolveAssigneeIds(project, input.assignees, principal?.email ?? null);
+      const wantsMe = input.assignees.some((assignee) => assignee.trim().toLowerCase() === "me");
+      body.assignees = await client.resolveAssigneeIds(project, input.assignees, wantsMe ? await callerEmail() : null);
       fields.push("assignees");
     }
     if (input.parent !== undefined) {
@@ -639,7 +660,7 @@ export function createHangarServer(
         call.project = target.project.identifier;
         call.work_item = workItemIdentifier(target.record, target.project.identifier) ?? target.id;
         call.fields_changed = ["comment"];
-        const comment = await client.addComment(target.project, target.id, htmlWithFooter(args.body, actor));
+        const comment = await client.addComment(target.project, target.id, htmlWithFooter(args.body, await actor()));
         return { ...sanitizeComment(comment), work_item: call.work_item };
       })
   );

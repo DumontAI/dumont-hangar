@@ -289,6 +289,21 @@ function parseIntrospection(
   return { oidcIntrospectionUrl: url, oidcIntrospectionAuth: parseIntrospectionPrivateKey(privateKeyJson, clientId) };
 }
 
+/**
+ * Userinfo endpoint used to find the caller's email when the access token has
+ * none. The caller's bearer is sent there, so it must be on the issuer's origin.
+ * Default: ZITADEL's `${issuer}/oidc/v1/userinfo`.
+ */
+function parseUserinfoUrl(env: NodeJS.ProcessEnv, oidcIssuer: URL | null): URL | null {
+  const configured = parseOptionalHttpsUrl(env, "MCP_OIDC_USERINFO_URL");
+  if (!oidcIssuer) return configured;
+  const url = configured ?? new URL(`${oidcIssuer.href.replace(/\/+$/, "")}/oidc/v1/userinfo`);
+  if (url.origin !== oidcIssuer.origin) {
+    throw new HangarConfigError("MCP_OIDC_USERINFO_URL must be on the same origin as MCP_OIDC_ISSUER");
+  }
+  return url;
+}
+
 export function loadHangarConfig(env: NodeJS.ProcessEnv = process.env): HangarConfig {
   const apiKey = env.HANGAR_API_KEY?.trim() ?? "";
   if (!API_KEY_PATTERN.test(apiKey)) {
@@ -316,14 +331,16 @@ export function loadHangarConfig(env: NodeJS.ProcessEnv = process.env): HangarCo
   const { readerRole, writerRole } = parseRoles(env);
   const oidcRequiredScope = parseOidcScope(env, zitadelRoleScope(readerRole));
   // ZITADEL only asserts the roles a client asked for, so clients must request
-  // both role scopes; a custom required scope is advertised first.
+  // both role scopes. `openid email` lets the userinfo endpoint return the
+  // caller's email for attribution; neither is required on the token.
   const oidcScopesSupported = [
-    ...new Set([oidcRequiredScope, zitadelRoleScope(readerRole), zitadelRoleScope(writerRole)]),
+    ...new Set(["openid", "email", oidcRequiredScope, zitadelRoleScope(readerRole), zitadelRoleScope(writerRole)]),
   ];
   const allowedProjects = parseAllowedProjects(env);
   const oidcAllowedOrgId = parseOptionalToken(env, "MCP_OIDC_ALLOWED_ORG_ID");
   const oidcAllowedSubjects = parseCsv(env, "MCP_OIDC_ALLOWED_SUBJECTS");
   const introspection = parseIntrospection(env, oidcIssuer);
+  const oidcUserinfoUrl = parseUserinfoUrl(env, oidcIssuer);
 
   if (!oidcIssuer) throw new HangarConfigError("MCP_OIDC_ISSUER is required");
   if (!oidcJwksUrl) throw new HangarConfigError("MCP_OIDC_JWKS_URL is required");
@@ -352,6 +369,7 @@ export function loadHangarConfig(env: NodeJS.ProcessEnv = process.env): HangarCo
     oidcReaderRole: readerRole,
     oidcWriterRole: writerRole,
     oidcScopesSupported,
+    oidcUserinfoUrl,
     oidcAllowedOrgId,
     oidcAllowedSubjects,
     resourceUrl,

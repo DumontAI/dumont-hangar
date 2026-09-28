@@ -54,7 +54,7 @@ function requestOriginAllowed(req: IncomingMessage, config: HangarConfig): boole
   return !origin || config.allowedOrigins.includes(origin);
 }
 
-function bearerToken(req: IncomingMessage): string | null {
+export function bearerToken(req: IncomingMessage): string | null {
   const authorization = req.headers.authorization ?? "";
   const match = /^Bearer[ \t]+([^ \t]+)$/i.exec(authorization);
   const token = match?.[1] ?? "";

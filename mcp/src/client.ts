@@ -457,7 +457,7 @@ export class HangarClient {
       if (!callerEmail) {
         throw new HangarError(
           "FORBIDDEN",
-          'assignee "me" needs the email claim in the access token (request the email scope and log in again)'
+          'assignee "me" needs your email, which neither the token nor userinfo provided (log in again with the openid and email scopes)'
         );
       }
       const matches = members.filter((member) => stringField(member, "email")?.toLowerCase() === callerEmail);

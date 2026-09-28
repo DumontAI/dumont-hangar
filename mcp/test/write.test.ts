@@ -96,7 +96,11 @@ interface Harness {
 async function harness(
   principal: Principal | null,
   configOverrides: Partial<HangarConfig> = { writeProjects: ["HGR"] },
-  options: { conflict?: boolean; rateLimiter?: WriteRateLimiter } = {}
+  options: {
+    conflict?: boolean;
+    rateLimiter?: WriteRateLimiter;
+    resolveEmail?: () => Promise<string | null>;
+  } = {}
 ): Promise<Harness> {
   const config = testConfig({ allowedProjects: ["HGR", "SEC"], ...configOverrides });
   const writes: WriteCall[] = [];
@@ -106,6 +110,7 @@ async function harness(
     principal,
     audit: (record) => audit.push(record),
     ...(options.rateLimiter ? { rateLimiter: options.rateLimiter } : {}),
+    ...(options.resolveEmail ? { resolveEmail: options.resolveEmail } : {}),
   });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
@@ -421,6 +426,86 @@ describe("Hangar write tools: behavior", () => {
   });
 });
 
+describe("Hangar write tools: lazy email resolution", () => {
+  const NO_EMAIL: Principal = { sub: "sub-no-email", email: null, roles: ["hangar_reader", "hangar_writer"] };
+
+  it("never looks the email up for reads", async () => {
+    let lookups = 0;
+    const h = await harness(
+      NO_EMAIL,
+      { writeProjects: ["HGR"] },
+      {
+        resolveEmail: async () => {
+          lookups += 1;
+          return "camila@example.test";
+        },
+      }
+    );
+    await h.call("hangar_list_projects", { limit: 1 });
+    await h.call("hangar_get_work_item", { work_item: "HGR-5" });
+    expect(lookups).toBe(0);
+    expect(h.audit.every((record) => record.email === null)).toBe(true);
+  });
+
+  it('uses the resolved email for the footer, for "me" and in the audit line, once per request', async () => {
+    let lookups = 0;
+    const h = await harness(
+      NO_EMAIL,
+      { writeProjects: ["HGR"] },
+      {
+        resolveEmail: async () => {
+          lookups += 1;
+          return "camila@example.test";
+        },
+      }
+    );
+    const result = await h.call("hangar_create_work_item", {
+      project: "HGR",
+      name: "x",
+      description: "body",
+      assignees: ["me"],
+    });
+    expect(result.isError).toBeUndefined();
+    expect(h.writes[0]!.body.description_html).toBe("<p>body</p><p>— via MCP por camila@example.test</p>");
+    expect(h.writes[0]!.body.assignees).toEqual(["user-2"]);
+    expect(h.audit.at(-1)?.email).toBe("camila@example.test");
+    expect(lookups).toBe(1);
+  });
+
+  it("falls back to the subject when the lookup fails, without failing the write", async () => {
+    const h = await harness(
+      NO_EMAIL,
+      { writeProjects: ["HGR"] },
+      {
+        resolveEmail: async () => {
+          throw new Error("userinfo down");
+        },
+      }
+    );
+    const result = await h.call("hangar_add_comment", { work_item: "HGR-5", body: "ok" });
+    expect(result.isError).toBeUndefined();
+    expect(h.writes[0]!.body.comment_html).toBe("<p>ok</p><p>— via MCP por sub-no-email</p>");
+    expect(h.audit.at(-1)).toMatchObject({ email: null, outcome: "success" });
+  });
+
+  it("does not look up when the token already carries the email", async () => {
+    let lookups = 0;
+    const h = await harness(
+      WRITER,
+      { writeProjects: ["HGR"] },
+      {
+        resolveEmail: async () => {
+          lookups += 1;
+          return "other@example.test";
+        },
+      }
+    );
+    await h.call("hangar_add_comment", { work_item: "HGR-5", body: "ok" });
+    expect(String(h.writes[0]!.body.comment_html)).toContain("cristian@example.test");
+    expect(lookups).toBe(0);
+  });
+});
+
 describe("credential detection and markup", () => {
   it("flags credential shapes and ignores prose, key names and placeholders", () => {
     for (const secret of [
@@ -493,6 +578,8 @@ describe("write configuration", () => {
     expect(legacy.oidcReaderRole).toBe("hangar_reader");
     const custom = loadHangarConfig({ ...base, MCP_OIDC_READER_ROLE: "r", MCP_OIDC_WRITER_ROLE: "w" });
     expect(custom.oidcScopesSupported).toEqual([
+      "openid",
+      "email",
       "urn:zitadel:iam:org:project:role:r",
       "urn:zitadel:iam:org:project:role:w",
     ]);

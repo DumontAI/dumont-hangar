@@ -5,7 +5,7 @@ import { createAuthorizer, protectedResourceMetadata } from "../src/auth.js";
 import { HangarClient } from "../src/client.js";
 import { createHangarHttpServer } from "../src/http.js";
 import { createHangarServer } from "../src/tools.js";
-import { hangarFetch, PROJECT_HGR, testConfig } from "./fixtures.js";
+import { hangarFetch, jsonResponse, PROJECT_HGR, testConfig } from "./fixtures.js";
 
 const openServers: Server[] = [];
 
@@ -92,6 +92,8 @@ describe("OIDC authorization", () => {
       resource: "https://mcp-hangar.example.test/mcp",
       authorization_servers: ["https://issuer.example.test"],
       scopes_supported: [
+        "openid",
+        "email",
         "urn:zitadel:iam:org:project:role:hangar_reader",
         "urn:zitadel:iam:org:project:role:hangar_writer",
       ],
@@ -182,7 +184,7 @@ describe("OIDC authorization", () => {
     const port = await listen(server);
     const unauthorized = await fetch(`http://127.0.0.1:${port}/mcp`, { method: "POST", body: "{}" });
     expect(unauthorized.headers.get("www-authenticate")).toContain(
-      'scope="urn:zitadel:iam:org:project:role:hangar_reader urn:zitadel:iam:org:project:role:hangar_writer"'
+      'scope="openid email urn:zitadel:iam:org:project:role:hangar_reader urn:zitadel:iam:org:project:role:hangar_writer"'
     );
     const response = await fetch(`http://127.0.0.1:${port}/mcp`, {
       method: "POST",
@@ -203,6 +205,61 @@ describe("OIDC authorization", () => {
     expect(payload.result.isError).toBe(true);
     expect(payload.result.structuredContent).toMatchObject({ error: { code: "FORBIDDEN" } });
     expect(calls).toHaveLength(0);
+  });
+
+  it("resolves a missing email through userinfo with the caller's own bearer on writes", async () => {
+    const { config: base, token } = await setupOidc();
+    const config = {
+      ...base,
+      writeProjects: ["HGR"],
+      oidcUserinfoUrl: new URL("https://issuer.example.test/oidc/v1/userinfo"),
+    };
+    const writerToken = await token({
+      "urn:zitadel:iam:org:project:roles": { hangar_writer: { "dumont-org": "dumont.example.test" } },
+    });
+    const userinfoCalls: string[] = [];
+    const comments: string[] = [];
+    const reads = hangarFetch([]);
+    const upstream = async (input: string | URL, init?: RequestInit) => {
+      if (init?.method === "POST") {
+        const body = JSON.parse(String(init.body)) as { comment_html: string };
+        comments.push(body.comment_html);
+        return jsonResponse({ id: "c-1", comment_html: body.comment_html }, 201);
+      }
+      return reads(input, init);
+    };
+    const server = createHangarHttpServer(
+      config,
+      (principal, resolveEmail) =>
+        createHangarServer(config, new HangarClient(config, upstream), { principal, resolveEmail, audit: () => {} }),
+      {},
+      {
+        fetch: async (_input, init) => {
+          userinfoCalls.push(((init?.headers ?? {}) as Record<string, string>).Authorization ?? "");
+          return jsonResponse({ sub: "user-1", email: "camila@example.test", email_verified: true });
+        },
+        log: () => {},
+      }
+    );
+    const port = await listen(server);
+    const post = (id: number, name: string, args: Record<string, unknown>) =>
+      fetch(`http://127.0.0.1:${port}/mcp`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${writerToken}`,
+          accept: "application/json, text/event-stream",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } }),
+      });
+    expect((await post(1, "hangar_list_projects", { limit: 1 })).status).toBe(200);
+    expect(userinfoCalls).toHaveLength(0);
+    const response = await post(2, "hangar_add_comment", { work_item: "HGR-5", body: "hello" });
+    expect(response.status).toBe(200);
+    expect(comments).toEqual(["<p>hello</p><p>— via MCP por camila@example.test</p>"]);
+    expect(userinfoCalls).toEqual([`Bearer ${writerToken}`]);
+    await post(3, "hangar_add_comment", { work_item: "HGR-5", body: "again" });
+    expect(userinfoCalls).toHaveLength(1); // cached by sub across requests
   });
 
   it("returns 401 metadata challenge and 403 for a valid token without the role", async () => {

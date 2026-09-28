@@ -41,9 +41,12 @@ export function testConfig(overrides: Partial<HangarConfig> = {}): HangarConfig 
     oidcReaderRole: "hangar_reader",
     oidcWriterRole: "hangar_writer",
     oidcScopesSupported: [
+      "openid",
+      "email",
       "urn:zitadel:iam:org:project:role:hangar_reader",
       "urn:zitadel:iam:org:project:role:hangar_writer",
     ],
+    oidcUserinfoUrl: null,
     oidcAllowedOrgId: "",
     oidcAllowedSubjects: [],
     resourceUrl: null,

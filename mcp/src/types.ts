@@ -47,6 +47,8 @@ export interface HangarConfig {
   readonly oidcWriterRole: string;
   /** Scopes advertised in protected-resource metadata and in the 401/403 challenge. */
   readonly oidcScopesSupported: readonly string[];
+  /** Same-origin userinfo endpoint for the lazy email lookup; null disables it. */
+  readonly oidcUserinfoUrl: URL | null;
   readonly oidcAllowedOrgId: string;
   readonly oidcAllowedSubjects: readonly string[];
   readonly resourceUrl: URL | null;
