@@ -18,6 +18,9 @@ def dumont_access_full_sync():
         # A typo in DUMONT_ACCESS_SYNC (or DUMONT_ACCESS_MAX_REMOVALS) must be loud every 5 minutes,
         # not read as `off`: the operator meant the sync to run.
         logger.error("dumont access: configuration error, full sync not run: %s", exc)
+        from plane.dumont.access.health import record_full_sync
+
+        record_full_sync({"status": "error", "reason": "config_error"})
         return {"status": "error", "error": str(exc)}
     if cfg.mode == MODE_OFF:
         return {"status": "off"}

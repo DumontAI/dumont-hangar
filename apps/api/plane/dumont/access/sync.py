@@ -232,7 +232,24 @@ def run_full_sync(mode=None, max_removals=None):
 
     `max_removals` overrides DUMONT_ACCESS_MAX_REMOVALS for this run only (the manual command's
     --max-removals, after a dry-run confirmed the removals are real).
+
+    Runs in the configured mode (the beat, or the command without --mode) are recorded for the
+    health endpoint (plane/dumont/access/health.py); a manual --mode dry-run while enforce is
+    configured is not, so it can never hide a stuck enforce sync.
     """
+    report = _run_full_sync(mode, max_removals)
+    try:
+        configured = load_access_config().mode
+    except AccessConfigError:
+        configured = None
+    if mode is None or mode == configured:
+        from plane.dumont.access.health import record_full_sync
+
+        record_full_sync(report)
+    return report
+
+
+def _run_full_sync(mode, max_removals):
     try:
         cfg = load_access_config()
         mode = _resolve_mode(cfg, mode)
@@ -242,7 +259,7 @@ def run_full_sync(mode=None, max_removals=None):
             cfg = dataclasses.replace(cfg, max_removals=max_removals)
     except AccessConfigError as exc:
         logger.error("dumont access: configuration error: %s", exc)
-        return _report(STATUS_ERROR, mode or "?", "full", error=str(exc))
+        return _report(STATUS_ERROR, mode or "?", "full", error=str(exc), reason="config_error")
     if mode == MODE_OFF:
         return _report(STATUS_OFF, mode, "full")
 
@@ -256,7 +273,9 @@ def run_full_sync(mode=None, max_removals=None):
         return _full_sync(cfg, mode, override=max_removals is not None)
     except Exception as exc:  # last line of defence: a sync bug must never escape into beat/commands
         logger.exception("dumont access: full sync failed")
-        return _report(STATUS_ERROR, mode, "full", error=f"internal error ({exc.__class__.__name__})")
+        return _report(
+            STATUS_ERROR, mode, "full", error=f"internal error ({exc.__class__.__name__})", reason="internal_error"
+        )
     finally:
         try:
             cache.delete(FULL_SYNC_LOCK_KEY)
@@ -275,7 +294,10 @@ def _full_sync(cfg, mode, override=False):
         if isinstance(exc, ZitadelError):
             start_zitadel_backoff()
         logger.error("dumont access: full sync changed nothing: %s", exc)
-        return _report(STATUS_ERROR, mode, "full", error=str(exc))
+        reason = {ZitadelError: "zitadel_error", WorkspaceNotFound: "workspace_not_found"}.get(
+            type(exc), "config_error"
+        )
+        return _report(STATUS_ERROR, mode, "full", error=str(exc), reason=reason)
 
     _store_managed_state(cfg, role_keys, workspace)
     snapshot = build_snapshot(workspace, role_keys, grants)
@@ -308,7 +330,7 @@ def _full_sync(cfg, mode, override=False):
             "is real, run once with `manage.py dumont_access_sync --max-removals N`.",
             ZERO_GRANTS_ERROR,
         )
-        report = _report(STATUS_ERROR, mode, "full", plan, snapshot, error=ZERO_GRANTS_ERROR)
+        report = _report(STATUS_ERROR, mode, "full", plan, snapshot, error=ZERO_GRANTS_ERROR, reason="zero_grants")
         _log_plan(report)
         return report
 
@@ -321,7 +343,14 @@ def _full_sync(cfg, mode, override=False):
         )
         _log_cascade(plan.changes, "planned (brake, not written)")
         report = _report(
-            STATUS_BRAKE, mode, "full", plan, snapshot, max_removals=cfg.max_removals, relative_brake=mostly_losing
+            STATUS_BRAKE,
+            mode,
+            "full",
+            plan,
+            snapshot,
+            max_removals=cfg.max_removals,
+            relative_brake=mostly_losing,
+            reason="brake_relative",
         )
         _log_plan(report)
         return report
@@ -339,7 +368,9 @@ def _full_sync(cfg, mode, override=False):
             cfg.max_removals,
         )
         _log_cascade(plan.changes, "planned (brake, not written)")
-        report = _report(STATUS_BRAKE, mode, "full", plan, snapshot, max_removals=cfg.max_removals)
+        report = _report(
+            STATUS_BRAKE, mode, "full", plan, snapshot, max_removals=cfg.max_removals, reason="brake_absolute"
+        )
         _log_plan(report)
         return report
 
