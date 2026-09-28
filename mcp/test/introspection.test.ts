@@ -2,8 +2,22 @@ import type { Server } from "node:http";
 import { afterEach, describe, expect, it } from "vitest";
 import { createAuthorizer, MIN_TOKEN_LIFETIME_SECONDS } from "../src/auth.js";
 import { createHangarHttpServer } from "../src/http.js";
-import { SELF_CHECK_TOKEN } from "../src/introspection.js";
+import { isZitadelOpaqueToken } from "../src/introspection.js";
 import { hangarFetch, jsonResponse, testConfig } from "./fixtures.js";
+
+const b64 = (value: string) => Buffer.from(value, "utf8").toString("base64url");
+
+/**
+ * An obviously fake user access token in ZITADEL's opaque (compact JWE)
+ * shape: only the shape matters, the fake issuer decides it is active.
+ */
+const FAKE_USER_OPAQUE_TOKEN = [
+  b64(JSON.stringify({ alg: "A256GCMKW", enc: "A256GCM", kid: "fake-test-user-token" })),
+  "F".repeat(43),
+  "F".repeat(16),
+  b64("fake-user-access-token-for-tests"),
+  "F".repeat(22),
+].join(".");
 
 const openServers: Server[] = [];
 afterEach(async () => {
@@ -82,10 +96,10 @@ describe("opaque token introspection", () => {
         return jsonResponse(activeClaims());
       },
     });
-    const result = await authorize(request(SELF_CHECK_TOKEN));
+    const result = await authorize(request(FAKE_USER_OPAQUE_TOKEN));
     expect(result).toMatchObject({ failure: null, subject: "user-1" });
     // Passed introspection and the claims policy: forwarded to Hangar verbatim.
-    expect(result.upstreamToken).toBe(SELF_CHECK_TOKEN);
+    expect(result.upstreamToken).toBe(FAKE_USER_OPAQUE_TOKEN);
     expect(result.expiresAt).toBe(activeClaims().exp);
     expect(calls[0]?.pathname).toBe("/oauth/v2/introspect");
   });
@@ -107,19 +121,20 @@ describe("opaque token introspection", () => {
         },
       }
     );
-    const response = await callTool(await listen(server), SELF_CHECK_TOKEN);
+    const response = await callTool(await listen(server), FAKE_USER_OPAQUE_TOKEN);
     expect(response.status).toBe(200);
     const payload = (await response.json()) as { result: { isError?: boolean } };
     expect(payload.result.isError).not.toBe(true);
     expect(hangarCalls.length).toBeGreaterThan(0);
     expect(authorizations.length).toBe(hangarCalls.length);
-    for (const authorization of authorizations) expect(authorization).toBe(`Bearer ${SELF_CHECK_TOKEN}`);
+    for (const authorization of authorizations) expect(authorization).toBe(`Bearer ${FAKE_USER_OPAQUE_TOKEN}`);
   });
 
   it("never forwards a token that failed introspection or the claims policy", async () => {
     const outcomes: Array<[string, () => Response, number]> = [
       ["inactive", () => jsonResponse({ active: false }), 401],
-      ["introspection error", () => jsonResponse({ error: "server_error" }, 500), 401],
+      // An introspection outage is not a credential problem: 503, no new login.
+      ["introspection error", () => jsonResponse({ error: "server_error" }, 500), 503],
       ["another audience", () => jsonResponse(activeClaims({ aud: "another-project" })), 401],
       ["another issuer", () => jsonResponse(activeClaims({ iss: "https://other-issuer.example.test" })), 401],
       ["ID token type", () => jsonResponse(activeClaims({ token_type: "id_token" })), 401],
@@ -154,7 +169,7 @@ describe("opaque token introspection", () => {
         }
       );
       // oxlint-disable-next-line no-await-in-loop
-      const response = await callTool(await listen(server), SELF_CHECK_TOKEN);
+      const response = await callTool(await listen(server), FAKE_USER_OPAQUE_TOKEN);
       expect({ label, status: response.status }).toEqual({ label, status });
       expect({ label, hangarCalls }).toEqual({ label, hangarCalls: [] });
     }
@@ -167,11 +182,11 @@ describe("opaque token introspection", () => {
       createAuthorizer(introspectionConfig(), {
         now: () => nowMs,
         fetch: async () => jsonResponse(activeClaims({ exp })),
-      })(request(SELF_CHECK_TOKEN));
+      })(request(FAKE_USER_OPAQUE_TOKEN));
     expect((await authorizeWithExp(nowSeconds + MIN_TOKEN_LIFETIME_SECONDS)).failure).toBe("invalid_credentials");
     expect((await authorizeWithExp(nowSeconds + 1)).failure).toBe("invalid_credentials");
     const fresh = await authorizeWithExp(nowSeconds + MIN_TOKEN_LIFETIME_SECONDS + 1);
-    expect(fresh).toMatchObject({ failure: null, upstreamToken: SELF_CHECK_TOKEN });
+    expect(fresh).toMatchObject({ failure: null, upstreamToken: FAKE_USER_OPAQUE_TOKEN });
 
     const withoutExp = createAuthorizer(introspectionConfig(), {
       fetch: async () => {
@@ -179,7 +194,7 @@ describe("opaque token introspection", () => {
         return jsonResponse(claims);
       },
     });
-    expect((await withoutExp(request(SELF_CHECK_TOKEN))).failure).toBe("invalid_credentials");
+    expect((await withoutExp(request(FAKE_USER_OPAQUE_TOKEN))).failure).toBe("invalid_credentials");
   });
 
   it("maps Hangar's answers to an opaque token like those to a JWS", async () => {
@@ -209,7 +224,7 @@ describe("opaque token introspection", () => {
         }
       );
       // oxlint-disable-next-line no-await-in-loop
-      const response = await callTool(await listen(server), SELF_CHECK_TOKEN);
+      const response = await callTool(await listen(server), FAKE_USER_OPAQUE_TOKEN);
       // Never this MCP's 401/403: that would restart the client's login loop.
       expect(response.status).toBe(200);
       expect(response.headers.get("www-authenticate")).toBeNull();
@@ -224,19 +239,103 @@ describe("opaque token introspection", () => {
     const inactive = createAuthorizer(introspectionConfig(), {
       fetch: async () => jsonResponse({ active: false }),
     });
-    expect((await inactive(request(SELF_CHECK_TOKEN))).failure).toBe("invalid_credentials");
+    expect((await inactive(request(FAKE_USER_OPAQUE_TOKEN))).failure).toBe("invalid_credentials");
 
     const errored = createAuthorizer(introspectionConfig(), {
       fetch: async () => jsonResponse({ error: "server_error" }, 500),
     });
-    expect((await errored(request(SELF_CHECK_TOKEN))).failure).toBe("invalid_credentials");
+    expect((await errored(request(FAKE_USER_OPAQUE_TOKEN))).failure).toBe("temporarily_unavailable");
+  });
+
+  it("answers an introspection outage with 503 and no challenge", async () => {
+    const hangarCalls: string[] = [];
+    const server = createHangarHttpServer(
+      introspectionConfig(),
+      undefined,
+      {
+        fetch: async () => {
+          throw new Error("connect ECONNREFUSED");
+        },
+      },
+      {
+        fetch: async (input) => {
+          hangarCalls.push(String(input));
+          return jsonResponse({});
+        },
+      }
+    );
+    const response = await callTool(await listen(server), FAKE_USER_OPAQUE_TOKEN);
+    expect(response.status).toBe(503);
+    expect(response.headers.get("www-authenticate")).toBeNull();
+    expect(hangarCalls).toHaveLength(0);
+  });
+
+  it("refuses a cached active answer once it is near expiry, without calling Hangar", async () => {
+    let nowMs = Date.parse("2026-09-28T12:00:00Z");
+    const exp = Math.floor(nowMs / 1000) + 120;
+    let introspections = 0;
+    const hangarCalls: URL[] = [];
+    const server = createHangarHttpServer(
+      testConfig({ ...introspectionConfig(), oidcIntrospectionCacheSeconds: 300 }),
+      undefined,
+      {
+        now: () => nowMs,
+        fetch: async () => {
+          introspections += 1;
+          return jsonResponse(activeClaims({ exp }));
+        },
+      },
+      { fetch: hangarFetch(hangarCalls) }
+    );
+    const port = await listen(server);
+    expect((await callTool(port, FAKE_USER_OPAQUE_TOKEN)).status).toBe(200);
+    const hangarCallsAfterFirst = hangarCalls.length;
+    expect(hangarCallsAfterFirst).toBeGreaterThan(0);
+
+    // Still cached (cache TTL 300 s, capped at exp), but only 30 s left now.
+    nowMs = (exp - MIN_TOKEN_LIFETIME_SECONDS) * 1000;
+    const second = await callTool(port, FAKE_USER_OPAQUE_TOKEN);
+    expect(second.status).toBe(401);
+    expect(second.headers.get("www-authenticate")).toContain("resource_metadata=");
+    expect(introspections).toBe(1);
+    expect(hangarCalls).toHaveLength(hangarCallsAfterFirst);
+  });
+
+  it("caches an inactive answer: two calls, one introspection, no Hangar call", async () => {
+    let introspections = 0;
+    const hangarCalls: string[] = [];
+    const server = createHangarHttpServer(
+      introspectionConfig(),
+      undefined,
+      {
+        fetch: async () => {
+          introspections += 1;
+          return jsonResponse({ active: false });
+        },
+      },
+      {
+        fetch: async (input) => {
+          hangarCalls.push(String(input));
+          return jsonResponse({});
+        },
+      }
+    );
+    const port = await listen(server);
+    expect((await callTool(port, FAKE_USER_OPAQUE_TOKEN)).status).toBe(401);
+    expect((await callTool(port, FAKE_USER_OPAQUE_TOKEN)).status).toBe(401);
+    expect(introspections).toBe(1);
+    expect(hangarCalls).toHaveLength(0);
+  });
+
+  it("uses a test token in ZITADEL's opaque shape", () => {
+    expect(isZitadelOpaqueToken(FAKE_USER_OPAQUE_TOKEN)).toBe(true);
   });
 
   it("enforces the same claims policy on introspected tokens", async () => {
     const withoutRole = createAuthorizer(introspectionConfig(), {
       fetch: async () => jsonResponse(activeClaims({ "urn:zitadel:iam:org:project:roles": {} })),
     });
-    expect((await withoutRole(request(SELF_CHECK_TOKEN))).failure).toBe("insufficient_scope");
+    expect((await withoutRole(request(FAKE_USER_OPAQUE_TOKEN))).failure).toBe("insufficient_scope");
 
     // Same organization binding as the JWS path: a role granted in another org is refused.
     const foreignOrg = createAuthorizer(introspectionConfig(), {
@@ -248,12 +347,12 @@ describe("opaque token introspection", () => {
           })
         ),
     });
-    expect((await foreignOrg(request(SELF_CHECK_TOKEN))).failure).toBe("insufficient_scope");
+    expect((await foreignOrg(request(FAKE_USER_OPAQUE_TOKEN))).failure).toBe("insufficient_scope");
 
     const wrongAudience = createAuthorizer(introspectionConfig(), {
       fetch: async () => jsonResponse(activeClaims({ aud: "another-project" })),
     });
-    expect((await wrongAudience(request(SELF_CHECK_TOKEN))).failure).toBe("invalid_credentials");
+    expect((await wrongAudience(request(FAKE_USER_OPAQUE_TOKEN))).failure).toBe("invalid_credentials");
   });
 
   it("never introspects JWS-shaped tokens and caches repeated introspection results", async () => {
@@ -271,8 +370,8 @@ describe("opaque token introspection", () => {
     expect((await authorize(request(jwsShaped))).failure).toBe("invalid_credentials");
     expect(calls).toHaveLength(0);
 
-    expect(await authorize(request(SELF_CHECK_TOKEN))).toMatchObject({ failure: null, subject: "user-1" });
-    expect(await authorize(request(SELF_CHECK_TOKEN))).toMatchObject({ failure: null, subject: "user-1" });
+    expect(await authorize(request(FAKE_USER_OPAQUE_TOKEN))).toMatchObject({ failure: null, subject: "user-1" });
+    expect(await authorize(request(FAKE_USER_OPAQUE_TOKEN))).toMatchObject({ failure: null, subject: "user-1" });
     expect(calls).toHaveLength(1);
   });
 });

@@ -17,7 +17,8 @@ const PLANE_MANAGED_BY_ZITADEL = "DUMONT_MANAGED_BY_ZITADEL";
 // 403: the linked Hangar user is inactive, a bot, or ambiguous. A new login
 // cannot fix it, so it is not retryable.
 const PLANE_USER_NOT_ALLOWED = "DUMONT_USER_NOT_ALLOWED";
-// 503: Hangar could not check the token (Dumont Auth keys unreachable).
+// 503: Hangar could not check the token (Dumont Auth keys or token
+// introspection unreachable).
 // Raised before any view runs, so nothing was applied: retryable, and never a
 // reason to log in again.
 const PLANE_AUTH_UNAVAILABLE = "DUMONT_AUTH_UNAVAILABLE";
@@ -717,7 +718,7 @@ export class HangarClient {
       }
       return new HangarError(
         "UPSTREAM_UNAUTHORIZED",
-        "Hangar did not accept your Dumont token for its API (logging in again will not help unless it expired); Hangar's Dumont bearer login may be disabled or misconfigured"
+        "Hangar did not accept your Dumont token (it may have been revoked, or Hangar's Dumont bearer login is misconfigured); if you logged out or your access changed, log in again"
       );
     }
     if (status === 403) {

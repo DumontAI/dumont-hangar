@@ -305,9 +305,12 @@ function createOidcVerifier(config: HangarConfig, dependencies: AuthorizerDepend
   async function verifyByIntrospection(token: string): Promise<AuthorizationResult> {
     if (!introspect) return invalidCredentials();
     const outcome = await introspect(token);
-    // Local overload is not a credential problem: answer 503 so clients retry
-    // instead of restarting an OAuth login loop.
-    if (outcome.status === "overloaded") return { failure: "temporarily_unavailable", subject: null };
+    // Local overload and an introspection outage (timeout, non-200, bad
+    // response) are not credential problems: answer 503 without a challenge
+    // so clients retry instead of restarting an OAuth login that cannot fix it.
+    if (outcome.status === "overloaded" || outcome.status === "error") {
+      return { failure: "temporarily_unavailable", subject: null };
+    }
     if (outcome.status !== "active" || !isAccessTokenType(outcome.claims.token_type)) {
       return invalidCredentials();
     }
