@@ -1,15 +1,21 @@
 name: Hangar MCP CI/CD
 
-# CI (typecheck, test, build, tarball) runs on every PR/push that touches the
-# MCP. The deploy job runs ONLY on a manual dispatch from `dumont` with
-# deploy=true and confirmation DEPLOY_HANGAR_MCP, in the `production`
-# environment, on a self-hosted runner that lives on airbase-hel1.
+# DumontAI/dumont-hangar is a PUBLIC repository.
 #
-# Runner labels default to [self-hosted, linux, x64, hangar-mcp]. The owner must
-# either register that label on the hel1 runner, or point the repository
-# variables HANGAR_MCP_CI_RUNS_ON / HANGAR_MCP_DEPLOY_RUNS_ON (JSON arrays) at
-# an existing runner, e.g. '["self-hosted","linux","x64","bugit-mcp"]'.
-# See mcp/README.md "Deploy workflow".
+# - CI (typecheck, test, build) runs on GitHub-hosted `ubuntu-latest` for every
+#   PR/push that touches the MCP. It never runs on a self-hosted runner, so
+#   code from a pull request cannot reach the hel1 runner.
+# - The deploy job is the ONLY self-hosted job. Its `if` requires
+#   event_name == 'workflow_dispatch' (only users with write access can
+#   dispatch), ref == refs/heads/dumont, deploy=true and confirmation
+#   DEPLOY_HANGAR_MCP; it runs in the `production` environment. It builds the
+#   release tarball itself from the dispatched `dumont` commit, so no artifact
+#   from another event is ever installed.
+#
+# Deploy runner labels default to [self-hosted, linux, x64, hangar-mcp]. The
+# owner must register that label on the hel1 runner, or point the repository
+# variable HANGAR_MCP_DEPLOY_RUNS_ON (JSON array) at an existing hel1 runner,
+# e.g. '["self-hosted","linux","x64","bugit-mcp"]'. See mcp/README.md.
 
 on:
   pull_request:
@@ -51,7 +57,7 @@ env:
 jobs:
   ci:
     name: MCP quality gate
-    runs-on: ${{ fromJSON(vars.HANGAR_MCP_CI_RUNS_ON || '["self-hosted","linux","x64","hangar-mcp"]') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -85,17 +91,6 @@ jobs:
       - name: Deploy script syntax
         run: bash -n scripts/deploy-mcp-hel1.sh
 
-      - name: Package deploy artifact
-        run: tar -czf "$RUNNER_TEMP/hangar-mcp-release.tar.gz" mcp/dist mcp/package.json mcp/pnpm-lock.yaml
-
-      - name: Upload deploy artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: hangar-mcp-release-${{ github.run_id }}
-          path: ${{ runner.temp }}/hangar-mcp-release.tar.gz
-          if-no-files-found: error
-          retention-days: 7
-
   deploy:
     name: Deploy and smoke test hel1
     needs: ci
@@ -108,7 +103,8 @@ jobs:
       group: airbase-hel1-dumont-hangar-mcp
       cancel-in-progress: false
     steps:
-      - name: Checkout deployment helpers
+      # Checks out the dispatched commit on `dumont` (github.sha).
+      - name: Checkout
         uses: actions/checkout@v7
 
       - name: Use Node.js
@@ -121,11 +117,16 @@ jobs:
         with:
           version: ${{ env.PNPM_VERSION }}
 
-      - name: Download release artifact
-        uses: actions/download-artifact@v8
-        with:
-          name: hangar-mcp-release-${{ github.run_id }}
-          path: ${{ runner.temp }}/hangar-mcp-artifact
+      - name: Build release tarball from this commit
+        run: |
+          set -euo pipefail
+          pnpm --dir mcp install --frozen-lockfile --ignore-workspace
+          pnpm --dir mcp run typecheck
+          pnpm --dir mcp test
+          rm -rf mcp/dist
+          pnpm --dir mcp run build
+          mkdir -p "$RUNNER_TEMP/hangar-mcp-artifact"
+          tar -czf "$RUNNER_TEMP/hangar-mcp-artifact/hangar-mcp-release.tar.gz" mcp/dist mcp/package.json mcp/pnpm-lock.yaml
 
       - name: Install release on hel1
         env:
@@ -153,6 +154,7 @@ jobs:
           HANGAR_MCP_OIDC_REQUIRED_SCOPE: ${{ vars.HANGAR_MCP_OIDC_REQUIRED_SCOPE || '' }}
           HANGAR_MCP_OIDC_ALLOWED_ORG_ID: ${{ vars.HANGAR_MCP_OIDC_ALLOWED_ORG_ID || '' }}
           HANGAR_MCP_OIDC_ALLOWED_SUBJECTS: ${{ vars.HANGAR_MCP_OIDC_ALLOWED_SUBJECTS || '' }}
+          HANGAR_MCP_OIDC_USERINFO_URL: ${{ vars.HANGAR_MCP_OIDC_USERINFO_URL || '' }}
           HANGAR_MCP_OIDC_INTROSPECTION_URL: ${{ vars.HANGAR_MCP_OIDC_INTROSPECTION_URL || '' }}
           HANGAR_MCP_OIDC_INTROSPECTION_CLIENT_ID: ${{ vars.HANGAR_MCP_OIDC_INTROSPECTION_CLIENT_ID || '' }}
           HANGAR_MCP_OIDC_INTROSPECTION_TIMEOUT_MS: ${{ vars.HANGAR_MCP_OIDC_INTROSPECTION_TIMEOUT_MS || '' }}

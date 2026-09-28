@@ -50,6 +50,8 @@ OIDC_WRITER_ROLE="${HANGAR_MCP_OIDC_WRITER_ROLE:-hangar_writer}"
 OIDC_REQUIRED_SCOPE="${HANGAR_MCP_OIDC_REQUIRED_SCOPE:-}"
 OIDC_ALLOWED_ORG_ID="${HANGAR_MCP_OIDC_ALLOWED_ORG_ID:-}"
 OIDC_ALLOWED_SUBJECTS="${HANGAR_MCP_OIDC_ALLOWED_SUBJECTS:-}"
+# Empty = default ${issuer}/oidc/v1/userinfo (same origin as the issuer).
+OIDC_USERINFO_URL="${HANGAR_MCP_OIDC_USERINFO_URL:-}"
 OIDC_INTROSPECTION_URL="${HANGAR_MCP_OIDC_INTROSPECTION_URL:-}"
 OIDC_INTROSPECTION_CLIENT_ID="${HANGAR_MCP_OIDC_INTROSPECTION_CLIENT_ID:-}"
 OIDC_INTROSPECTION_TIMEOUT_MS="${HANGAR_MCP_OIDC_INTROSPECTION_TIMEOUT_MS:-}"
@@ -129,7 +131,9 @@ tar -xzf "$ARCHIVE" -C "$STAGING_DIR"
 [[ -f "$STAGING_DIR/mcp/dist/http.js" ]] || die "extracted release is incomplete"
 
 echo "==> installing production dependencies for ${RELEASE_ID}"
-"$PNPM_BIN" --dir "$STAGING_DIR/mcp" install --prod --frozen-lockfile --ignore-scripts --ignore-workspace
+# Run from mcp/ so a corepack pnpm shim picks mcp/package.json's packageManager
+# (pnpm 10), not the root checkout's (pnpm 11).
+(cd "$STAGING_DIR/mcp" && "$PNPM_BIN" install --prod --frozen-lockfile --ignore-scripts --ignore-workspace)
 
 # One list, used for validation and for the env file, so both see the same keys.
 runtime_env() {
@@ -158,6 +162,7 @@ runtime_env() {
     "MCP_OIDC_REQUIRED_SCOPE=$OIDC_REQUIRED_SCOPE" \
     "MCP_OIDC_ALLOWED_ORG_ID=$OIDC_ALLOWED_ORG_ID" \
     "MCP_OIDC_ALLOWED_SUBJECTS=$OIDC_ALLOWED_SUBJECTS" \
+    "MCP_OIDC_USERINFO_URL=$OIDC_USERINFO_URL" \
     "MCP_OIDC_INTROSPECTION_URL=$OIDC_INTROSPECTION_URL" \
     "MCP_OIDC_INTROSPECTION_CLIENT_ID=$OIDC_INTROSPECTION_CLIENT_ID" \
     "MCP_OIDC_INTROSPECTION_CLIENT_SECRET=$OIDC_INTROSPECTION_CLIENT_SECRET" \
