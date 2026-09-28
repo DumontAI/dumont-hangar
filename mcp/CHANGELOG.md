@@ -31,8 +31,18 @@ Needs the Hangar (Plane fork) side first: API v1 accepting
 - Hangar errors mapped to actionable tool errors: `ACCOUNT_NOT_LINKED` (sign
   in once to Hangar web with Dumont login), `WRITER_ROLE_REQUIRED`,
   `PROJECT_ACCESS_DENIED` (names the `hangar.project.<id>.member` role),
-  `TOKEN_EXPIRED` (retryable; only when the token is within 60 s of `exp`),
-  `UPSTREAM_UNAUTHORIZED`. A Hangar 401 never becomes an MCP HTTP 401.
+  `TOKEN_EXPIRED` (not retryable with the same token), `UPSTREAM_UNAUTHORIZED`.
+  A Hangar 401 never becomes an MCP HTTP 401.
+- A JWS access token with 30 s or less left is refused by the authorizer with
+  the regular HTTP 401 challenge, so clients refresh before the token is
+  forwarded; `TOKEN_EXPIRED` only remains for calls that outlive that margin.
+- Footer anti-forgery compares a folded form of each line: zero-width
+  characters removed, any Unicode dash, NFKC (NBSP, U+3000, full-width),
+  combining marks dropped, Cyrillic/Greek homoglyphs mapped to Latin.
+- A project missing from a user's cached list triggers one reload of that
+  list before `PROJECT_NOT_FOUND`.
+- Every tool call does one `GET /api/v1/users/me/` (cached per user for
+  `HANGAR_PROJECT_CACHE_SECONDS`; with 0 an extra GET per call).
 - Write tools are always registered (12 tools); `hangar_writer` still gates
   them per call. `WRITES_DISABLED` and `PROJECT_NOT_WRITABLE` are gone.
 - `HANGAR_ALLOWED_PROJECTS` is now an optional ceiling (empty = whatever
@@ -41,15 +51,17 @@ Needs the Hangar (Plane fork) side first: API v1 accepting
 - Audit line: `email` replaced by `plane_user_id`.
 - `HANGAR_API_KEY` and `HANGAR_WRITE_PROJECTS` are retired: startup error if
   present (even empty), with a "retired, remove it" message.
-- `scripts/live-smoke.mjs` expects 12 tools and prints the tool error code on
-  a failed read.
+- `scripts/live-smoke.mjs` expects 12 tools, lists up to 50 projects and
+  prints the tool error code on a failed read.
 
 ### Owner steps
 
 Follow README → "Manual deploy (0.3.0: acting as the user)". In short: deploy
-and verify the Hangar side first; then, in one go, remove `HANGAR_API_KEY` and
-`HANGAR_WRITE_PROJECTS` from `/etc/dumont-hangar-mcp.env`, add
-`MCP_CURSOR_SECRET`, validate, switch, restart. Every user must sign in once
+and verify the Hangar side first; then prepare `/etc/dumont-hangar-mcp.env.new`
+as a copy without `HANGAR_API_KEY` and `HANGAR_WRITE_PROJECTS` and with
+`MCP_CURSOR_SECRET` (compare the two project lists first: writes now reach
+every project in `HANGAR_ALLOWED_PROJECTS` where the user is a Hangar Member),
+validate the copy, then move it into place, switch and restart back to back. Every user must sign in once
 to Hangar web with Dumont login. Revoke the bot token only after the release
 is stable.
 

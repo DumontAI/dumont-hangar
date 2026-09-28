@@ -121,16 +121,25 @@ Behavior common to all writes:
   Hangar user id are cached per token `sub` (`HANGAR_PROJECT_CACHE_SECONDS`,
   at most 1000 users, least recently used dropped first). One user's cached
   data is never served to another user. The cache only helps name resolution;
-  Hangar still authorizes every call.
+  Hangar still authorizes every call. A project missing from a user's cached
+  list triggers one reload of that user's list before `PROJECT_NOT_FOUND`, so a
+  just-granted project works at once.
+- **One `users/me` lookup per tool call**: every tool call first asks Hangar
+  who the caller is (`GET /api/v1/users/me/`) for the audit line and `"me"`.
+  It is cached per user for `HANGAR_PROJECT_CACHE_SECONDS`; with `0` it is an
+  extra GET on every call.
 - **Cursors are per user**: pagination cursors are HMAC-signed with
   `MCP_CURSOR_SECRET` and bound to the caller's `sub`; a cursor issued to one
   user is `INVALID_CURSOR` for anyone else.
 - **Hangar 401 is not an MCP 401**: a 401 from Hangar becomes a tool error
   (HTTP 200), so the client does not restart its login for a problem a new
-  login cannot fix. The only exception is an expired token: when Hangar
-  answers 401 and the token is at most 60 s from its `exp`, the tool answers
-  `TOKEN_EXPIRED` (retryable), and the client's next request with that token
-  gets this server's regular 401 challenge and refreshes the login.
+  login cannot fix. Expiry is handled before forwarding: a JWS with 30 s or
+  less left (`MIN_TOKEN_LIFETIME_SECONDS`) already gets this server's regular
+  HTTP 401 challenge, so the client refreshes before the token reaches Hangar.
+  Only if a call outlives that margin (or the clocks disagree) and Hangar
+  answers 401 within 30 s of `exp` does the tool answer `TOKEN_EXPIRED`, not
+  retryable with the same token; the client's next request gets the 401
+  challenge and refreshes, so this cannot loop.
 
 ### Error codes (tool errors, HTTP 200)
 
@@ -139,7 +148,7 @@ Behavior common to all writes:
 | `FORBIDDEN`             | Token lacks the role for this tool (write tools need `hangar_writer`)                                         |
 | `ACCOUNT_NOT_LINKED`    | Hangar has no account linked to this Dumont login: sign in once at https://hangar.getdumont.ai (Dumont login) |
 | `TOKEN_NOT_FORWARDABLE` | Opaque token; connect with the pinned public client (JWT) and log in again                                    |
-| `TOKEN_EXPIRED`         | Token expired during the call; retry (the client refreshes on the next request)                               |
+| `TOKEN_EXPIRED`         | Token expired during the call; nothing changed; the next request gets a 401 and the client refreshes          |
 | `WRITER_ROLE_REQUIRED`  | Hangar requires `hangar_writer` for this change                                                               |
 | `PROJECT_ACCESS_DENIED` | Hangar denied access to project X; ask for role `hangar.project.x.member` in Dumont Auth                      |
 | `PROJECT_NOT_FOUND`     | Not among the projects you can see (the message names the role to ask for)                                    |
@@ -356,33 +365,45 @@ Never `cat` the env file: it holds secrets. Print key names only.
    printf 'release_id=%s\nsource_commit=%s\nsource_ref=manual\n' "$SHA-manual" "$SHA" > "$REL/RELEASE"
    ```
 
-3. **Edit the env file** (only after step 0; back up first). The backup keeps
-   the old API key for a rollback; it has the same owner and mode as the
-   original.
+3. **Prepare the new env file as a copy** (only after step 0). The live file
+   is not touched until step 5; the backup keeps the old API key for a
+   rollback. `cp -p` keeps owner and mode (`root:deploy`, `0640`).
 
    ```bash
-   sudo cp -p /etc/dumont-hangar-mcp.env /etc/dumont-hangar-mcp.env.bak-$SHA
-   sudo sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' /etc/dumont-hangar-mcp.env   # names only
+   ENV=/etc/dumont-hangar-mcp.env
+   sudo cp -p "$ENV" "$ENV.bak-$SHA"
+   sudo cp -p "$ENV" "$ENV.new"
+   sudo sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' "$ENV.new"   # names only
+   # Compare the two NON-secret project lists before removing the write list
+   # (this prints only these two keys):
+   sudo grep -E '^(HANGAR_ALLOWED_PROJECTS|HANGAR_WRITE_PROJECTS)=' "$ENV.new"
    # Remove the retired keys (and the no-longer-read userinfo URL, if present).
    sudo sed -i -e '/^HANGAR_API_KEY=/d' -e '/^HANGAR_WRITE_PROJECTS=/d' \
-     -e '/^MCP_OIDC_USERINFO_URL=/d' /etc/dumont-hangar-mcp.env
+     -e '/^MCP_OIDC_USERINFO_URL=/d' "$ENV.new"
    # Add the new cursor secret, generated on the host and never printed.
-   printf 'MCP_CURSOR_SECRET="%s"\n' "$(openssl rand -hex 32)" | sudo tee -a /etc/dumont-hangar-mcp.env >/dev/null
-   sudo sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' /etc/dumont-hangar-mcp.env   # names only, check
+   printf 'MCP_CURSOR_SECRET="%s"\n' "$(openssl rand -hex 32)" | sudo tee -a "$ENV.new" >/dev/null
+   sudo sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' "$ENV.new"   # names only, check
+   sudo stat -c '%U:%G %a' "$ENV.new"                                  # expect root:deploy 640
    ```
 
-   The running (old) release is unaffected until the restart in step 5, since
-   systemd read the env at start. `HANGAR_ALLOWED_PROJECTS` stays as it is: it
-   is now an optional ceiling. Emptying it later lets each user reach every
-   project Hangar shows them.
+   **Write scope changes with this release.** `HANGAR_WRITE_PROJECTS` used to
+   be a subset of `HANGAR_ALLOWED_PROJECTS` where writes were allowed; that
+   subset is gone. From now on a user with `hangar_writer` can write in
+   **every project inside `HANGAR_ALLOWED_PROJECTS` where they are a Hangar
+   Member or Admin**. If the two lists printed above differ, decide before the
+   switch: either shrink `HANGAR_ALLOWED_PROJECTS` in `$ENV.new` (this also
+   limits reads) or accept that Hangar membership now decides writes there.
+   `HANGAR_ALLOWED_PROJECTS` is now an optional ceiling; emptying it later lets
+   each user reach every project Hangar shows them.
 
-4. **Validate the config with the new release** before switching. `systemd-run`
-   reads the env file exactly as the service does and runs the check as
-   `deploy`; secrets stay in the unit's environment, never in argv or output:
+4. **Validate the new file with the new release** before switching.
+   `systemd-run` reads `$ENV.new` exactly as the service will read the live
+   file and runs the check as `deploy`; secrets stay in the unit's
+   environment, never in argv or output:
 
    ```bash
    sudo systemd-run --pipe --wait --quiet --collect \
-     -p EnvironmentFile=/etc/dumont-hangar-mcp.env -p User=deploy -p Group=deploy \
+     -p EnvironmentFile=/etc/dumont-hangar-mcp.env.new -p User=deploy -p Group=deploy \
      -p WorkingDirectory="$REL" \
      /usr/bin/node --input-type=module -e '
        const m = await import("./mcp/dist/config.js");
@@ -394,9 +415,12 @@ Never `cat` the env file: it holds secrets. Print key names only.
    `ERROR HANGAR_API_KEY is retired, remove it…` means step 3 did not remove
    it; `ERROR MCP_CURSOR_SECRET is required…` means the secret is missing.
 
-5. **Switch and restart**:
+5. **Put the new env in place, switch and restart**, back to back (the old
+   release keeps running on the environment it read at start until the
+   restart):
 
    ```bash
+   sudo mv /etc/dumont-hangar-mcp.env.new /etc/dumont-hangar-mcp.env
    ln -s "$REL" /opt/dumont-hangar-mcp/.current.new
    mv -Tf /opt/dumont-hangar-mcp/.current.new /opt/dumont-hangar-mcp/current
    sudo systemctl restart dumont-hangar-mcp.service
@@ -425,15 +449,15 @@ Never `cat` the env file: it holds secrets. Print key names only.
 
    Then the authenticated read smoke with a real user's short-lived JWT
    (`mcp/scripts/live-smoke.mjs`, `MCP_AUTH_TOKEN` from the environment, never
-   in argv): it expects 12 tools and prints the number of projects **that
-   user** sees. `HANGAR_PROJECTS_READ_FAILED:ACCOUNT_NOT_LINKED` means that
+   in argv): it expects 12 tools and lists up to 50 projects, printing how
+   many **that user** sees (capped at 50). `HANGAR_PROJECTS_READ_FAILED:ACCOUNT_NOT_LINKED` means that
    user never signed in to Hangar web with Dumont login;
    `…:UPSTREAM_UNAUTHORIZED` means Hangar does not accept the bearer (step 0).
    In the journal, audit lines now carry `plane_user_id` and no email.
 
 7. **Rollback**: the previous release needs the old env file (with
-   `HANGAR_API_KEY`), so restore the backup, switch the symlink back and
-   restart:
+   `HANGAR_API_KEY` and `HANGAR_WRITE_PROJECTS`), so restore
+   `.bak-$SHA` (not the `.new` copy), switch the symlink back and restart:
 
    ```bash
    sudo cp -p /etc/dumont-hangar-mcp.env.bak-$SHA /etc/dumont-hangar-mcp.env
