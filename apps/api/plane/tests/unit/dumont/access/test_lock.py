@@ -332,6 +332,22 @@ class TestLock:
         assert "error_code" not in response.data  # Plane's own permission answer, not the lock
         assert setup["fake"].calls == []
 
+    @pytest.mark.parametrize("variable,value", [("DUMONT_ACCESS_SYNC", "enfroce"), ("DUMONT_ACCESS_MAX_REMOVALS", "x")])
+    @pytest.mark.parametrize("case", LOCKED_CASES[:3], ids=[c[0] for c in LOCKED_CASES[:3]])
+    def test_invalid_config_fails_closed(self, setup, monkeypatch, case, variable, value):
+        # a typo must not read as `off` and open the membership endpoints
+        monkeypatch.setenv(variable, value)
+        response = _call(setup, *case[1:])
+        assert response.status_code == 503, response.content
+        assert response.data["error_code"] == UNAVAILABLE_CODE
+        assert setup["fake"].calls == []
+
+    def test_invalid_config_leaves_other_workspaces_alone(self, setup, monkeypatch):
+        monkeypatch.setenv("DUMONT_ACCESS_SYNC", "enfroce")
+        monkeypatch.setenv("DUMONT_ACCESS_WORKSPACE_SLUG", "another-workspace")
+        response = _call(setup, *LOCKED_CASES[0][1:])
+        assert response.status_code != 503
+
     def test_enforce_without_org_id_fails_closed(self, setup, monkeypatch):
         # DUMONT_ZITADEL_ORG_ID is required: without it the lock cannot learn the managed scopes
         # and answers 503 instead of letting a change through; ZITADEL is never called.

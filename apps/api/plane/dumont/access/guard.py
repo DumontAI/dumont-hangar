@@ -15,6 +15,7 @@
 
 import functools
 import logging
+import os
 
 from django.core.exceptions import ValidationError
 from rest_framework import status
@@ -44,17 +45,35 @@ WORKSPACE_MEMBER_PREFERENCE_FIELDS = frozenset(
 )
 
 
+class _InvalidConfig:
+    """DUMONT_ACCESS_SYNC (or another DUMONT_ACCESS_* value) cannot be parsed. The lock fails closed:
+    membership changes in the configured workspace (every workspace when even the slug is unknown)
+    answer 503 until the value is fixed, instead of silently reading as `off`."""
+
+    mode = "invalid"
+
+    def __init__(self, error):
+        self.error = error
+        self.workspace_slug = (os.environ.get("DUMONT_ACCESS_WORKSPACE_SLUG") or "").strip() or None
+
+    def covers(self, slug):
+        return self.workspace_slug is None or slug == self.workspace_slug
+
+
 def _enforce_config():
     try:
         cfg = load_access_config()
-    except AccessConfigError:
-        return None
+    except AccessConfigError as exc:
+        logger.error("dumont access: invalid configuration, membership changes fail closed (503): %s", exc)
+        return _InvalidConfig(str(exc))
     if cfg.mode != MODE_ENFORCE or not cfg.workspace_slug:
         return None
     return cfg
 
 
 def _state(cfg):
+    if isinstance(cfg, _InvalidConfig):
+        raise AccessConfigError(cfg.error)
     from plane.dumont.access.sync import get_managed_state
 
     return get_managed_state(cfg)
@@ -98,11 +117,10 @@ def project_lock_response(request, project_ids, message=None):
     from plane.db.models import Project
 
     try:
-        projects = list(
-            Project.objects.filter(
-                id__in=[pid for pid in project_ids if pid], workspace__slug=cfg.workspace_slug
-            ).values_list("identifier", flat=True)
-        )
+        queryset = Project.objects.filter(id__in=[pid for pid in project_ids if pid])
+        if cfg.workspace_slug is not None:
+            queryset = queryset.filter(workspace__slug=cfg.workspace_slug)
+        projects = list(queryset.values_list("identifier", flat=True))
     except (ValueError, ValidationError):  # malformed ids: let the view answer as it always did
         return None
     if not projects:
@@ -133,6 +151,8 @@ def project_lock_response(request, project_ids, message=None):
 
 def workspace_lock_response(request, slugs):
     cfg = _enforce_config()
+    if isinstance(cfg, _InvalidConfig):
+        return _unavailable() if any(cfg.covers(slug) for slug in slugs) else None
     if cfg is None or cfg.workspace_slug not in set(slugs):
         return None
     try:
@@ -274,7 +294,10 @@ def lock_project_create():
         @functools.wraps(view_func)
         def wrapped(instance, request, *args, **kwargs):
             cfg = _enforce_config()
-            if cfg is None or kwargs.get("slug") != cfg.workspace_slug:
+            if isinstance(cfg, _InvalidConfig):
+                if not cfg.covers(kwargs.get("slug")):
+                    return view_func(instance, request, *args, **kwargs)
+            elif cfg is None or kwargs.get("slug") != cfg.workspace_slug:
                 return view_func(instance, request, *args, **kwargs)
             identifier = _body_value(request, "identifier")
             part = R.identifier_to_key_part(str(identifier)) if identifier else None
