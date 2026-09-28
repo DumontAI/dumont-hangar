@@ -21,6 +21,9 @@ ISSUER = "https://issuer.test"
 JWKS_URL = "https://issuer.test/oauth/v2/keys"
 AUDIENCE = "300000000000000001"
 OTHER_AUDIENCE = "300000000000000002"
+ORG_ID = "200000000000000001"
+FOREIGN_ORG_ID = "200000000000000099"
+RESOURCE_OWNER = "urn:zitadel:iam:user:resourceowner:id"
 WEB_URL = "https://hangar.example.test"
 LINKED_SUB = "sub-linked-0001"
 
@@ -52,13 +55,35 @@ class FakeJwks:
         self.keys = []
         self.calls = 0
         self.fail = False
+        # When set, returned as-is instead of {"keys": [...]} (malformed or unusable answers).
+        self.document = None
 
     def __call__(self, uri, timeout):
         self.calls += 1
         assert uri == JWKS_URL
         if self.fail:
             raise OSError("fake JWKS down")
+        if self.document is not None:
+            return self.document
         return {"keys": list(self.keys)}
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 1_000_000.0
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    fake = FakeClock()
+    monkeypatch.setattr(jwks_module, "_now", fake)
+    return fake
 
 
 @pytest.fixture
@@ -77,6 +102,7 @@ def make_config(**overrides):
         "issuer": ISSUER,
         "jwks_url": JWKS_URL,
         "audiences": (AUDIENCE, OTHER_AUDIENCE),
+        "allowed_org_id": ORG_ID,
         "reader_role": "hangar_reader",
         "writer_role": "hangar_writer",
         "rate_limit": "1000/minute",
@@ -104,7 +130,7 @@ def base_claims(**overrides):
         "nbf": now,
         "exp": now + 600,
         "jti": uuid.uuid4().hex,
-        f"urn:zitadel:iam:org:project:{AUDIENCE}:roles": {"hangar_reader": {"org-1": "dumont.example"}},
+        f"urn:zitadel:iam:org:project:{AUDIENCE}:roles": {"hangar_reader": {ORG_ID: "dumont.example"}},
     }
     claims.update(overrides)
     return {k: v for k, v in claims.items() if v is not _DROP}
@@ -126,7 +152,12 @@ def make_token(signing_key):
 
 
 def writer_roles():
-    return {f"urn:zitadel:iam:org:project:{AUDIENCE}:roles": {"hangar_reader": {}, "hangar_writer": {}}}
+    return {
+        f"urn:zitadel:iam:org:project:{AUDIENCE}:roles": {
+            "hangar_reader": {ORG_ID: "dumont.example"},
+            "hangar_writer": {ORG_ID: "dumont.example"},
+        }
+    }
 
 
 @pytest.fixture

@@ -8,7 +8,7 @@ from rest_framework import status
 from rest_framework.test import APIClient
 
 from plane.api.rate_limit import ApiKeyRateThrottle
-from plane.db.models import Account, Project, ProjectMember, User
+from plane.db.models import Account, APIActivityLog, Project, ProjectMember, User
 
 from .conftest import make_config, writer_roles
 
@@ -96,6 +96,50 @@ class TestProjectsWithBearer:
         client = bearer_client(make_token())
         assert client.get(url).status_code == status.HTTP_200_OK
         assert client.get(url).status_code == status.HTTP_429_TOO_MANY_REQUESTS
+
+
+@pytest.mark.contract
+@pytest.mark.django_db
+class TestBearerAuditLog:
+    def test_bearer_post_is_logged_without_the_token(
+        self, bearer_enabled, linked_account, workspace, make_token, monkeypatch
+    ):
+        # Run the celery task inline so the row is written by the real task code.
+        from plane.bgtasks import logger_task
+        from plane.middleware import logger as logger_middleware
+
+        monkeypatch.setattr(
+            logger_middleware.process_logs,
+            "delay",
+            lambda log_data: logger_task.process_logs(log_data=log_data),
+        )
+        token = make_token(jti="jti-audit-1", **writer_roles())
+        response = bearer_client(token).post(
+            projects_url(workspace), {"name": "Audited", "identifier": "AUD"}, format="json"
+        )
+        assert response.status_code == status.HTTP_201_CREATED, response.content
+
+        row = APIActivityLog.objects.get(path=projects_url(workspace), method="POST")
+        assert row.token_identifier == "dumont:sub-linked-0001:jti-audit-1"
+        assert row.response_code == status.HTTP_201_CREATED
+        assert "[REDACTED]" in row.headers
+        stored = " ".join(
+            str(getattr(row, field))
+            for field in ("token_identifier", "headers", "body", "response_body", "query_params")
+        )
+        assert token not in stored
+        # No piece of the token either (header, payload or signature segment).
+        for segment in token.split("."):
+            assert segment not in stored
+
+    def test_failed_bearer_request_is_not_logged_as_bearer(self, bearer_enabled, workspace, make_token, monkeypatch):
+        from plane.middleware import logger as logger_middleware
+
+        calls = []
+        monkeypatch.setattr(logger_middleware.process_logs, "delay", lambda log_data: calls.append(log_data))
+        response = bearer_client(make_token()).get(projects_url(workspace))  # no linked account
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+        assert calls == []
 
 
 @pytest.mark.contract

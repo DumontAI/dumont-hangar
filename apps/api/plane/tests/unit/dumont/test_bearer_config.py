@@ -7,6 +7,7 @@ from plane.dumont.auth.config import BearerConfigError, load_bearer_config
 ENABLED = {
     "DUMONT_API_BEARER_ENABLED": "1",
     "DUMONT_API_AUDIENCES": "300000000000000001",
+    "DUMONT_ZITADEL_ORG_ID": "200000000000000001",
 }
 
 
@@ -65,9 +66,33 @@ class TestBearerConfig:
         config = load_bearer_config({**ENABLED, "DUMONT_API_AUDIENCES": " a1 ,a2,, a1 "})
         assert config.audiences == ("a1", "a2")
 
-    def test_audience_must_be_bare_project_id(self):
+    @pytest.mark.parametrize("value", ["a1:hangar_reader", "a1 a2", "a1\ta2", "a1 a2", "a1,a\x0bb"])
+    def test_audience_must_be_bare_project_id(self, value):
         with pytest.raises(BearerConfigError, match="bare ZITADEL project ids"):
-            load_bearer_config({**ENABLED, "DUMONT_API_AUDIENCES": "a1:hangar_reader"})
+            load_bearer_config({**ENABLED, "DUMONT_API_AUDIENCES": value})
+
+    def test_allowed_org_is_required(self):
+        env = {k: v for k, v in ENABLED.items() if k != "DUMONT_ZITADEL_ORG_ID"}
+        with pytest.raises(BearerConfigError, match="DUMONT_ZITADEL_ORG_ID is required"):
+            load_bearer_config(env)
+        with pytest.raises(BearerConfigError, match="DUMONT_ZITADEL_ORG_ID is required"):
+            load_bearer_config({**env, "DUMONT_ZITADEL_ORG_ID": "  "})
+
+    @pytest.mark.parametrize("value", ["org:1", "200 001", "200\t001", "200\n001", "200 001"])
+    def test_allowed_org_must_be_bare_id(self, value):
+        with pytest.raises(BearerConfigError, match="bare ZITADEL organization id"):
+            load_bearer_config({**ENABLED, "DUMONT_ZITADEL_ORG_ID": value})
+
+    def test_allowed_org_is_kept(self):
+        assert load_bearer_config(ENABLED).allowed_org_id == "200000000000000001"
+
+    def test_disabled_ignores_bad_rate_override(self):
+        # A bad override must not reach the throttle, which also runs on X-Api-Key requests.
+        config = load_bearer_config(
+            {"DUMONT_API_BEARER_ENABLED": "0", "DUMONT_API_BEARER_RATE_LIMIT": "fast"}, default_rate="60/minute"
+        )
+        assert config.enabled is False
+        assert config.rate_limit == "60/minute"
 
     def test_jwks_must_share_issuer_origin(self):
         with pytest.raises(BearerConfigError, match="same origin"):

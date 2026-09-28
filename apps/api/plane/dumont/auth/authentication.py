@@ -9,6 +9,7 @@ import binascii
 import hashlib
 import json
 import logging
+import math
 import re
 import time
 from dataclasses import dataclass
@@ -18,12 +19,13 @@ from django.conf import settings
 from rest_framework import status
 from rest_framework.authentication import BaseAuthentication
 from rest_framework.exceptions import APIException, AuthenticationFailed, PermissionDenied
-from jwt.exceptions import PyJWKClientConnectionError, PyJWKClientError
 
-from plane.dumont.auth.jwks import get_jwks_client
+from plane.dumont.auth.jwks import UnknownKid, get_jwks_client
 from plane.dumont.auth.roles import granted_roles
 
-logger = logging.getLogger("plane.dumont.auth")
+# A child of "plane.authentication", so it inherits the handler and level that
+# plane/settings/production.py and local.py configure there.
+logger = logging.getLogger("plane.authentication.dumont_bearer")
 
 MAX_BEARER_BYTES = 16 * 1024
 NOT_BEFORE_LEEWAY_SECONDS = 30
@@ -71,14 +73,24 @@ class AuthUnavailable(APIException):
     default_code = "auth_unavailable"
 
 
+class InvalidBearerToken(AuthenticationFailed):
+    """401 DUMONT_INVALID_TOKEN; answered with `error="invalid_token"` in the Bearer challenge (RFC 6750)."""
+
+
+# Set on the DRF request when authenticate() rejected the token itself, so
+# authenticate_header() can add `error="invalid_token"` to the challenge.
+_INVALID_TOKEN_FLAG = "_dumont_bearer_invalid_token"
+
+
 def _invalid(reason):
     # `reason` is a fixed code chosen here, never token content.
     logger.info("dumont bearer rejected", extra={"reason": reason})
-    return AuthenticationFailed({"error_code": ERROR_INVALID_TOKEN, "error": "Invalid or expired Dumont access token."})
+    return InvalidBearerToken({"error_code": ERROR_INVALID_TOKEN, "error": "Invalid or expired Dumont access token."})
 
 
 def _is_number(value):
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    # json.loads accepts NaN and Infinity; neither is a usable timestamp.
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
 def _decode_header(segment):
@@ -114,6 +126,8 @@ class ZitadelBearerAuthentication(BaseAuthentication):
         # their upstream behaviour (DRF turns AuthenticationFailed into 403 without a challenge).
         if not _config().enabled or _bearer_header(request) is None:
             return None
+        if getattr(request, _INVALID_TOKEN_FLAG, False):
+            return f'Bearer realm="{self.www_authenticate_realm}", error="invalid_token"'
         return f'Bearer realm="{self.www_authenticate_realm}"'
 
     def authenticate(self, request):
@@ -126,13 +140,17 @@ class ZitadelBearerAuthentication(BaseAuthentication):
         if request.headers.get("X-Api-Key"):
             raise AmbiguousCredentials()
 
-        match = BEARER_HEADER.match(header)
-        if not match:
-            raise _invalid("malformed_header")
-        token = match.group(1)
-        claims = self._verify(token, config)
+        try:
+            match = BEARER_HEADER.match(header)
+            if not match:
+                raise _invalid("malformed_header")
+            token = match.group(1)
+            claims = self._verify(token, config)
+        except InvalidBearerToken:
+            setattr(request, _INVALID_TOKEN_FLAG, True)
+            raise
 
-        roles = granted_roles(claims, config.audiences, config.reader_role, config.writer_role)
+        roles = granted_roles(claims, config.audiences, config.reader_role, config.writer_role, config.allowed_org_id)
         if not roles:
             raise PermissionDenied(
                 {
@@ -171,11 +189,14 @@ class ZitadelBearerAuthentication(BaseAuthentication):
 
         try:
             signing_key = get_jwks_client(config.jwks_url).get_signing_key(kid)
-        except PyJWKClientConnectionError:
+        except UnknownKid:
+            # The key set is current and has no such kid: the token is invalid.
+            raise _invalid("unknown_kid")
+        except jwt.PyJWTError:
+            # Anything else (fetch failure, unusable key set) means we could not check the
+            # token, which is not the caller's fault: 503, never 401 or 500.
             logger.warning("dumont bearer: JWKS unavailable")
             raise AuthUnavailable()
-        except PyJWKClientError:
-            raise _invalid("unknown_kid")
 
         try:
             # Signature only; the claim checks below mirror mcp/src/auth.ts evaluateAccessClaims.
@@ -224,8 +245,9 @@ class ZitadelBearerAuthentication(BaseAuthentication):
         # Imported here so this module stays importable before the app registry is ready.
         from plane.db.models import Account
 
-        accounts = list(Account.objects.filter(provider="dumont", provider_account_id=sub).select_related("user")[:2])
-        if not accounts:
+        # (provider, provider_account_id) is unique_together on Account: at most one row.
+        account = Account.objects.filter(provider="dumont", provider_account_id=sub).select_related("user").first()
+        if account is None:
             where = f" at {config.web_url}" if config.web_url else " in the Hangar web app"
             raise AuthenticationFailed(
                 {
@@ -233,10 +255,11 @@ class ZitadelBearerAuthentication(BaseAuthentication):
                     "error": f"Sign in once{where} with Dumont login",
                 }
             )
-        user = accounts[0].user
-        if len(accounts) != 1 or not user.is_active or user.is_bot:
+        user = account.user
+        if not user.is_active or user.is_bot:
+            # The token is fine; this user may not use the API. 403, so clients do not re-login.
             logger.info("dumont bearer rejected", extra={"reason": "user_not_allowed"})
-            raise AuthenticationFailed(
+            raise PermissionDenied(
                 {"error_code": ERROR_USER_NOT_ALLOWED, "error": "This Hangar user cannot use the API."}
             )
         return user

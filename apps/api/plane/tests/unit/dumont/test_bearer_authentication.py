@@ -15,9 +15,22 @@ from plane.db.models import Account, User
 from plane.dumont.auth import jwks as jwks_module
 from plane.dumont.auth.authentication import AuthContext, ZitadelBearerAuthentication
 
-from .conftest import AUDIENCE, DROP, LINKED_SUB, OTHER_AUDIENCE, WEB_URL, base_claims, make_config, public_jwk
+from .conftest import (
+    AUDIENCE,
+    DROP,
+    FOREIGN_ORG_ID,
+    LINKED_SUB,
+    ORG_ID,
+    OTHER_AUDIENCE,
+    RESOURCE_OWNER,
+    WEB_URL,
+    base_claims,
+    make_config,
+    public_jwk,
+)
 
 ME = "/api/v1/users/me/"
+INVALID_TOKEN_CHALLENGE = 'Bearer realm="api", error="invalid_token"'
 
 
 def bearer_client(token):
@@ -28,7 +41,7 @@ def bearer_client(token):
 
 def assert_invalid(response, token=None):
     assert response.status_code == status.HTTP_401_UNAUTHORIZED, response.content
-    assert response["WWW-Authenticate"].startswith("Bearer")
+    assert response["WWW-Authenticate"] == INVALID_TOKEN_CHALLENGE
     assert response.json()["error_code"] == "DUMONT_INVALID_TOKEN"
     if token:
         assert token not in response.content.decode()
@@ -67,6 +80,7 @@ class TestBearerAccepted:
             **{
                 f"urn:zitadel:iam:org:project:{AUDIENCE}:roles": DROP,
                 "my:zitadel:grants": [f"{OTHER_AUDIENCE}:hangar_reader"],
+                RESOURCE_OWNER: ORG_ID,
             },
         )
         assert bearer_client(token).get(ME).status_code == status.HTTP_200_OK
@@ -124,6 +138,13 @@ class TestBearerRejected:
             {"exp": "9999999999"},
             {"nbf": int(time.time()) + 3600},
             {"nbf": "0"},
+            # json.loads accepts NaN/Infinity; comparisons with them would wave the token through.
+            {"exp": float("inf")},
+            {"exp": float("nan")},
+            {"exp": float("-inf")},
+            {"nbf": float("nan")},
+            {"nbf": float("-inf")},
+            {"nbf": float("inf")},
             {"iss": "https://evil.test"},
             {"iss": "https://issuer.test/"},
             {"iss": DROP},
@@ -232,6 +253,122 @@ class TestBearerRejected:
         assert bearer_client(token).get(ME).status_code == status.HTTP_503_SERVICE_UNAVAILABLE
         assert fake_jwks.calls == 1
 
+
+def assert_unavailable(response, token):
+    assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE, response.content
+    assert response.json()["error_code"] == "DUMONT_AUTH_UNAVAILABLE"
+    assert token not in response.content.decode()
+
+
+@pytest.mark.unit
+@pytest.mark.django_db
+class TestJwksCache:
+    @pytest.mark.parametrize(
+        "document",
+        [
+            {"keys": []},
+            ["x"],
+            "x",
+            {"keys": "x"},
+            {"nokeys": True},
+            {"keys": [{"kty": "RSA", "kid": "kid-1"}]},  # unusable RSA key
+            {"keys": [{"kty": "oct", "k": "c2VjcmV0", "kid": "kid-1"}]},  # no RS256 key
+            {"keys": [{"kty": "oct", "k": "c2VjcmV0", "kid": "kid-1", "alg": "HS256"}]},
+        ],
+        ids=["empty", "list", "string", "keys-string", "no-keys", "bad-rsa", "oct", "oct-hs256"],
+    )
+    def test_unusable_key_set_is_503(self, bearer_enabled, linked_account, make_token, fake_jwks, document):
+        fake_jwks.document = document
+        token = make_token()
+        assert_unavailable(bearer_client(token).get(ME), token)
+        assert jwks_module.get_jwks_client("https://issuer.test/oauth/v2/keys")._keys == {}
+
+    def test_rs256_key_without_signing_use_is_not_usable(
+        self, bearer_enabled, linked_account, make_token, fake_jwks, signing_key
+    ):
+        fake_jwks.keys = [{**public_jwk(signing_key, "kid-1"), "use": "enc"}]
+        token = make_token()
+        assert_unavailable(bearer_client(token).get(ME), token)
+
+    def test_unusable_answer_is_not_cached(self, bearer_enabled, linked_account, make_token, fake_jwks, clock):
+        fake_jwks.document = ["x"]
+        token = make_token()
+        assert_unavailable(bearer_client(token).get(ME), token)
+        fake_jwks.document = None
+        clock.advance(jwks_module.FETCH_FAILURE_BACKOFF_SECONDS + 1)
+        assert bearer_client(token).get(ME).status_code == status.HTTP_200_OK
+        assert fake_jwks.calls == 2
+
+    def test_unusable_answer_does_not_replace_good_keys(
+        self, bearer_enabled, linked_account, make_token, fake_jwks, clock
+    ):
+        assert bearer_client(make_token()).get(ME).status_code == status.HTTP_200_OK
+        clock.advance(jwks_module.JWKS_LIFESPAN_SECONDS + 1)
+        fake_jwks.document = {"keys": []}
+        assert bearer_client(make_token()).get(ME).status_code == status.HTTP_200_OK
+        assert fake_jwks.calls == 2
+        fake_jwks.document = None
+        clock.advance(jwks_module.FETCH_FAILURE_BACKOFF_SECONDS + 1)
+        assert bearer_client(make_token()).get(ME).status_code == status.HTTP_200_OK
+        assert fake_jwks.calls == 3
+
+    def test_stale_keys_serve_known_kids_while_issuer_is_down(
+        self, bearer_enabled, linked_account, make_token, fake_jwks, clock
+    ):
+        assert bearer_client(make_token()).get(ME).status_code == status.HTTP_200_OK
+        fake_jwks.fail = True
+        clock.advance(jwks_module.JWKS_LIFESPAN_SECONDS + 1)
+        assert bearer_client(make_token()).get(ME).status_code == status.HTTP_200_OK
+        assert fake_jwks.calls == 2
+        # Unknown kid while refreshes fail: cannot tell whether it is real, so 503, not 401.
+        unknown = make_token(kid="kid-new")
+        assert_unavailable(bearer_client(unknown).get(ME), unknown)
+        # Still inside the backoff window: no extra call to the issuer.
+        assert fake_jwks.calls == 2
+
+        # Keep failing for almost a day: known kids keep working.
+        clock.advance(jwks_module.MAX_STALE_SECONDS - jwks_module.JWKS_LIFESPAN_SECONDS - 10)
+        assert bearer_client(make_token()).get(ME).status_code == status.HTTP_200_OK
+        # Past 24 h since the last good fetch: the stale set is dropped.
+        clock.advance(20)
+        token = make_token()
+        assert_unavailable(bearer_client(token).get(ME), token)
+
+        # Issuer back: normal service.
+        fake_jwks.fail = False
+        clock.advance(jwks_module.FETCH_FAILURE_BACKOFF_SECONDS + 1)
+        assert bearer_client(make_token()).get(ME).status_code == status.HTTP_200_OK
+
+    def test_failed_forced_refresh_keeps_known_kids(self, bearer_enabled, linked_account, make_token, fake_jwks, clock):
+        assert bearer_client(make_token()).get(ME).status_code == status.HTTP_200_OK
+        fake_jwks.fail = True
+        unknown = make_token(kid="kid-new")
+        assert_unavailable(bearer_client(unknown).get(ME), unknown)
+        assert fake_jwks.calls == 2
+        assert bearer_client(make_token()).get(ME).status_code == status.HTTP_200_OK
+
+    def test_unknown_kid_with_current_keys_is_401(self, bearer_enabled, linked_account, make_token, fake_jwks, clock):
+        assert bearer_client(make_token()).get(ME).status_code == status.HTTP_200_OK
+        unknown = make_token(kid="kid-new")
+        assert_invalid(bearer_client(unknown).get(ME), unknown)
+        assert fake_jwks.calls == 2
+
+    def test_non_connection_jwt_error_from_key_lookup_is_503(
+        self, bearer_enabled, linked_account, make_token, monkeypatch
+    ):
+        import jwt
+
+        def broken(self, kid):
+            raise jwt.exceptions.PyJWKError("unexpected")
+
+        monkeypatch.setattr(jwks_module.BoundedJWKClient, "get_signing_key", broken)
+        token = make_token()
+        assert_unavailable(bearer_client(token).get(ME), token)
+
+
+@pytest.mark.unit
+@pytest.mark.django_db
+class TestBearerRolesAndIdentity:
     def test_no_hangar_role(self, bearer_enabled, linked_account, make_token):
         token = make_token(**{f"urn:zitadel:iam:org:project:{AUDIENCE}:roles": {"other_role": {}}})
         response = bearer_client(token).get(ME)
@@ -242,18 +379,79 @@ class TestBearerRejected:
         token = make_token(
             **{
                 f"urn:zitadel:iam:org:project:{AUDIENCE}:roles": DROP,
-                "urn:zitadel:iam:org:project:999:roles": {"hangar_writer": {}},
+                "urn:zitadel:iam:org:project:999:roles": {"hangar_writer": {ORG_ID: "dumont.example"}},
                 "my:zitadel:grants": ["999:hangar_writer"],
+                RESOURCE_OWNER: ORG_ID,
             }
         )
         assert bearer_client(token).get(ME).status_code == status.HTTP_403_FORBIDDEN
+
+    def test_foreign_org_role_map_with_our_audience(self, bearer_enabled, linked_account, make_token):
+        # Our project granted to another org: same aud, same claim name, but the role is that org's.
+        token = make_token(
+            **{
+                f"urn:zitadel:iam:org:project:{AUDIENCE}:roles": {
+                    "hangar_reader": {FOREIGN_ORG_ID: "other.example"},
+                    "hangar_writer": {FOREIGN_ORG_ID: "other.example"},
+                },
+                RESOURCE_OWNER: FOREIGN_ORG_ID,
+            }
+        )
+        response = bearer_client(token).get(ME)
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+        assert response.json()["error_code"] == "DUMONT_HANGAR_ROLE_REQUIRED"
+
+    @pytest.mark.parametrize("owner", [DROP, FOREIGN_ORG_ID, ""])
+    def test_bare_roles_claim_needs_our_resource_owner(self, bearer_enabled, linked_account, make_token, owner):
+        token = make_token(
+            **{
+                f"urn:zitadel:iam:org:project:{AUDIENCE}:roles": DROP,
+                "roles": ["hangar_writer"],
+                "org_id": ORG_ID,  # never stands in for the resource owner
+                RESOURCE_OWNER: owner,
+            }
+        )
+        response = bearer_client(token).get(ME)
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+        assert response.json()["error_code"] == "DUMONT_HANGAR_ROLE_REQUIRED"
+
+    def test_our_guest_plus_foreign_writer_is_not_writer(self, bearer_enabled, linked_account, make_token):
+        token = make_token(
+            **{
+                f"urn:zitadel:iam:org:project:{AUDIENCE}:roles": {
+                    "hangar.workspace.guest": {ORG_ID: "dumont.example"},
+                    "hangar_reader": {ORG_ID: "dumont.example"},
+                    "hangar_writer": {FOREIGN_ORG_ID: "other.example"},
+                },
+            }
+        )
+        request = Request(APIRequestFactory().get(ME, HTTP_AUTHORIZATION=f"Bearer {token}"))
+        _, auth = ZitadelBearerAuthentication().authenticate(request)
+        assert auth.roles == ("hangar_reader",)
+        response = bearer_client(token).patch(ME, {"first_name": "X"}, format="json")
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+        assert response.json()["error_code"] == "DUMONT_WRITER_ROLE_REQUIRED"
+
+    def test_foreign_writer_only_has_no_role(self, bearer_enabled, linked_account, make_token):
+        token = make_token(
+            **{
+                f"urn:zitadel:iam:org:project:{AUDIENCE}:roles": {
+                    "hangar.workspace.guest": {ORG_ID: "dumont.example"},
+                    "hangar_writer": {FOREIGN_ORG_ID: "other.example"},
+                },
+            }
+        )
+        response = bearer_client(token).get(ME)
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+        assert response.json()["error_code"] == "DUMONT_HANGAR_ROLE_REQUIRED"
 
     def test_account_not_linked(self, bearer_enabled, create_user, make_token):
         # create_user exists with an email, but has no Dumont Account: no email fallback.
         token = make_token(email=create_user.email, email_verified=True)
         response = bearer_client(token).get(ME)
         assert response.status_code == status.HTTP_401_UNAUTHORIZED
-        assert response["WWW-Authenticate"].startswith("Bearer")
+        # Not an invalid token: plain challenge, no error="invalid_token".
+        assert response["WWW-Authenticate"] == 'Bearer realm="api"'
         assert response.json() == {
             "error_code": "DUMONT_ACCOUNT_NOT_LINKED",
             "error": f"Sign in once at {WEB_URL} with Dumont login",
@@ -268,16 +466,18 @@ class TestBearerRejected:
         create_user.is_active = False
         create_user.save()
         response = bearer_client(make_token()).get(ME)
-        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+        assert response.status_code == status.HTTP_403_FORBIDDEN
         assert response.json()["error_code"] == "DUMONT_USER_NOT_ALLOWED"
+        assert "WWW-Authenticate" not in response
 
     def test_bot_user(self, bearer_enabled, create_bot_user, make_token):
         Account.objects.create(
             user=create_bot_user, provider="dumont", provider_account_id=LINKED_SUB, access_token="x"
         )
         response = bearer_client(make_token()).get(ME)
-        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+        assert response.status_code == status.HTTP_403_FORBIDDEN
         assert response.json()["error_code"] == "DUMONT_USER_NOT_ALLOWED"
+        assert "WWW-Authenticate" not in response
 
     def test_both_headers_are_ambiguous(self, bearer_enabled, linked_account, make_token, api_token):
         client = APIClient()
@@ -302,6 +502,18 @@ class TestBearerDisabledAndApiKeyUnchanged:
         client = APIClient()
         client.credentials(HTTP_AUTHORIZATION=f"Bearer {make_token()}", HTTP_X_API_KEY=api_token.token)
         assert client.get(ME).status_code == status.HTTP_200_OK
+
+    def test_disabled_with_bad_rate_override_keeps_api_key_working(self, settings, fake_jwks, api_key_client):
+        # The bearer throttle is instantiated on every API v1 request; with the feature off a
+        # bad DUMONT_API_BEARER_RATE_LIMIT must be ignored, not turn X-Api-Key requests into 500s.
+        from plane.dumont.auth.config import load_bearer_config
+
+        settings.DUMONT_API_BEARER = load_bearer_config(
+            {"DUMONT_API_BEARER_ENABLED": "0", "DUMONT_API_BEARER_RATE_LIMIT": "not-a-rate"},
+            default_rate=settings.API_KEY_RATE_LIMIT,
+        )
+        assert api_key_client.get(ME).status_code == status.HTTP_200_OK
+        assert fake_jwks.calls == 0
 
     def test_api_key_still_works_when_enabled(self, bearer_enabled, api_key_client, fake_jwks):
         assert api_key_client.get(ME).status_code == status.HTTP_200_OK

@@ -5,6 +5,7 @@
 # Django settings are loading, so a misconfiguration stops the process at startup
 # with a clear message instead of failing on the first request.
 
+import re
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
@@ -14,6 +15,8 @@ DEFAULT_AUTH_HOST = "https://auth.getdumont.ai"
 DEFAULT_READER_ROLE = "hangar_reader"
 DEFAULT_WRITER_ROLE = "hangar_writer"
 LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+# A bare ZITADEL id: no ':' (that would make `<aud>:<role>` grants ambiguous) and no whitespace of any kind.
+_NOT_BARE_ID = re.compile(r"[:\s]")
 
 
 class BearerConfigError(ImproperlyConfigured):
@@ -26,6 +29,7 @@ class BearerConfig:
     issuer: str = ""
     jwks_url: str = ""
     audiences: tuple = ()
+    allowed_org_id: str = ""
     reader_role: str = DEFAULT_READER_ROLE
     writer_role: str = DEFAULT_WRITER_ROLE
     rate_limit: str = "60/minute"
@@ -69,9 +73,11 @@ def _enabled(raw):
 def load_bearer_config(environ, default_rate="60/minute"):
     """Parse the DUMONT_API_BEARER_* / DUMONT_AUTH_* variables. Raises BearerConfigError when enabled but invalid."""
     enabled = _enabled(environ.get("DUMONT_API_BEARER_ENABLED"))
-    rate_limit = (environ.get("DUMONT_API_BEARER_RATE_LIMIT") or "").strip() or default_rate
     if not enabled:
-        return BearerConfig(enabled=False, rate_limit=rate_limit)
+        # Off means off: the bearer rate override is ignored, so a bad value can never
+        # break X-Api-Key requests (DumontBearerRateThrottle is still instantiated on them).
+        return BearerConfig(enabled=False, rate_limit=default_rate)
+    rate_limit = (environ.get("DUMONT_API_BEARER_RATE_LIMIT") or "").strip() or default_rate
 
     auth_host = (environ.get("DUMONT_AUTH_HOST") or "").strip() or DEFAULT_AUTH_HOST
     auth_host = _canonical_url(auth_host, "DUMONT_AUTH_HOST")
@@ -90,8 +96,17 @@ def load_bearer_config(environ, default_rate="60/minute"):
             "DUMONT_API_AUDIENCES is required when DUMONT_API_BEARER_ENABLED=1 "
             "(comma-separated ZITADEL project ids accepted in the token `aud`)"
         )
-    if any(":" in a or " " in a for a in audiences):
-        raise BearerConfigError("DUMONT_API_AUDIENCES entries must be bare ZITADEL project ids (no ':' or spaces)")
+    if any(_NOT_BARE_ID.search(a) for a in audiences):
+        raise BearerConfigError("DUMONT_API_AUDIENCES entries must be bare ZITADEL project ids (no ':' or whitespace)")
+
+    allowed_org_id = (environ.get("DUMONT_ZITADEL_ORG_ID") or "").strip()
+    if not allowed_org_id:
+        raise BearerConfigError(
+            "DUMONT_ZITADEL_ORG_ID is required when DUMONT_API_BEARER_ENABLED=1 "
+            "(the ZITADEL organization id whose role grants Hangar accepts)"
+        )
+    if _NOT_BARE_ID.search(allowed_org_id):
+        raise BearerConfigError("DUMONT_ZITADEL_ORG_ID must be a bare ZITADEL organization id (no ':' or whitespace)")
 
     reader_role = (environ.get("DUMONT_API_READER_ROLE") or "").strip() or DEFAULT_READER_ROLE
     writer_role = (environ.get("DUMONT_API_WRITER_ROLE") or "").strip() or DEFAULT_WRITER_ROLE
@@ -107,6 +122,7 @@ def load_bearer_config(environ, default_rate="60/minute"):
         issuer=issuer,
         jwks_url=jwks_url,
         audiences=audiences,
+        allowed_org_id=allowed_org_id,
         reader_role=reader_role,
         writer_role=writer_role,
         rate_limit=rate_limit,
