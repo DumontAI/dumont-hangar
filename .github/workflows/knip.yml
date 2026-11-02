@@ -1,0 +1,16 @@
+name: Knip
+
+on:
+  schedule:
+    - cron: '41 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  knip:
+    uses: DumontAI/dumont-ci/.github/workflows/knip.yml@v1
+    with:
+      strict: false
+      install-command: pnpm install --frozen-lockfile

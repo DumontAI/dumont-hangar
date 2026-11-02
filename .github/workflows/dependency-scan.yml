@@ -1,0 +1,18 @@
+name: Dependency scan
+
+on:
+  schedule:
+    - cron: '17 4 * * *'
+  pull_request:
+    paths:
+      - 'pnpm-lock.yaml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    uses: DumontAI/dumont-ci/.github/workflows/dependency-scan.yml@v1
+    with:
+      fail-on: none
