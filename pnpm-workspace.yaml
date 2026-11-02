@@ -166,7 +166,7 @@ catalog:
   "serve": "14.2.5"
   "sharp": "^0.34.3"
   "smooth-scroll-into-view-if-needed": "^2.0.2"
-  "storybook": "10.4.6"
+  "storybook": "10.6.2"
   "swr": "2.2.4"
   "tailwind-merge": "3.4.0"
   "tailwindcss": "4.1.17"
@@ -237,6 +237,8 @@ overrides:
   "@opentelemetry/core": 2.8.0
   "@opentelemetry/resources": 2.8.0
   "@opentelemetry/sdk-trace-base": 2.8.0
+  proxy-addr: 2.0.8
+  tinypool: 2.1.2
 
 allowBuilds:
   "@parcel/watcher": true
@@ -254,3 +256,4 @@ minimumReleaseAgeExclude:
   - '@storybook/react-vite@10.4.6'
   - '@storybook/react@10.4.6'
   - storybook@10.4.6
+  - storybook@10.6.2
